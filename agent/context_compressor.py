@@ -1331,6 +1331,8 @@ class ContextCompressor(ContextEngine):
 
         def _prepare() -> None:
             candidate: Optional[Dict[str, Any]] = None
+            worker_cooldown: Optional[Dict[str, Any]] = None
+            worker: Optional["ContextCompressor"] = None
             try:
                 worker = self._clone_for_background()
                 worker._previous_summary = window["previous_summary"]
@@ -1347,6 +1349,14 @@ class ContextCompressor(ContextEngine):
             except Exception as exc:
                 logger.warning("Background context preparation failed: %s", exc)
             finally:
+                cooldown_getter = getattr(worker, "get_active_compression_failure_cooldown", None)
+                if cooldown_getter:
+                    worker_cooldown = cooldown_getter()
+                if worker_cooldown:
+                    self._record_compression_failure_cooldown(
+                        float(worker_cooldown.get("remaining_seconds") or 0.0),
+                        worker_cooldown.get("error"),
+                    )
                 with self._background_lock:
                     if generation == self._background_generation:
                         self._background_candidate = candidate

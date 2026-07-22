@@ -158,6 +158,32 @@ def test_background_preparation_respects_failure_cooldown():
     assert not compressor.maybe_prepare_background(_messages(), current_tokens=80)
 
 
+def test_background_worker_failure_propagates_cooldown_to_parent():
+    compressor = _compressor()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            return None
+
+        def get_active_compression_failure_cooldown(self):
+            return {
+                "remaining_seconds": 60.0,
+                "error": "auxiliary summarizer unavailable",
+            }
+
+    setattr(compressor, "_clone_for_background", lambda: Worker())
+
+    assert compressor.maybe_prepare_background(_messages(), current_tokens=80)
+    assert not compressor.wait_for_background_preparation(timeout=2)
+    cooldown = compressor.get_active_compression_failure_cooldown()
+    assert cooldown is not None
+    assert cooldown["remaining_seconds"] > 50
+    assert cooldown["error"] == "auxiliary summarizer unavailable"
+    assert not compressor.maybe_prepare_background(_messages(), current_tokens=80)
+
+
 def test_background_window_preserves_live_previous_summary_lineage():
     compressor = _compressor()
     compressor._previous_summary = "live lineage"
