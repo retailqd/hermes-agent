@@ -1832,6 +1832,23 @@ def init_agent(
             _bind_session_state(session_db=session_db, session_id=agent.session_id)
         except Exception:
             pass
+    _bind_profile_identity = getattr(
+        agent.context_compressor,
+        "bind_profile_identity",
+        None,
+    )
+    if callable(_bind_profile_identity):
+        _active_profile = "default"
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            _active_profile = get_active_profile_name() or "default"
+        except Exception:
+            pass
+        try:
+            _bind_profile_identity(_active_profile)
+        except Exception:
+            pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction

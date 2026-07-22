@@ -1,6 +1,9 @@
+import copy
 import threading
 import time
 from typing import Any
+
+import pytest
 
 from agent.context_compressor import ContextCompressor
 
@@ -88,6 +91,35 @@ def test_background_preparation_uses_live_estimate_when_reported_tokens_are_stal
 
     assert compressor.maybe_prepare_background(_messages(), current_tokens=1)
     assert compressor.wait_for_background_preparation(timeout=1)
+
+
+def test_published_candidate_is_immutable_and_does_not_retain_source_turns(monkeypatch):
+    compressor = _compressor()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            return "prepared summary"
+
+    monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+
+    assert compressor.maybe_prepare_background(_messages(), current_tokens=80)
+    assert compressor.wait_for_background_preparation(timeout=1)
+    candidate = compressor._background_candidate
+    assert candidate is not None
+    assert "turns" not in candidate
+    with pytest.raises(TypeError):
+        candidate["summary"] = "mutated"
+
+
+def test_policy_fingerprint_changes_with_summary_and_partition_semantics():
+    compressor = _compressor()
+    original = compressor._background_policy_fingerprint()
+
+    compressor._CONTENT_MAX += 1
+
+    assert compressor._background_policy_fingerprint() != original
 
 
 def test_exact_background_candidate_is_consumed_without_new_llm_call():
@@ -184,6 +216,104 @@ def test_persistence_marker_does_not_change_semantic_fingerprint():
     assert ContextCompressor._background_source_hash(messages) == before
 
 
+def test_nested_transport_metadata_does_not_change_semantic_fingerprint():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "calling tool",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"},
+                }
+            ],
+        }
+    ]
+    before = ContextCompressor._background_source_hash(messages)
+    messages[0]["tool_calls"][0]["_transport_trace"] = "ephemeral"
+
+    assert ContextCompressor._background_source_hash(messages) == before
+
+
+def test_destructive_prefix_edit_rejects_candidate_and_falls_back_without_loss():
+    compressor = _compressor()
+    messages = _messages()
+    window = compressor._background_window(messages)
+    assert window is not None
+    compressor._background_candidate = {
+        "namespace": compressor._background_namespace(),
+        "source_hash": window["source_hash"],
+        "count": window["count"],
+        "focus_topic": window["focus_topic"],
+        "requested_focus_topic": None,
+        "summary": "stale prepared summary",
+    }
+    messages[2]["content"] = "destructive edit before watermark"
+    captured = []
+
+    def foreground_summary(turns, focus_topic=None):
+        captured.extend(turns)
+        return "fresh foreground summary"
+
+    compressor._generate_summary = foreground_summary
+    compressor.compress(messages, current_tokens=200)
+
+    assert any(
+        message.get("content") == "destructive edit before watermark"
+        for message in captured
+    )
+    assert messages[2]["content"] == "destructive edit before watermark"
+
+
+def test_hard_gate_joins_matching_inflight_preparation_without_duplicate_call():
+    compressor = _compressor()
+    messages = _messages()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    calls = []
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            calls.append("background")
+            worker_started.set()
+            release_worker.wait(2)
+            return "prepared summary"
+
+    compressor._clone_for_background = lambda: Worker()
+
+    def forbidden_foreground_summary(*args, **kwargs):
+        calls.append("foreground")
+        raise AssertionError("hard gate started a duplicate summarizer call")
+
+    compressor._generate_summary = forbidden_foreground_summary
+    assert compressor.maybe_prepare_background(messages, current_tokens=80)
+    assert worker_started.wait(1)
+
+    errors = []
+    results = []
+
+    def run_hard_gate():
+        try:
+            results.append(compressor.compress(messages, current_tokens=200))
+        except Exception as exc:
+            errors.append(exc)
+
+    hard_gate = threading.Thread(target=run_hard_gate)
+    hard_gate.start()
+    time.sleep(0.05)
+    assert hard_gate.is_alive()
+    release_worker.set()
+    hard_gate.join(2)
+
+    assert not hard_gate.is_alive()
+    assert errors == []
+    assert results
+    assert calls == ["background"]
+
+
 def test_background_preparation_respects_failure_cooldown():
     compressor = _compressor()
     compressor._summary_failure_cooldown_until = time.monotonic() + 60
@@ -237,8 +367,8 @@ def test_background_window_preserves_live_previous_summary_lineage():
     assert window["previous_summary"] == "live lineage"
 
 
-def test_session_boundaries_prevent_inflight_worker_from_publishing():
-    for boundary in ("reset", "end"):
+def test_session_model_and_profile_boundaries_prevent_inflight_publish():
+    for boundary in ("reset", "end", "model", "profile"):
         compressor = _compressor()
         release = threading.Event()
         started = threading.Event()
@@ -258,11 +388,102 @@ def test_session_boundaries_prevent_inflight_worker_from_publishing():
         assert started.wait(1)
         if boundary == "reset":
             compressor.on_session_reset()
-        else:
+        elif boundary == "end":
             compressor.on_session_end("session-a", _messages())
+        elif boundary == "model":
+            compressor.update_model("other-model", context_length=240)
+        else:
+            compressor.bind_profile_identity("other-profile")
         release.set()
         assert finished.wait(1)
         assert compressor._background_candidate is None
+
+
+def test_matching_concurrent_preparers_are_single_flight():
+    compressor = _compressor()
+    release = threading.Event()
+    started = threading.Event()
+    calls = []
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            calls.append(len(turns))
+            started.set()
+            release.wait(2)
+            return "one summary"
+
+    setattr(compressor, "_clone_for_background", lambda: Worker())
+    barrier = threading.Barrier(3)
+    results = []
+
+    def schedule():
+        barrier.wait()
+        results.append(compressor.maybe_prepare_background(_messages(), current_tokens=80))
+
+    threads = [threading.Thread(target=schedule) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    assert started.wait(1)
+    for thread in threads:
+        thread.join(1)
+    assert sorted(results) == [False, True]
+    assert len(calls) == 1
+    release.set()
+    assert compressor.wait_for_background_preparation(1)
+
+
+def test_background_capacity_exhaustion_skips_model_call(monkeypatch):
+    compressor = _compressor()
+
+    class ExhaustedSlots:
+        def acquire(self, blocking=False):
+            return False
+
+        def release(self):
+            raise AssertionError("unacquired slot must not be released")
+
+    monkeypatch.setattr(
+        "agent.context_compressor._BACKGROUND_PREPARATION_SLOTS",
+        ExhaustedSlots(),
+    )
+    setattr(
+        compressor,
+        "_clone_for_background",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("capacity exhaustion must not clone a worker")
+        ),
+    )
+
+    assert compressor.maybe_prepare_background(_messages(), current_tokens=80)
+    assert compressor.wait_for_background_preparation(1) is False
+    assert compressor._background_candidate is None
+
+
+def test_hard_gate_timeout_preserves_raw_transcript():
+    compressor = _compressor()
+    messages = _messages()
+    raw_snapshot = copy.deepcopy(messages)
+    setattr(
+        compressor,
+        "_join_compatible_background_preparation",
+        lambda *args, **kwargs: False,
+    )
+    setattr(
+        compressor,
+        "_generate_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("timeout must not start a duplicate foreground call")
+        ),
+    )
+
+    result = compressor.compress(messages, current_tokens=200)
+
+    assert result is messages
+    assert result == raw_snapshot
+    assert compressor._last_compress_aborted is True
 
 
 def test_cancelled_worker_cannot_publish_candidate_or_overlap_replacement():

@@ -24,7 +24,8 @@ import re
 import copy
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
 from agent.context_engine import ContextEngine
@@ -41,7 +42,11 @@ HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
 HISTORICAL_PENDING_ASKS_HEADING = "## Historical Pending User Asks"
 HISTORICAL_REMAINING_WORK_HEADING = "## Historical Remaining Work"
-BACKGROUND_CANDIDATE_VERSION = "context-summary-v1"
+BACKGROUND_CANDIDATE_VERSION = "context-summary-v2"
+SUMMARY_PROMPT_VERSION = "structured-handoff-v1"
+SUMMARY_SERIALIZER_VERSION = "summary-wire-v1"
+_BACKGROUND_JOIN_TIMEOUT_SECONDS = 120.0
+_BACKGROUND_PREPARATION_SLOTS = threading.BoundedSemaphore(4)
 
 
 SUMMARY_PREFIX = (
@@ -1135,7 +1140,8 @@ class ContextCompressor(ContextEngine):
         self._background_thread: Optional[threading.Thread] = None
         self._background_done: Optional[threading.Event] = None
         self._background_active: Optional[Dict[str, Any]] = None
-        self._background_candidate: Optional[Dict[str, Any]] = None
+        self._background_candidate: Optional[Mapping[str, Any]] = None
+        self._profile_identity: str = "default"
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -1166,30 +1172,97 @@ class ContextCompressor(ContextEngine):
             self._background_candidate = None
             if not hasattr(self, "_session_id"):
                 self._session_id = ""
+            if not hasattr(self, "_profile_identity"):
+                self._profile_identity = "default"
+
+    def bind_profile_identity(self, profile_identity: str = "default") -> None:
+        """Bind prepared state to one Hermes profile lineage."""
+        self._ensure_background_state()
+        normalized = str(profile_identity or "default")
+        if normalized != self._profile_identity:
+            self.cancel_background_preparation()
+            self._profile_identity = normalized
+
+    def _background_model_fingerprint(self) -> str:
+        """Fingerprint routing semantics without credentials."""
+        payload = {
+            "model": self.model,
+            "provider": self.provider,
+            "api_mode": self.api_mode,
+            "base_url": self.base_url,
+            "summary_model": self.summary_model,
+            "context_length": self.context_length,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _background_policy_fingerprint(self) -> str:
+        """Hash every setting that changes prefix selection or summary output."""
+        payload = {
+            "candidate_version": BACKGROUND_CANDIDATE_VERSION,
+            "prompt_version": SUMMARY_PROMPT_VERSION,
+            "serializer_version": SUMMARY_SERIALIZER_VERSION,
+            "threshold_percent": self.threshold_percent,
+            "threshold_tokens": self.threshold_tokens,
+            "protect_first_n": self.protect_first_n,
+            "protect_last_n": self.protect_last_n,
+            "summary_target_ratio": self.summary_target_ratio,
+            "tail_token_budget": self.tail_token_budget,
+            "max_summary_tokens": self.max_summary_tokens,
+            "max_tokens": self.max_tokens,
+            "abort_on_summary_failure": self.abort_on_summary_failure,
+            "summary_chunk_input_budget": self._summary_chunk_input_budget(),
+            "summary_ratio": _SUMMARY_RATIO,
+            "minimum_summary_tokens": _MIN_SUMMARY_TOKENS,
+            "summary_tokens_ceiling": _SUMMARY_TOKENS_CEILING,
+            "content_max": self._CONTENT_MAX,
+            "content_head": self._CONTENT_HEAD,
+            "content_tail": self._CONTENT_TAIL,
+            "tool_args_max": self._TOOL_ARGS_MAX,
+            "tool_args_head": self._TOOL_ARGS_HEAD,
+            "fallback_summary_max_chars": _FALLBACK_SUMMARY_MAX_CHARS,
+            "fallback_turn_max_chars": _FALLBACK_TURN_MAX_CHARS,
+            "auto_focus_max_turns": _AUTO_FOCUS_MAX_TURNS,
+            "auto_focus_turn_max_chars": _AUTO_FOCUS_TURN_MAX_CHARS,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _background_namespace(self) -> tuple:
         """Return the identity boundary for a reusable prepared summary."""
         self._ensure_background_state()
         return (
             self._session_id,
-            self.model,
-            self.provider,
-            self.api_mode,
-            self.base_url,
-            self.summary_model,
-            self.context_length,
+            self._profile_identity,
+            self._background_model_fingerprint(),
+            self._background_policy_fingerprint(),
             BACKGROUND_CANDIDATE_VERSION,
         )
 
     @staticmethod
     def _background_source_hash(messages: List[Dict[str, Any]]) -> str:
         # Persistence and transport markers mutate live dicts after preparation
-        # but do not change semantic conversation content. Exclude private
-        # top-level fields so flush-to-SQLite cannot invalidate a valid candidate.
-        semantic_messages = [
-            {key: value for key, value in message.items() if not str(key).startswith("_")}
-            for message in messages
-        ]
+        # but do not change semantic conversation content. Hash only fields the
+        # compressor can serialize, recursively excluding private metadata.
+        def _without_private_metadata(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: _without_private_metadata(item)
+                    for key, item in value.items()
+                    if not str(key).startswith("_")
+                }
+            if isinstance(value, (list, tuple)):
+                return [_without_private_metadata(item) for item in value]
+            return value
+
+        semantic_messages = []
+        for message in messages:
+            semantic_message = {
+                key: _without_private_metadata(message[key])
+                for key in ("role", "content", "name", "tool_call_id", "tool_calls")
+                if key in message
+            }
+            semantic_messages.append(semantic_message)
         payload = json.dumps(
             semantic_messages,
             sort_keys=True,
@@ -1329,16 +1402,23 @@ class ContextCompressor(ContextEngine):
             generation = self._background_generation
             done = threading.Event()
             self._background_done = done
+            window["generation"] = generation
             self._background_active = window
 
         preparation_started_at = time.monotonic()
 
         def _prepare() -> None:
-            candidate: Optional[Dict[str, Any]] = None
+            candidate: Optional[Mapping[str, Any]] = None
             worker_cooldown: Optional[Dict[str, Any]] = None
             worker: Optional["ContextCompressor"] = None
             published = False
+            slot_acquired = _BACKGROUND_PREPARATION_SLOTS.acquire(blocking=False)
             try:
+                if not slot_acquired:
+                    logger.info(
+                        "Background context preparation skipped: capacity exhausted"
+                    )
+                    return
                 worker = self._clone_for_background()
                 worker._previous_summary = window["previous_summary"]
                 summary = worker._generate_summary(
@@ -1346,21 +1426,37 @@ class ContextCompressor(ContextEngine):
                     focus_topic=window["focus_topic"],
                 )
                 if summary:
-                    candidate = {
-                        **window,
+                    candidate = MappingProxyType({
+                        "namespace": window["namespace"],
+                        "source_hash": window["source_hash"],
+                        "count": window["count"],
+                        "focus_topic": window["focus_topic"],
+                        "requested_focus_topic": window["requested_focus_topic"],
                         "summary": summary,
                         "prepared_at": time.time(),
-                    }
+                        "elapsed_seconds": time.monotonic() - preparation_started_at,
+                        "state": "ready",
+                    })
             except Exception as exc:
                 logger.warning("Background context preparation failed: %s", exc)
             finally:
-                cooldown_getter = getattr(worker, "get_active_compression_failure_cooldown", None)
-                if cooldown_getter:
-                    worker_cooldown = cooldown_getter()
-                if worker_cooldown:
-                    self._record_compression_failure_cooldown(
-                        float(worker_cooldown.get("remaining_seconds") or 0.0),
-                        worker_cooldown.get("error"),
+                try:
+                    cooldown_getter = getattr(
+                        worker,
+                        "get_active_compression_failure_cooldown",
+                        None,
+                    )
+                    if cooldown_getter:
+                        worker_cooldown = cooldown_getter()
+                    if worker_cooldown:
+                        self._record_compression_failure_cooldown(
+                            float(worker_cooldown.get("remaining_seconds") or 0.0),
+                            worker_cooldown.get("error"),
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "Could not propagate background compression cooldown: %s",
+                        exc,
                     )
                 with self._background_lock:
                     if generation == self._background_generation:
@@ -1373,6 +1469,8 @@ class ContextCompressor(ContextEngine):
                         self._background_thread = None
                         self._background_done = None
                     done.set()
+                if slot_acquired:
+                    _BACKGROUND_PREPARATION_SLOTS.release()
                 if published:
                     logger.info(
                         "Background context preparation ready: session=%s messages=%d elapsed=%.1fs",
@@ -1398,6 +1496,41 @@ class ContextCompressor(ContextEngine):
         )
         return True
 
+    def _join_compatible_background_preparation(
+        self,
+        turns: List[Dict[str, Any]],
+        requested_focus_topic: Optional[str] = None,
+        timeout: float = _BACKGROUND_JOIN_TIMEOUT_SECONDS,
+    ) -> Optional[bool]:
+        """Join an in-flight worker for this exact prefix.
+
+        Returns ``None`` when the active worker is unrelated, ``True`` when it
+        completed, and ``False`` on timeout. A timeout is fail-closed at the
+        hard gate so the foreground never starts a duplicate provider call.
+        """
+        self._ensure_background_state()
+        with self._background_lock:
+            active = self._background_active
+            done = self._background_done
+            generation = self._background_generation
+            if not active or done is None:
+                return None
+            if active.get("generation") != generation:
+                return None
+            if active.get("namespace") != self._background_namespace():
+                return None
+            if (active.get("requested_focus_topic") or None) != (
+                requested_focus_topic or None
+            ):
+                return None
+            covered = int(active.get("count") or 0)
+            source_hash = active.get("source_hash")
+        if covered <= 0 or covered > len(turns):
+            return None
+        if self._background_source_hash(turns[:covered]) != source_hash:
+            return None
+        return done.wait(max(0.0, float(timeout)))
+
     def wait_for_background_preparation(self, timeout: float = 0.0) -> bool:
         """Wait only when a caller explicitly chooses to; live turns use zero."""
         self._ensure_background_state()
@@ -1418,7 +1551,11 @@ class ContextCompressor(ContextEngine):
         """Reuse a valid prepared prefix and summarize only an appended tail."""
         self._ensure_background_state()
         with self._background_lock:
-            candidate = copy.deepcopy(self._background_candidate)
+            candidate = (
+                dict(self._background_candidate)
+                if self._background_candidate is not None
+                else None
+            )
         if not candidate or candidate.get("namespace") != self._background_namespace():
             return None
         if (candidate.get("requested_focus_topic") or None) != (requested_focus_topic or None):
@@ -3223,6 +3360,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
+        original_messages = messages
         # NOTE: do NOT reset _last_summary_auth_failure or
         # _last_summary_network_failure here.  These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
@@ -3335,8 +3473,26 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary. A valid background candidate
         # covers an immutable prefix; when the hard gate moves, only the newly
-        # appended suffix is summarized synchronously.
+        # appended suffix is summarized synchronously. If the matching worker
+        # is still running, join it instead of issuing the same provider call
+        # twice. A bounded join timeout preserves the raw transcript unchanged.
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+        background_join = self._join_compatible_background_preparation(
+            turns_to_summarize,
+            requested_focus_topic=focus_topic,
+        )
+        if background_join is False:
+            self._last_summary_error = (
+                "Timed out waiting for compatible background context preparation"
+            )
+            self._last_compress_aborted = True
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression aborted after waiting %.0fs for matching "
+                    "background preparation; transcript preserved",
+                    _BACKGROUND_JOIN_TIMEOUT_SECONDS,
+                )
+            return original_messages
         summary = self._consume_background_candidate(
             turns_to_summarize,
             summary_focus_topic,

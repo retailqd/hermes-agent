@@ -446,6 +446,74 @@ class TestAgentCacheLifecycle:
         assert cached[1] == sig
         assert cached[0] is agent1  # same instance
 
+    def test_mattermost_thread_cache_preserves_prepared_candidate(self):
+        """Mattermost thread turns reuse the AIAgent that owns preparation."""
+        from run_agent import AIAgent
+
+        runner = _make_runner()
+        session_key = "agent:default:mattermost:channel:thread-root"
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4",
+            api_key="test",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            max_iterations=5,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            platform="mattermost",
+        )
+        compressor = getattr(agent, "context_compressor")
+        assert compressor._profile_identity == "default"
+        compressor.context_length = 100
+        compressor.threshold_percent = 0.5
+        compressor.threshold_tokens = 50
+        compressor.protect_first_n = 1
+        compressor.protect_last_n = 2
+        compressor.tail_token_budget = 20
+        compressor.bind_session_state(session_id="mm-thread-lineage")
+        messages = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"mattermost-{index} " + ("x" * 120),
+            }
+            for index in range(12)
+        ]
+
+        class Worker:
+            _previous_summary = None
+
+            def _generate_summary(self, turns, focus_topic=None):
+                return "prepared Mattermost summary"
+
+        setattr(compressor, "_clone_for_background", lambda: Worker())
+        assert compressor.maybe_prepare_background(messages, current_tokens=80)
+        assert compressor.wait_for_background_preparation(1)
+        candidate = compressor._background_candidate
+        assert candidate is not None
+
+        with runner._agent_cache_lock:
+            runner._agent_cache[session_key] = (agent, "mattermost-config")
+        with runner._agent_cache_lock:
+            cached_agent = runner._agent_cache[session_key][0]
+
+        assert cached_agent is agent
+        assert cached_agent.context_compressor._background_candidate is candidate
+        window = compressor._background_window(messages)
+        assert window is not None
+        setattr(
+            compressor,
+            "_generate_summary",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("cache hit must consume without a second call")
+            ),
+        )
+        summary = compressor._consume_background_candidate(
+            window["turns"],
+            window["focus_topic"],
+        )
+        assert summary == "prepared Mattermost summary"
+
     def test_cache_miss_on_model_change(self):
         """Model change produces different signature → cache miss."""
         from run_agent import AIAgent
