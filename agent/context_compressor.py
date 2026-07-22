@@ -21,6 +21,8 @@ import json
 import logging
 import sqlite3
 import re
+import copy
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -39,6 +41,7 @@ HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
 HISTORICAL_PENDING_ASKS_HEADING = "## Historical Pending User Asks"
 HISTORICAL_REMAINING_WORK_HEADING = "## Historical Remaining Work"
+BACKGROUND_CANDIDATE_VERSION = "context-summary-v1"
 
 
 SUMMARY_PREFIX = (
@@ -696,6 +699,9 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
     return f"[{tool_name}]{first_arg} ({content_len:,} chars result)"
 
 
+_BACKGROUND_STATE_INIT_LOCK = threading.Lock()
+
+
 class ContextCompressor(ContextEngine):
     """Default context engine — compresses conversation context via lossy summarization.
 
@@ -713,6 +719,7 @@ class ContextCompressor(ContextEngine):
 
     def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset."""
+        self.cancel_background_preparation()
         super().on_session_reset()
         self._context_probed = False
         self._context_probe_persistable = False
@@ -751,6 +758,7 @@ class ContextCompressor(ContextEngine):
         point of use; this is defense-in-depth that resets the full per-session
         surface the moment the owning session ends.
         """
+        self.cancel_background_preparation()
         self._previous_summary = None
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
@@ -770,6 +778,8 @@ class ContextCompressor(ContextEngine):
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
+        if hasattr(self, "_background_lock"):
+            self.cancel_background_preparation()
         self._session_db = session_db
         self._session_id = session_id or ""
         self._summary_failure_cooldown_until = 0.0
@@ -877,6 +887,8 @@ class ContextCompressor(ContextEngine):
         max_tokens: int | None = None,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
+        if hasattr(self, "_background_lock"):
+            self.cancel_background_preparation()
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -1114,6 +1126,17 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
 
+        # A soft-threshold worker may summarize a closed prefix while the live
+        # turn continues. Candidates stay in-memory and generation-scoped: a
+        # restart falls back to the normal hard path, while session/model
+        # changes invalidate old work without blocking the foreground turn.
+        self._background_lock = threading.RLock()
+        self._background_generation = 0
+        self._background_thread: Optional[threading.Thread] = None
+        self._background_done: Optional[threading.Event] = None
+        self._background_active: Optional[Dict[str, Any]] = None
+        self._background_candidate: Optional[Dict[str, Any]] = None
+
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
@@ -1127,6 +1150,281 @@ class ContextCompressor(ContextEngine):
             else:
                 self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+
+    def _ensure_background_state(self) -> None:
+        """Initialize background fields for legacy/factory-created instances."""
+        if hasattr(self, "_background_lock"):
+            return
+        with _BACKGROUND_STATE_INIT_LOCK:
+            if hasattr(self, "_background_lock"):
+                return
+            self._background_lock = threading.RLock()
+            self._background_generation = 0
+            self._background_thread = None
+            self._background_done = None
+            self._background_active = None
+            self._background_candidate = None
+            if not hasattr(self, "_session_id"):
+                self._session_id = ""
+
+    def _background_namespace(self) -> tuple:
+        """Return the identity boundary for a reusable prepared summary."""
+        self._ensure_background_state()
+        return (
+            self._session_id,
+            self.model,
+            self.provider,
+            self.api_mode,
+            self.base_url,
+            self.summary_model,
+            self.context_length,
+            BACKGROUND_CANDIDATE_VERSION,
+        )
+
+    @staticmethod
+    def _background_source_hash(messages: List[Dict[str, Any]]) -> str:
+        # Persistence and transport markers mutate live dicts after preparation
+        # but do not change semantic conversation content. Exclude private
+        # top-level fields so flush-to-SQLite cannot invalidate a valid candidate.
+        semantic_messages = [
+            {key: value for key, value in message.items() if not str(key).startswith("_")}
+            for message in messages
+        ]
+        payload = json.dumps(
+            semantic_messages,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def cancel_background_preparation(self) -> None:
+        """Invalidate prepared/in-flight work without blocking the live turn.
+
+        Python cannot safely terminate an in-flight HTTP request in another
+        thread. Incrementing the generation makes its eventual result
+        unpublishable. The active marker remains until that worker exits, so a
+        second provider call cannot start concurrently for this session.
+        """
+        self._ensure_background_state()
+        with self._background_lock:
+            self._background_generation += 1
+            self._background_candidate = None
+            done = None
+            if self._background_active is None:
+                done = self._background_done
+                self._background_done = None
+        if done is not None:
+            done.set()
+
+    def _clone_for_background(self) -> "ContextCompressor":
+        """Create an isolated compressor so worker state cannot race foreground."""
+        worker = ContextCompressor(
+            model=self.model,
+            threshold_percent=self.threshold_percent,
+            protect_first_n=self.protect_first_n,
+            protect_last_n=self.protect_last_n,
+            summary_target_ratio=self.summary_target_ratio,
+            quiet_mode=True,
+            summary_model_override=self.summary_model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            config_context_length=self.context_length,
+            provider=self.provider,
+            api_mode=self.api_mode,
+            abort_on_summary_failure=True,
+            max_tokens=self.max_tokens,
+        )
+        worker._previous_summary = self._previous_summary
+        return worker
+
+    def _background_window(
+        self,
+        messages: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Build the same closed compression prefix used by ``compress()``."""
+        if not messages:
+            return None
+        snapshot = copy.deepcopy(messages)
+        min_messages = self._protect_head_size(snapshot) + 4
+        if len(snapshot) <= min_messages:
+            return None
+        snapshot, _ = self._prune_old_tool_results(
+            snapshot,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        compress_start = self._align_boundary_forward(
+            snapshot,
+            self._protect_head_size(snapshot),
+        )
+        compress_end = self._find_tail_cut_by_tokens(snapshot, compress_start)
+        if compress_start >= compress_end:
+            return None
+        turns = snapshot[compress_start:compress_end]
+        summary_search_start = 1 if snapshot and snapshot[0].get("role") == "system" else 0
+        summary_idx, summary_body = self._find_latest_context_summary(
+            snapshot,
+            summary_search_start,
+            compress_end,
+        )
+        previous_summary = self._previous_summary
+        if summary_idx is not None:
+            if summary_body and not previous_summary:
+                previous_summary = summary_body
+            turns = snapshot[max(compress_start, summary_idx + 1):compress_end]
+        elif previous_summary:
+            previous_summary = None
+        if not turns:
+            return None
+        focus = focus_topic or self._derive_auto_focus_topic(snapshot)
+        return {
+            "turns": turns,
+            "count": len(turns),
+            "source_hash": self._background_source_hash(turns),
+            "focus_topic": focus,
+            "requested_focus_topic": focus_topic,
+            "previous_summary": previous_summary,
+            "namespace": self._background_namespace(),
+        }
+
+    def maybe_prepare_background(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+        soft_ratio: float = 0.70,
+    ) -> bool:
+        """Start non-blocking summary preparation above a soft threshold."""
+        self._ensure_background_state()
+        tokens = current_tokens if current_tokens is not None else self.last_prompt_tokens
+        if tokens <= 0:
+            tokens = estimate_messages_tokens_rough(messages)
+        ratio = max(0.25, min(float(soft_ratio), 0.95))
+        if tokens < int(self.threshold_tokens * ratio):
+            return False
+        # Respect the same durable/local failure backoff as foreground
+        # compression. Background preparation must not turn a transient provider
+        # outage into one extra LLM call on every user turn.
+        if self.get_active_compression_failure_cooldown():
+            return False
+        window = self._background_window(messages, focus_topic)
+        if not window:
+            return False
+
+        with self._background_lock:
+            if (
+                self._background_candidate
+                and self._background_candidate.get("source_hash") == window["source_hash"]
+                and self._background_candidate.get("namespace") == window["namespace"]
+            ):
+                return False
+            if self._background_active:
+                return False
+            self._background_generation += 1
+            generation = self._background_generation
+            done = threading.Event()
+            self._background_done = done
+            self._background_active = window
+
+        def _prepare() -> None:
+            candidate: Optional[Dict[str, Any]] = None
+            try:
+                worker = self._clone_for_background()
+                worker._previous_summary = window["previous_summary"]
+                summary = worker._generate_summary(
+                    window["turns"],
+                    focus_topic=window["focus_topic"],
+                )
+                if summary:
+                    candidate = {
+                        **window,
+                        "summary": summary,
+                        "prepared_at": time.time(),
+                    }
+            except Exception as exc:
+                logger.warning("Background context preparation failed: %s", exc)
+            finally:
+                with self._background_lock:
+                    if generation == self._background_generation:
+                        self._background_candidate = candidate
+                    # No newer worker can exist while _background_active is set.
+                    # Clear the slot even when this generation was cancelled.
+                    if self._background_done is done:
+                        self._background_active = None
+                        self._background_thread = None
+                        self._background_done = None
+                    done.set()
+
+        thread = threading.Thread(
+            target=_prepare,
+            name=f"context-prepare-{self._session_id or 'anonymous'}",
+            daemon=True,
+        )
+        with self._background_lock:
+            self._background_thread = thread
+        thread.start()
+        logger.info(
+            "Background context preparation started: session=%s messages=%d tokens=%d hard_threshold=%d",
+            self._session_id or "none",
+            window["count"],
+            tokens,
+            self.threshold_tokens,
+        )
+        return True
+
+    def wait_for_background_preparation(self, timeout: float = 0.0) -> bool:
+        """Wait only when a caller explicitly chooses to; live turns use zero."""
+        self._ensure_background_state()
+        with self._background_lock:
+            done = self._background_done
+        if done is None:
+            return bool(self._background_candidate)
+        done.wait(max(0.0, float(timeout)))
+        with self._background_lock:
+            return bool(self._background_candidate)
+
+    def _consume_background_candidate(
+        self,
+        turns: List[Dict[str, Any]],
+        focus_topic: Optional[str],
+        requested_focus_topic: Optional[str] = None,
+    ) -> Optional[str]:
+        """Reuse a valid prepared prefix and summarize only an appended tail."""
+        self._ensure_background_state()
+        with self._background_lock:
+            candidate = copy.deepcopy(self._background_candidate)
+        if not candidate or candidate.get("namespace") != self._background_namespace():
+            return None
+        if (candidate.get("requested_focus_topic") or None) != (requested_focus_topic or None):
+            return None
+        covered = int(candidate.get("count") or 0)
+        if covered <= 0 or covered > len(turns):
+            return None
+        if self._background_source_hash(turns[:covered]) != candidate.get("source_hash"):
+            return None
+        summary = str(candidate.get("summary") or "")
+        if not summary:
+            return None
+        if covered < len(turns):
+            previous = self._previous_summary
+            self._previous_summary = summary
+            summary = self._generate_summary(
+                turns[covered:],
+                focus_topic=focus_topic,
+            )
+            if not summary:
+                self._previous_summary = previous
+                return None
+        logger.info(
+            "Background context candidate consumed: session=%s prepared=%d tail=%d",
+            self._session_id or "none",
+            covered,
+            len(turns) - covered,
+        )
+        return summary
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
@@ -3012,9 +3310,20 @@ This compaction should PRIORITISE preserving all information related to the focu
                 tail_msgs,
             )
 
-        # Phase 3: Generate structured summary
+        # Phase 3: Generate structured summary. A valid background candidate
+        # covers an immutable prefix; when the hard gate moves, only the newly
+        # appended suffix is summarized synchronously.
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        summary = self._consume_background_candidate(
+            turns_to_summarize,
+            summary_focus_topic,
+            requested_focus_topic=focus_topic,
+        )
+        if not summary:
+            summary = self._generate_summary(
+                turns_to_summarize,
+                focus_topic=summary_focus_topic,
+            )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -3247,4 +3556,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # future copy site cannot re-leak the marker into the child-session flush.
         _strip_persistence_markers(compressed)
 
+        # This candidate has now been committed into the compacted transcript.
+        # Invalidate it so the next generation starts from the new lineage.
+        self.cancel_background_preparation()
         return compressed

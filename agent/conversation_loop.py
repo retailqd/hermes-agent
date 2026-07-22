@@ -4659,6 +4659,17 @@ def run_conversation(
 
                 messages.append(assistant_msg)
                 agent._emit_interim_assistant_message(assistant_msg)
+                if agent.compression_enabled:
+                    try:
+                        agent.context_compressor.maybe_prepare_background(
+                            messages,
+                            current_tokens=agent.context_compressor.last_prompt_tokens,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Background context preparation scheduling failed",
+                            exc_info=True,
+                        )
                 try:
                     # Persist the assistant tool-call turn before any tool
                     # side effects run. If a destructive tool restarts or
@@ -5224,7 +5235,18 @@ def run_conversation(
                     continue
 
                 messages.append(final_msg)
-                
+                if agent.compression_enabled:
+                    try:
+                        agent.context_compressor.maybe_prepare_background(
+                            messages,
+                            current_tokens=agent.context_compressor.last_prompt_tokens,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Background context preparation scheduling failed",
+                            exc_info=True,
+                        )
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
