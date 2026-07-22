@@ -37,12 +37,18 @@ MATTERMOST_FREE_RESPONSE_CHANNELS='' \
 
 The benchmark is synthetic and deterministic. It measures critical-path hard-gate latency with a sleeping fake summarizer, not provider or production latency. The local run on 2026-07-22 produced:
 
-- synchronous baseline hard gate median: **84.221 ms**
-- prepared candidate hard gate median: **0.287 ms**
-- background preparation median, off critical path: **84.627 ms**
-- measured median hard-gate speedup in that synthetic run: **293.31x**
+- synchronous baseline hard gate median: **84.482 ms**
+- prepared candidate hard gate median: **0.411 ms**
+- background preparation median, excluded from the hard-gate timing: **84.850 ms**
+- synthetic hard-gate speedup excluding preparation: **205.79x**
+- prepared total median when preparation is not hidden: **85.309 ms**
+- synthetic total speedup when preparation is not hidden: **0.99x**
 
-These seven-run numbers must not be presented as live Mattermost or provider timings.
+These seven-run numbers must not be presented as live Mattermost or provider timings. The hard-gate speedup applies only when preparation completed off the critical path before the gate.
+
+## Residual local validation limit
+
+The local Mattermost cache test proves that the same cached `AIAgent` retains its prepared candidate, but it seeds the cache directly. It does not drive the complete live adapter and `_run_agent_inner` lookup path. Therefore the candidate is not releasable from local tests alone. The organic Mattermost gate below must verify real thread-to-session routing and same-agent reuse before production acceptance.
 
 ## Release decision required
 

@@ -143,6 +143,36 @@ def test_exact_background_candidate_is_consumed_without_new_llm_call():
     assert compressor._consume_background_candidate(turns, "topic") == "prepared summary"
 
 
+def test_compress_exact_ready_candidate_avoids_second_call_and_preserves_boundaries(
+    monkeypatch,
+):
+    compressor = _compressor()
+    messages = _messages()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            return "prepared exact summary"
+
+    monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+    assert compressor.maybe_prepare_background(messages, current_tokens=80)
+    assert compressor.wait_for_background_preparation(1)
+    monkeypatch.setattr(
+        compressor,
+        "_generate_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ready candidate started a second summarizer call")
+        ),
+    )
+
+    result = compressor.compress(messages, current_tokens=200)
+
+    assert result[0] == messages[0]
+    assert result[-2:] == messages[-2:]
+    assert any("prepared exact summary" in str(item.get("content")) for item in result)
+
+
 def test_manual_focus_rejects_automatic_background_candidate():
     compressor = _compressor()
     turns = _messages(4)
@@ -191,6 +221,49 @@ def test_background_candidate_summarizes_only_appended_tail():
 
     assert compressor._consume_background_candidate(turns, "topic") == "combined summary"
     assert captured == turns[3:]
+
+
+def test_compress_append_after_watermark_summarizes_only_public_path_delta(monkeypatch):
+    compressor = _compressor()
+    messages = _messages()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            return "prepared prefix summary"
+
+    monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+    assert compressor.maybe_prepare_background(messages, current_tokens=80)
+    assert compressor.wait_for_background_preparation(1)
+    candidate = compressor._background_candidate
+    assert candidate is not None
+    prepared_count = int(candidate["count"])
+
+    appended = messages + [
+        {"role": "user", "content": "append-only user delta"},
+        {"role": "assistant", "content": "append-only assistant delta"},
+    ]
+    hard_gate_window = compressor._background_window(appended)
+    assert hard_gate_window is not None
+    expected_delta = hard_gate_window["turns"][prepared_count:]
+    received = []
+
+    def summarize_delta(turns, focus_topic=None):
+        received.append(copy.deepcopy(turns))
+        return "prepared prefix plus delta summary"
+
+    monkeypatch.setattr(compressor, "_generate_summary", summarize_delta)
+
+    result = compressor.compress(appended, current_tokens=200)
+
+    assert received == [expected_delta]
+    assert result[0] == appended[0]
+    assert result[-2:] == appended[-2:]
+    assert any(
+        "prepared prefix plus delta summary" in str(item.get("content"))
+        for item in result
+    )
 
 
 def test_model_or_session_namespace_change_rejects_candidate():
@@ -252,18 +325,70 @@ def test_destructive_prefix_edit_rejects_candidate_and_falls_back_without_loss()
     messages[2]["content"] = "destructive edit before watermark"
     captured = []
 
-    def foreground_summary(turns, focus_topic=None):
-        captured.extend(turns)
-        return "fresh foreground summary"
+    def foreground_summary(turns_to_summarize, focus_topic=None):
+        captured.extend(turns_to_summarize)
+        contents = " | ".join(
+            str(turn.get("content") or "") for turn in turns_to_summarize
+        )
+        return f"fresh foreground summary: {contents}"
 
     compressor._generate_summary = foreground_summary
-    compressor.compress(messages, current_tokens=200)
+    result = compressor.compress(messages, current_tokens=200)
 
     assert any(
         message.get("content") == "destructive edit before watermark"
         for message in captured
     )
     assert messages[2]["content"] == "destructive edit before watermark"
+    assert result[0] == messages[0]
+    assert result[-2:] == messages[-2:]
+    assert any(
+        "destructive edit before watermark" in str(item.get("content"))
+        for item in result
+    )
+
+
+def test_background_path_preserves_tool_call_result_group_at_tail_boundary(monkeypatch):
+    compressor = _compressor()
+    compressor.protect_last_n = 1
+    messages = _messages(8) + [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-tail",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"x\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-tail", "content": "tool result"},
+    ]
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            assert not any(turn.get("tool_call_id") == "call-tail" for turn in turns)
+            return "prepared tool-safe summary"
+
+    monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+    assert compressor.maybe_prepare_background(messages, current_tokens=80)
+    assert compressor.wait_for_background_preparation(1)
+    monkeypatch.setattr(
+        compressor,
+        "_generate_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("tool-safe candidate started a second call")
+        ),
+    )
+
+    result = compressor.compress(messages, current_tokens=200)
+
+    assert result[-2:] == messages[-2:]
+    assert result[-2]["tool_calls"][0]["id"] == "call-tail"
+    assert result[-1]["tool_call_id"] == "call-tail"
 
 
 def test_hard_gate_joins_matching_inflight_preparation_without_duplicate_call():
@@ -396,6 +521,29 @@ def test_session_model_and_profile_boundaries_prevent_inflight_publish():
             compressor.bind_profile_identity("other-profile")
         release.set()
         assert finished.wait(1)
+        assert compressor._background_candidate is None
+
+
+def test_model_and_profile_changes_invalidate_already_published_candidate(monkeypatch):
+    for boundary in ("model", "profile"):
+        compressor = _compressor()
+
+        class Worker:
+            _previous_summary = None
+
+            def _generate_summary(self, turns, focus_topic=None):
+                return "published candidate"
+
+        monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+        assert compressor.maybe_prepare_background(_messages(), current_tokens=80)
+        assert compressor.wait_for_background_preparation(1)
+        assert compressor._background_candidate is not None
+
+        if boundary == "model":
+            compressor.update_model("post-publish-model", context_length=240)
+        else:
+            compressor.bind_profile_identity("post-publish-profile")
+
         assert compressor._background_candidate is None
 
 

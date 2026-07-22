@@ -125,6 +125,10 @@ def main() -> None:
     prepared_gate, preparation = benchmark_prepared()
     baseline_median = statistics.median(baseline)
     prepared_median = statistics.median(prepared_gate)
+    prepared_total_if_not_hidden = [
+        prep + gate for prep, gate in zip(preparation, prepared_gate, strict=True)
+    ]
+    prepared_total_median = statistics.median(prepared_total_if_not_hidden)
     result = {
         "kind": "synthetic_deterministic_sleep",
         "runs": RUNS,
@@ -132,13 +136,23 @@ def main() -> None:
         "baseline_hard_gate": summarize(baseline),
         "prepared_hard_gate": summarize(prepared_gate),
         "background_preparation_off_critical_path": summarize(preparation),
-        "measured_median_hard_gate_speedup": round(
+        "prepared_total_if_preparation_is_not_hidden": summarize(
+            prepared_total_if_not_hidden
+        ),
+        "synthetic_hard_gate_speedup_excluding_preparation": round(
             baseline_median / prepared_median,
             2,
         ),
+        "synthetic_total_speedup_if_preparation_is_not_hidden": round(
+            baseline_median / prepared_total_median,
+            2,
+        ),
+        "preparation_excluded_from_hard_gate_speedup": True,
         "disclaimer": (
-            "Synthetic local timing only. No provider, network, Gateway restart, "
-            "or live Mattermost request was used."
+            "Synthetic local timing only. The hard-gate speedup excludes the "
+            "background preparation cost and applies only when preparation finishes "
+            "before the gate. No provider, network, Gateway restart, or live "
+            "Mattermost request was used."
         ),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
