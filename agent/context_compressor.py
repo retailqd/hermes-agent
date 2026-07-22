@@ -1141,6 +1141,12 @@ class ContextCompressor(ContextEngine):
         self._background_done: Optional[threading.Event] = None
         self._background_active: Optional[Dict[str, Any]] = None
         self._background_candidate: Optional[Mapping[str, Any]] = None
+        # A cached Gateway agent can receive overlapping requests after the
+        # caller releases its history lock. Coalesce only operations that are
+        # concurrently in flight; later sequential calls retain the historical
+        # compression semantics.
+        self._compression_lock = threading.RLock()
+        self._compression_active: Optional[Dict[str, Any]] = None
         self._profile_identity: str = "default"
 
     def update_from_response(self, usage: Dict[str, Any]):
@@ -1170,6 +1176,8 @@ class ContextCompressor(ContextEngine):
             self._background_done = None
             self._background_active = None
             self._background_candidate = None
+            self._compression_lock = threading.RLock()
+            self._compression_active = None
             if not hasattr(self, "_session_id"):
                 self._session_id = ""
             if not hasattr(self, "_profile_identity"):
@@ -3330,7 +3338,76 @@ This compaction should PRIORITISE preserving all information related to the focu
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
+    def compress(self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None, focus_topic: Optional[str] = None, force: bool = False) -> List[Dict[str, Any]]:
+        """Serialize hard gates and coalesce identical in-flight snapshots.
+
+        Gateway request handling intentionally releases its history lock before
+        compression. Two overlapping requests can therefore reach one cached
+        compressor with the same prepared candidate. The underlying compressor
+        mutates iterative-summary and diagnostic state, so only one complete
+        compression operation may run at a time. A request with the same key
+        waits for and reuses the in-flight result. A different or later request
+        runs normally after the active operation exits.
+        """
+        self._ensure_background_state()
+
+        while True:
+            operation_key = (
+                self._background_namespace(),
+                self._background_source_hash(messages),
+                focus_topic or None,
+                bool(force),
+            )
+            owner = False
+            matching_operation = False
+            with self._compression_lock:
+                operation = self._compression_active
+                if operation is None:
+                    operation = {
+                        "key": operation_key,
+                        "done": threading.Event(),
+                        "result": None,
+                        "error": None,
+                        "waiters": 0,
+                    }
+                    self._compression_active = operation
+                    owner = True
+                elif operation.get("key") == operation_key:
+                    operation["waiters"] = int(operation.get("waiters") or 0) + 1
+                    matching_operation = True
+
+            if owner:
+                break
+
+            operation["done"].wait()
+            if matching_operation:
+                error = operation.get("error")
+                if error is not None:
+                    raise error
+                return copy.deepcopy(operation["result"])
+            # A different snapshot was serialized behind the active operation.
+            # Recompute its namespace after waiting in case session/model/profile
+            # identity changed while the first compression was running.
+
+        try:
+            result = self._compress_once(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                force=force,
+            )
+            operation["result"] = copy.deepcopy(result)
+            return result
+        except BaseException as exc:
+            operation["error"] = exc
+            raise
+        finally:
+            with self._compression_lock:
+                if self._compression_active is operation:
+                    self._compression_active = None
+                operation["done"].set()
+
+    def _compress_once(self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None, focus_topic: Optional[str] = None, force: bool = False) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:

@@ -266,6 +266,73 @@ def test_compress_append_after_watermark_summarizes_only_public_path_delta(monke
     )
 
 
+def test_concurrent_hard_gates_coalesce_identical_candidate_consumption(monkeypatch):
+    compressor = _compressor()
+    messages = _messages()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            return "prepared concurrent prefix"
+
+    monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+    assert compressor.maybe_prepare_background(messages, current_tokens=80)
+    assert compressor.wait_for_background_preparation(1)
+
+    appended = messages + [
+        {"role": "user", "content": "concurrent append user"},
+        {"role": "assistant", "content": "concurrent append assistant"},
+    ]
+    summary_started = threading.Event()
+    release_summary = threading.Event()
+    summary_calls = []
+
+    def summarize_delta(turns, focus_topic=None):
+        summary_calls.append(copy.deepcopy(turns))
+        summary_started.set()
+        assert release_summary.wait(2)
+        return "single-flight candidate plus delta"
+
+    monkeypatch.setattr(compressor, "_generate_summary", summarize_delta)
+    start = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def run_hard_gate():
+        try:
+            start.wait(2)
+            results.append(compressor.compress(appended, current_tokens=200))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_hard_gate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    start.wait(2)
+    assert summary_started.wait(1)
+    deadline = time.monotonic() + 1
+    waiter_count = 0
+    while time.monotonic() < deadline:
+        with compressor._compression_lock:
+            active = compressor._compression_active
+            waiter_count = int(active.get("waiters") or 0) if active else 0
+        if waiter_count == 1:
+            break
+        time.sleep(0.005)
+    assert waiter_count == 1
+    release_summary.set()
+    for thread in threads:
+        thread.join(2)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(summary_calls) == 1
+    assert len(results) == 2
+    assert results[0] == results[1]
+    assert appended[-2:][0]["content"] == "concurrent append user"
+
+
 def test_model_or_session_namespace_change_rejects_candidate():
     compressor = _compressor()
     turns = _messages(4)
