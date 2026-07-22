@@ -1676,7 +1676,175 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _summary_chunk_input_budget(self) -> int:
+        """Return a conservative source-token budget for one summary call.
+
+        The request also carries the structured template, a prior checkpoint,
+        and an output reservation. Limiting source material to 45% of the model
+        window prevents timeout from becoming an implicit input-size limit.
+        """
+        summary_context = int(
+            getattr(self, "_summary_context_length", 0) or self.context_length
+        )
+        main_context = int(self.context_length or summary_context)
+        # A failed auxiliary request is retried on the main model. Bound chunks
+        # to the smaller window so the exact same chunk remains valid there.
+        effective_context = min(summary_context, main_context)
+        return max(4_000, int(effective_context * 0.45))
+
+    def _summary_atomic_units(
+        self,
+        turns: List[Dict[str, Any]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Group turns without splitting assistant tool calls from results."""
+        units: List[List[Dict[str, Any]]] = []
+        idx = 0
+        while idx < len(turns):
+            message = turns[idx]
+            unit = [message]
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                idx += 1
+                while idx < len(turns) and turns[idx].get("role") == "tool":
+                    unit.append(turns[idx])
+                    idx += 1
+                units.append(unit)
+                continue
+            units.append(unit)
+            idx += 1
+        return units
+
+    def _partition_summary_turns(
+        self,
+        turns: List[Dict[str, Any]],
+        max_input_tokens: Optional[int] = None,
+    ) -> List[List[Dict[str, Any]]]:
+        """Partition summarizer input into token-bounded atomic chunks."""
+        if not turns:
+            return []
+        budget = max(1, int(max_input_tokens or self._summary_chunk_input_budget()))
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_tokens = 0
+
+        for unit in self._summary_atomic_units(turns):
+            serialized = self._serialize_for_summary(unit)
+            unit_tokens = estimate_messages_tokens_rough([
+                {"role": "user", "content": serialized},
+            ])
+            if current and current_tokens + unit_tokens > budget:
+                chunks.append(current)
+                current = []
+                current_tokens = 0
+            current.extend(unit)
+            current_tokens += unit_tokens
+
+        if current:
+            chunks.append(current)
+        return chunks
+
     def _generate_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+    ) -> Optional[str]:
+        """Generate one checkpoint, folding oversized input hierarchically."""
+        chunk_input_budget = self._summary_chunk_input_budget()
+        chunks = self._partition_summary_turns(
+            turns_to_summarize,
+            max_input_tokens=chunk_input_budget,
+        )
+        if len(chunks) <= 1:
+            return self._generate_summary_single(
+                turns_to_summarize,
+                focus_topic=focus_topic,
+            )
+
+        previous_before_run = self._previous_summary
+        source_payload = json.dumps(
+            {
+                "turns": turns_to_summarize,
+                "focus_topic": focus_topic or "",
+                "previous_summary": previous_before_run or "",
+                "chunk_input_budget": chunk_input_budget,
+                "chunk_boundaries": [
+                    hashlib.sha256(
+                        self._serialize_for_summary(chunk).encode("utf-8")
+                    ).hexdigest()
+                    for chunk in chunks
+                ],
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+        source_hash = hashlib.sha256(source_payload.encode("utf-8")).hexdigest()
+        final_summary: Optional[str] = None
+        start_index = 0
+
+        get_checkpoint = getattr(
+            self._session_db,
+            "get_latest_compression_checkpoint",
+            None,
+        )
+        if callable(get_checkpoint) and self._session_id:
+            checkpoint = get_checkpoint(
+                self._session_id,
+                source_hash,
+                len(chunks),
+            )
+            if isinstance(checkpoint, dict):
+                checkpoint_index = int(checkpoint.get("chunk_index", -1))
+                checkpoint_summary = str(checkpoint.get("summary") or "")
+                if 0 <= checkpoint_index < len(chunks) and checkpoint_summary:
+                    self._previous_summary = checkpoint_summary
+                    final_summary = self._with_summary_prefix(checkpoint_summary)
+                    start_index = checkpoint_index + 1
+                    logger.info(
+                        "Context compression: resuming at chunk %d/%d",
+                        start_index + 1,
+                        len(chunks),
+                    )
+
+        logger.info(
+            "Context compression: folding %d messages across %d bounded chunk(s)",
+            len(turns_to_summarize),
+            len(chunks),
+        )
+        save_checkpoint = getattr(
+            self._session_db,
+            "save_compression_checkpoint",
+            None,
+        )
+        for chunk_index in range(start_index, len(chunks)):
+            chunk = chunks[chunk_index]
+            logger.info(
+                "Context compression chunk %d/%d (%d message(s))",
+                chunk_index + 1,
+                len(chunks),
+                len(chunk),
+            )
+            final_summary = self._generate_summary_single(
+                chunk,
+                focus_topic=focus_topic,
+            )
+            if not final_summary:
+                self._previous_summary = previous_before_run
+                return None
+            if (
+                callable(save_checkpoint)
+                and self._session_id
+                and self._previous_summary
+            ):
+                save_checkpoint(
+                    self._session_id,
+                    source_hash,
+                    chunk_index,
+                    len(chunks),
+                    self._previous_summary,
+                )
+        return final_summary
+
+    def _generate_summary_single(
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
@@ -2037,7 +2205,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                return self._generate_summary_single(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
             # context is almost always worse than one extra summary attempt, so
@@ -2054,7 +2222,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+                return self._generate_summary_single(turns_to_summarize, focus_topic=focus_topic)
 
             # Transient errors (timeout, rate limit, network, JSON decode,
             # streaming premature-close) — shorter cooldown for JSON decode and

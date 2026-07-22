@@ -407,6 +407,154 @@ class TestCompress:
         assert c._effective_protect_first_n() == 0
 
 
+class TestHierarchicalSummary:
+    def test_chunk_budget_fits_auxiliary_and_main_fallback_windows(self, compressor):
+        compressor.context_length = 100_000
+        compressor._summary_context_length = 200_000
+        assert compressor._summary_chunk_input_budget() == 45_000
+
+        compressor._summary_context_length = 80_000
+        assert compressor._summary_chunk_input_budget() == 36_000
+
+    def test_checkpoint_generation_hash_changes_with_chunk_budget(self, compressor):
+        turns = [
+            {"role": "user", "content": f"turn-{idx} " * 100}
+            for idx in range(3)
+        ]
+
+        class CheckpointDB:
+            def __init__(self):
+                self.queries = []
+
+            def get_latest_compression_checkpoint(self, session_id, source_hash, total_chunks):
+                self.queries.append((session_id, source_hash, total_chunks))
+                return None
+
+            def save_compression_checkpoint(self, *args):
+                return None
+
+        db = CheckpointDB()
+        compressor.bind_session_state(session_db=db, session_id="session-1")
+
+        def fake_single(chunk, focus_topic=None):
+            compressor._previous_summary = "fold"
+            return compressor._with_summary_prefix("fold")
+
+        for budget in (50, 51):
+            compressor._previous_summary = None
+            with patch.object(compressor, "_summary_chunk_input_budget", return_value=budget), \
+                 patch.object(compressor, "_generate_summary_single", side_effect=fake_single):
+                compressor._generate_summary(turns)
+
+        assert len(db.queries) == 2
+        assert db.queries[0][2] == db.queries[1][2]
+        assert db.queries[0][1] != db.queries[1][1]
+
+    def test_partition_keeps_tool_call_and_results_atomic(self, compressor):
+        turns = [
+            {"role": "user", "content": "first " * 80},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result " * 80},
+            {"role": "user", "content": "last " * 80},
+        ]
+
+        chunks = compressor._partition_summary_turns(turns, max_input_tokens=50)
+        locations = {
+            id(message): chunk_index
+            for chunk_index, chunk in enumerate(chunks)
+            for message in chunk
+        }
+
+        assert len(chunks) >= 3
+        assert locations[id(turns[1])] == locations[id(turns[2])]
+
+    def test_oversized_input_is_folded_incrementally(self, compressor):
+        turns = [
+            {"role": "user", "content": f"turn-{idx} " * 100}
+            for idx in range(5)
+        ]
+        calls = []
+
+        def fake_single(chunk, focus_topic=None):
+            calls.append([message["content"] for message in chunk])
+            body = f"fold-{len(calls)}"
+            compressor._previous_summary = body
+            return compressor._with_summary_prefix(body)
+
+        with patch.object(compressor, "_summary_chunk_input_budget", return_value=50), \
+             patch.object(compressor, "_generate_summary_single", side_effect=fake_single):
+            summary = compressor._generate_summary(turns)
+
+        assert len(calls) == len(turns)
+        assert summary.endswith(f"fold-{len(turns)}")
+        assert compressor._previous_summary == f"fold-{len(turns)}"
+
+    def test_failed_chunk_restores_previous_checkpoint(self, compressor):
+        compressor._previous_summary = "durable previous"
+        turns = [
+            {"role": "user", "content": f"turn-{idx} " * 100}
+            for idx in range(3)
+        ]
+
+        with patch.object(compressor, "_summary_chunk_input_budget", return_value=50), \
+             patch.object(
+                 compressor,
+                 "_generate_summary_single",
+                 side_effect=[SUMMARY_PREFIX + "\nfold-1", None],
+             ):
+            summary = compressor._generate_summary(turns)
+
+        assert summary is None
+        assert compressor._previous_summary == "durable previous"
+
+    def test_resumes_from_latest_durable_chunk_checkpoint(self, compressor):
+        turns = [
+            {"role": "user", "content": f"turn-{idx} " * 100}
+            for idx in range(3)
+        ]
+
+        class CheckpointDB:
+            def __init__(self):
+                self.saved = []
+
+            def get_latest_compression_checkpoint(self, session_id, source_hash, total_chunks):
+                return {
+                    "chunk_index": 0,
+                    "total_chunks": total_chunks,
+                    "summary": "durable fold-1",
+                    "created_at": 1.0,
+                }
+
+            def save_compression_checkpoint(self, *args):
+                self.saved.append(args)
+
+        db = CheckpointDB()
+        compressor.bind_session_state(session_db=db, session_id="session-1")
+        calls = []
+
+        def fake_single(chunk, focus_topic=None):
+            calls.append(chunk)
+            body = f"resumed-fold-{len(calls) + 1}"
+            compressor._previous_summary = body
+            return compressor._with_summary_prefix(body)
+
+        with patch.object(compressor, "_summary_chunk_input_budget", return_value=50), \
+             patch.object(compressor, "_generate_summary_single", side_effect=fake_single):
+            summary = compressor._generate_summary(turns)
+
+        assert len(calls) == 2
+        assert summary.endswith("resumed-fold-3")
+        assert [saved[2] for saved in db.saved] == [1, 2]
+
+
 class TestTailBudgetCodexReplayFields:
     def test_tail_cut_counts_codex_replay_and_reasoning_fields(self):
         """Tail protection must budget hidden replay fields sent back to providers.

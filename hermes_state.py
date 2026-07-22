@@ -787,12 +787,24 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS compression_checkpoints (
+    session_id TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    total_chunks INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (session_id, source_hash, chunk_index)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_compression_checkpoints_latest
+    ON compression_checkpoints(session_id, source_hash, chunk_index DESC);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -2331,6 +2343,81 @@ class SessionDB:
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def save_compression_checkpoint(
+        self,
+        session_id: str,
+        source_hash: str,
+        chunk_index: int,
+        total_chunks: int,
+        summary: str,
+    ) -> None:
+        """Append an idempotent hierarchical-compression checkpoint."""
+        if not session_id or not source_hash or not summary:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO compression_checkpoints "
+                "(session_id, source_hash, chunk_index, total_chunks, summary, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    source_hash,
+                    int(chunk_index),
+                    int(total_chunks),
+                    summary,
+                    time.time(),
+                ),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "save_compression_checkpoint(%s, %s, %s) failed: %s",
+                session_id,
+                source_hash[:12],
+                chunk_index,
+                exc,
+            )
+
+    def get_latest_compression_checkpoint(
+        self,
+        session_id: str,
+        source_hash: str,
+        total_chunks: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the newest matching checkpoint, ignoring stale generations."""
+        if not session_id or not source_hash:
+            return None
+        conn = self._conn
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT chunk_index, total_chunks, summary, created_at "
+                "FROM compression_checkpoints "
+                "WHERE session_id = ? AND source_hash = ? AND total_chunks = ? "
+                "ORDER BY chunk_index DESC LIMIT 1",
+                (session_id, source_hash, int(total_chunks)),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "get_latest_compression_checkpoint(%s, %s) failed: %s",
+                session_id,
+                source_hash[:12],
+                exc,
+            )
+            return None
+        if row is None:
+            return None
+        return dict(row) if isinstance(row, sqlite3.Row) else {
+            "chunk_index": row[0],
+            "total_chunks": row[1],
+            "summary": row[2],
+            "created_at": row[3],
+        }
 
     def update_session_meta(
         self,
