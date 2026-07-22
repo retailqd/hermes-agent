@@ -52,6 +52,44 @@ def test_background_preparation_is_non_blocking():
     assert compressor._background_candidate["summary"] == "prepared summary"
 
 
+def test_background_preparation_starts_at_half_hard_threshold(monkeypatch):
+    compressor = _compressor()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            return "prepared summary"
+
+    monkeypatch.setattr(
+        "agent.context_compressor.estimate_messages_tokens_rough",
+        lambda messages: 0,
+    )
+    monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+
+    assert compressor.maybe_prepare_background(_messages(), current_tokens=50)
+    assert compressor.wait_for_background_preparation(timeout=1)
+
+
+def test_background_preparation_uses_live_estimate_when_reported_tokens_are_stale(monkeypatch):
+    compressor = _compressor()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            return "prepared summary"
+
+    monkeypatch.setattr(
+        "agent.context_compressor.estimate_messages_tokens_rough",
+        lambda messages: 80,
+    )
+    monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
+
+    assert compressor.maybe_prepare_background(_messages(), current_tokens=1)
+    assert compressor.wait_for_background_preparation(timeout=1)
+
+
 def test_exact_background_candidate_is_consumed_without_new_llm_call():
     compressor = _compressor()
     turns = _messages(4)

@@ -1295,13 +1295,15 @@ class ContextCompressor(ContextEngine):
         messages: List[Dict[str, Any]],
         current_tokens: Optional[int] = None,
         focus_topic: Optional[str] = None,
-        soft_ratio: float = 0.70,
+        soft_ratio: float = 0.50,
     ) -> bool:
         """Start non-blocking summary preparation above a soft threshold."""
         self._ensure_background_state()
-        tokens = current_tokens if current_tokens is not None else self.last_prompt_tokens
-        if tokens <= 0:
-            tokens = estimate_messages_tokens_rough(messages)
+        reported_tokens = current_tokens if current_tokens is not None else self.last_prompt_tokens
+        # Provider usage describes the previous request. A tool-heavy turn can
+        # append enough transcript to cross the hard gate before that usage is
+        # refreshed, so always compare it with the live transcript estimate.
+        tokens = max(int(reported_tokens or 0), estimate_messages_tokens_rough(messages))
         ratio = max(0.25, min(float(soft_ratio), 0.95))
         if tokens < int(self.threshold_tokens * ratio):
             return False
@@ -1329,10 +1331,13 @@ class ContextCompressor(ContextEngine):
             self._background_done = done
             self._background_active = window
 
+        preparation_started_at = time.monotonic()
+
         def _prepare() -> None:
             candidate: Optional[Dict[str, Any]] = None
             worker_cooldown: Optional[Dict[str, Any]] = None
             worker: Optional["ContextCompressor"] = None
+            published = False
             try:
                 worker = self._clone_for_background()
                 worker._previous_summary = window["previous_summary"]
@@ -1360,6 +1365,7 @@ class ContextCompressor(ContextEngine):
                 with self._background_lock:
                     if generation == self._background_generation:
                         self._background_candidate = candidate
+                        published = candidate is not None
                     # No newer worker can exist while _background_active is set.
                     # Clear the slot even when this generation was cancelled.
                     if self._background_done is done:
@@ -1367,6 +1373,13 @@ class ContextCompressor(ContextEngine):
                         self._background_thread = None
                         self._background_done = None
                     done.set()
+                if published:
+                    logger.info(
+                        "Background context preparation ready: session=%s messages=%d elapsed=%.1fs",
+                        self._session_id or "none",
+                        window["count"],
+                        time.monotonic() - preparation_started_at,
+                    )
 
         thread = threading.Thread(
             target=_prepare,
