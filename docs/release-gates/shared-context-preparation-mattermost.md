@@ -48,27 +48,39 @@ These seven-run numbers must not be presented as live Mattermost or provider tim
 
 ## Residual local validation limit
 
-The local Mattermost cache test proves that the same cached `AIAgent` retains its prepared candidate, but it seeds the cache directly. It does not drive the complete live adapter and `_run_agent_inner` lookup path. Therefore the candidate is not releasable from local tests alone. The organic Mattermost gate below must verify real thread-to-session routing and same-agent reuse before production acceptance.
+The local Mattermost cache test proves that the same cached `AIAgent` retains its prepared candidate, but it seeds the cache directly. It does not drive the complete live adapter and `_run_agent_inner` lookup path. Therefore the candidate is not releasable from local tests alone. The organic Mattermost gate below must verify real thread-to-session routing and same-agent reuse before local runtime acceptance.
 
-## Release decision required
+## Local Gateway release decision required
 
-This document stops before release. A new owner gate is required for:
+This document stops before changing the local Gateway checkout or restarting the local `hermes-gateway.service`. A current-chat owner gate is required for:
 
-1. deploying the candidate commit to the Gateway host;
-2. one scoped Gateway restart or equivalent process replacement;
-3. production log observation and Mattermost thread validation;
-4. rollback if any acceptance criterion fails.
+1. switching the local Gateway checkout to the immutable candidate commit;
+2. one scoped local Gateway restart through a detached validator;
+3. canonical Gateway log observation plus a functional Mattermost round-trip in the originating root;
+4. immediate code-only rollback if any acceptance criterion fails.
 
-No config, auth, systemd, plugin, skill, memory, secret, schema, or transcript mutation is part of this release.
+No config, auth, systemd unit, plugin, skill, memory, cron, credential, provider, schema, or transcript mutation is part of this release. A Git push is the only external code action. Owner and bot credentials may be read from the existing protected environment for validation, but must never be printed, copied into the runner, renewed, or rewritten.
+
+## Detached local restart gate
+
+The detached validator must establish a candidate start boundary from `MainPID` and `ExecMainStartTimestamp`, then use all of these independent signals:
+
+1. `systemd`: require a new PID, `ActiveState=active`, `SubState=running`, and the intended candidate SHA in the local checkout.
+2. Canonical log: inspect `~/.hermes/logs/gateway.log` after the candidate start boundary and require Mattermost WebSocket authentication. `journalctl` is supplemental evidence only. Absence of an INFO line in the journal is indeterminate and must not trigger rollback when the canonical log or the functional round-trip is green.
+3. Functional round-trip: post a nonce-bearing owner canary to the exact originating `channel_id` and `root_id`, then poll the Mattermost thread until a non-owner reply in the same root contains the exact expected nonce. Require HTTP success and read back the posted canary and reply by ID. Do not post to a channel root as fallback.
+4. Session continuity: compare the exact Mattermost session binding before and after restart and require the same thread root plus preserved durable user-message history. Distinguish a detached canary continuation from native auto-resume, and claim native auto-resume only when logs bind it to the exact originating session/root.
+5. Integrity: run SQLite `quick_check` on the consistent pre-release backup and live store, and require that the pre-existing root messages remain present after the round-trip.
+
+The runner must roll back to the recorded immutable commit and restart again if service health, candidate SHA, canonical-log authentication, functional round-trip, thread binding, or SQLite integrity fails. The durable report must identify the source used for each signal without exposing tokens or message bodies.
 
 ## Organic Mattermost validation
 
-After explicit release approval:
+After explicit local release approval:
 
-1. Record the deployed immutable commit and the rollback commit.
+1. Record the active immutable candidate commit and the rollback commit.
 2. Select one dedicated Mattermost thread whose real context is below the normal hard compaction threshold but close enough to cross the preparation threshold through ordinary conversation. Do not bulk-inject fabricated transcript content.
 3. Record the thread root ID, current session ID/lineage, model, provider, profile, and pre-release message count. Do not record credentials or message bodies containing secrets.
-4. Continue normal thread interaction until logs show:
+4. Continue normal thread interaction until the canonical Gateway log shows:
    - `Background context preparation started`
    - `Background context preparation ready`
 5. Confirm that readiness alone did not rotate the session, change the durable message count, or replace the live transcript.
