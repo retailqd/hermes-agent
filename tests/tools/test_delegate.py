@@ -2426,6 +2426,40 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_trusted_parent_context_is_derived_from_messages_not_model_args(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        messages = [
+            {"role": "user", "content": "Approve production release gate"},
+            {"role": "assistant", "content": "delegating"},
+        ]
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "List files",
+                    "trusted_parent_context": "model-supplied-bypass",
+                },
+                messages=messages,
+            )
+
+        self.assertEqual(
+            captured["trusted_parent_context"],
+            "Approve production release gate",
+        )
+        self.assertNotEqual(
+            captured["trusted_parent_context"],
+            "model-supplied-bypass",
+        )
+
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

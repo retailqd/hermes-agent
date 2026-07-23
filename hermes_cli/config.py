@@ -2341,8 +2341,42 @@ DEFAULT_CONFIG = {
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
                                      # (floor 30s) to enforce a hard cap.
-        "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
+        "reasoning_effort": "",  # legacy global subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
+        # Optional runtime-enforced model routing by functional class. The model
+        # may request a class but can never select provider/model. Core inference
+        # can only keep or raise the requested class, never downgrade it. When
+        # enabled, every route must define an explicit provider and model; a
+        # missing/invalid route fails closed instead of inheriting the legacy
+        # delegation.model or the parent's model. Parent model fallbacks are off
+        # by default so an enforced route cannot silently downgrade.
+        "model_routing": {
+            "enabled": False,
+            "default_class": "specialist",
+            "inherit_parent_fallback": False,
+            "routes": {
+                "mechanical": {
+                    "provider": "",
+                    "model": "",
+                    "reasoning_effort": "",
+                },
+                "specialist": {
+                    "provider": "",
+                    "model": "",
+                    "reasoning_effort": "",
+                },
+                "coordinator": {
+                    "provider": "",
+                    "model": "",
+                    "reasoning_effort": "",
+                },
+                "critical": {
+                    "provider": "",
+                    "model": "",
+                    "reasoning_effort": "",
+                },
+            },
+        },
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap

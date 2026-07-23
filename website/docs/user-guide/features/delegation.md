@@ -153,6 +153,59 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+## Enforced Functional Model Routing
+
+For mixed workloads, `delegation.model_routing` assigns provider/model pairs by
+functional class inside the runtime. This is stronger than a prompt rule:
+`delegate_task` can request only `function_class`, never `provider` or `model`.
+Hermes also infers a minimum class from the goal, context, and structural role.
+A request can keep or raise that class, but cannot lower it.
+
+```yaml
+delegation:
+  model_routing:
+    enabled: true
+    default_class: specialist
+    inherit_parent_fallback: false
+    routes:
+      mechanical:
+        provider: openai-codex
+        model: gpt-5.6-luna
+        reasoning_effort: low
+      specialist:
+        provider: openai-codex
+        model: gpt-5.6-terra
+        reasoning_effort: high
+      coordinator:
+        provider: openai-codex
+        model: gpt-5.6-sol
+        reasoning_effort: xhigh
+      critical:
+        provider: openai-codex
+        model: gpt-5.6-sol
+        reasoning_effort: xhigh
+```
+
+The four classes are:
+
+- `mechanical`: extraction, enumeration, monitoring, and formatting
+- `specialist`: implementation, debugging, research, testing, and review
+- `coordinator`: orchestration, decomposition, and multi-agent coordination
+- `critical`: production release gates, rollback, migrations, credentials, and other high-impact decisions
+
+When routing is enabled, every selected route must contain a non-empty
+`provider` and `model`. Missing or invalid routes fail closed before any child
+is created. Enforced routes are self-contained: legacy top-level
+`delegation.provider`, `delegation.model`, endpoint, transport, API key, and
+request override values are not used to fill them. Parent model fallback
+inheritance is disabled by default so a routed tier cannot silently downgrade
+after a provider or model failure.
+
+Each child records the effective class, inferred class, decision source,
+provider, and model in its session metadata and result. Compression remains a
+separate auxiliary path controlled by `auxiliary.compression`; it is not a
+delegated functional class.
+
 ## Inherited Tool Access
 
 `delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.

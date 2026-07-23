@@ -6437,13 +6437,16 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
-    def _dispatch_delegate_task(self, function_args: dict) -> str:
+    def _dispatch_delegate_task(
+        self, function_args: dict, messages: Optional[list] = None
+    ) -> str:
         """Single call site for delegate_task dispatch.
 
         New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _extract_trusted_parent_context,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
@@ -6463,6 +6466,8 @@ class AIAgent:
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
+            function_class=function_args.get("function_class"),
+            trusted_parent_context=_extract_trusted_parent_context(messages),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),

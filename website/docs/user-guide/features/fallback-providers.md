@@ -428,5 +428,5 @@ See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration d
 | Approval classification | Layered (see above) | `auxiliary.approval` |
 | Title generation | Layered (see above) | `auxiliary.title_generation` |
 | Triage specifier | Layered (see above) | `auxiliary.triage_specifier` |
-| Delegation | Provider override only (no automatic fallback) | `delegation.provider` / `delegation.model` |
-| Cron jobs | Per-job provider override only (no automatic fallback) | Per-job `provider` / `model` |
+| Delegation | Legacy mode inherits the parent fallback chain; deterministic functional routes require fallback to remain disabled | `delegation.model_routing` / `delegation.provider` / `delegation.model` |
+| Cron jobs | Configured fallback providers plus optional per-job primary override | `fallback_providers` and per-job `provider` / `model` |
