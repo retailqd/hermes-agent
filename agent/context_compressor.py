@@ -42,7 +42,7 @@ HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 HISTORICAL_IN_PROGRESS_HEADING = "## Historical In-Progress State"
 HISTORICAL_PENDING_ASKS_HEADING = "## Historical Pending User Asks"
 HISTORICAL_REMAINING_WORK_HEADING = "## Historical Remaining Work"
-BACKGROUND_CANDIDATE_VERSION = "context-summary-v2"
+BACKGROUND_CANDIDATE_VERSION = "context-summary-v3"
 SUMMARY_PROMPT_VERSION = "structured-handoff-v1"
 SUMMARY_SERIALIZER_VERSION = "summary-wire-v1"
 _BACKGROUND_JOIN_TIMEOUT_SECONDS = 120.0
@@ -92,6 +92,7 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # poisoning every subsequent request in the session — a bare key like
 # "is_compressed_summary" would reach the wire and trip exactly that.
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+BACKGROUND_TAIL_MODE_METADATA_KEY = "_background_tail_mode"
 _DB_PERSISTED_MARKER = "_db_persisted"
 
 
@@ -1397,6 +1398,7 @@ class ContextCompressor(ContextEngine):
         if not window:
             return False
 
+        preparation_started_at = time.monotonic()
         with self._background_lock:
             if (
                 self._background_candidate
@@ -1411,9 +1413,8 @@ class ContextCompressor(ContextEngine):
             done = threading.Event()
             self._background_done = done
             window["generation"] = generation
+            window["started_monotonic"] = preparation_started_at
             self._background_active = window
-
-        preparation_started_at = time.monotonic()
 
         def _prepare() -> None:
             candidate: Optional[Mapping[str, Any]] = None
@@ -1513,8 +1514,11 @@ class ContextCompressor(ContextEngine):
         """Join an in-flight worker for this exact prefix.
 
         Returns ``None`` when the active worker is unrelated, ``True`` when it
-        completed, and ``False`` on timeout. A timeout is fail-closed at the
-        hard gate so the foreground never starts a duplicate provider call.
+        completed, and ``False`` on timeout. The timeout is a total worker-age
+        budget, not a fresh allowance per hard-gate caller. A timed-out worker
+        remains the active single flight until its thread exits, while repeated
+        compatible gates fail closed immediately instead of waiting again or
+        starting a duplicate foreground provider call.
         """
         self._ensure_background_state()
         with self._background_lock:
@@ -1523,7 +1527,11 @@ class ContextCompressor(ContextEngine):
             generation = self._background_generation
             if not active or done is None:
                 return None
-            if active.get("generation") != generation:
+            active_generation = active.get("generation")
+            timed_out = (
+                active_generation != generation and bool(active.get("timed_out"))
+            )
+            if active_generation != generation and not timed_out:
                 return None
             if active.get("namespace") != self._background_namespace():
                 return None
@@ -1533,11 +1541,33 @@ class ContextCompressor(ContextEngine):
                 return None
             covered = int(active.get("count") or 0)
             source_hash = active.get("source_hash")
+            started_monotonic = float(
+                active.get("started_monotonic") or time.monotonic()
+            )
         if covered <= 0 or covered > len(turns):
             return None
         if self._background_source_hash(turns[:covered]) != source_hash:
             return None
-        return done.wait(max(0.0, float(timeout)))
+        if timed_out:
+            return False
+
+        worker_age = max(0.0, time.monotonic() - started_monotonic)
+        remaining = max(0.0, float(timeout) - worker_age)
+        if remaining > 0.0 and done.wait(remaining):
+            return True
+
+        with self._background_lock:
+            # Close the race where the worker completed between wait() timing
+            # out and reacquiring the state lock.
+            if done.is_set():
+                return True
+            if (
+                self._background_active is active
+                and active.get("generation") == self._background_generation
+            ):
+                active["timed_out"] = True
+                self._background_generation += 1
+        return False
 
     def wait_for_background_preparation(self, timeout: float = 0.0) -> bool:
         """Wait only when a caller explicitly chooses to; live turns use zero."""
@@ -1550,13 +1580,12 @@ class ContextCompressor(ContextEngine):
         with self._background_lock:
             return bool(self._background_candidate)
 
-    def _consume_background_candidate(
+    def _matching_background_candidate(
         self,
         turns: List[Dict[str, Any]],
-        focus_topic: Optional[str],
         requested_focus_topic: Optional[str] = None,
-    ) -> Optional[str]:
-        """Reuse a valid prepared prefix and summarize only an appended tail."""
+    ) -> Optional[Dict[str, Any]]:
+        """Return a prepared candidate only when it covers an exact prefix."""
         self._ensure_background_state()
         with self._background_lock:
             candidate = (
@@ -1573,9 +1602,25 @@ class ContextCompressor(ContextEngine):
             return None
         if self._background_source_hash(turns[:covered]) != candidate.get("source_hash"):
             return None
-        summary = str(candidate.get("summary") or "")
-        if not summary:
+        if not str(candidate.get("summary") or ""):
             return None
+        return candidate
+
+    def _consume_background_candidate(
+        self,
+        turns: List[Dict[str, Any]],
+        focus_topic: Optional[str],
+        requested_focus_topic: Optional[str] = None,
+    ) -> Optional[str]:
+        """Reuse a valid prepared prefix and summarize only an appended tail."""
+        candidate = self._matching_background_candidate(
+            turns,
+            requested_focus_topic=requested_focus_topic,
+        )
+        if candidate is None:
+            return None
+        covered = int(candidate.get("count") or 0)
+        summary = str(candidate.get("summary") or "")
         if covered < len(turns):
             previous = self._previous_summary
             self._previous_summary = summary
@@ -1593,6 +1638,97 @@ class ContextCompressor(ContextEngine):
             len(turns) - covered,
         )
         return summary
+
+    def _literal_background_tail_fits(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        compress_start: int,
+        literal_tail_start: int,
+        summary: str,
+        display_tokens: int,
+    ) -> bool:
+        """Conservatively check a prepared-prefix plus literal-tail projection.
+
+        ``display_tokens`` can include request overhead that is not represented
+        in the message list, notably tool schemas. Preserve that overhead in the
+        projection so a message-only estimate cannot admit an over-limit request.
+        The final assembly may merge the summary into the first tail message;
+        modeling it as a standalone message is intentionally conservative.
+        """
+        projected = [
+            _fresh_compaction_message_copy(message)
+            for message in messages[:compress_start]
+        ]
+        projected.append(
+            {
+                "role": "user",
+                "content": summary + "\n\n" + _SUMMARY_END_MARKER,
+            }
+        )
+        projected.extend(
+            _fresh_compaction_message_copy(message)
+            for message in messages[literal_tail_start:]
+        )
+
+        current_message_tokens = estimate_messages_tokens_rough(messages)
+        request_overhead = max(0, int(display_tokens or 0) - current_message_tokens)
+        projected_request_tokens = (
+            request_overhead
+            + estimate_messages_tokens_rough(projected)
+            + 256  # compression note, delimiters, and estimator rounding
+        )
+        safety_margin = max(32, min(1024, self.threshold_tokens // 50))
+        return projected_request_tokens <= max(
+            0,
+            self.threshold_tokens - safety_margin,
+        )
+
+    def _prepared_candidate_fast_path(
+        self,
+        messages: List[Dict[str, Any]],
+        turns: List[Dict[str, Any]],
+        *,
+        turns_start: int,
+        compress_start: int,
+        compress_end: int,
+        requested_focus_topic: Optional[str],
+        display_tokens: int,
+    ) -> Optional[tuple[str, int, Optional[str]]]:
+        """Return a ready candidate without starting another summary call.
+
+        An exact candidate is immediately reusable. An older candidate that
+        covers an exact prefix is also reusable when preserving the appended
+        delta literally keeps the projected request below the hard threshold.
+        """
+        candidate = self._matching_background_candidate(
+            turns,
+            requested_focus_topic=requested_focus_topic,
+        )
+        if candidate is None:
+            return None
+
+        covered = int(candidate.get("count") or 0)
+        summary = str(candidate.get("summary") or "")
+        if covered == len(turns):
+            return summary, compress_end, None
+
+        literal_tail_start = turns_start + covered
+        boundary_is_atomic = (
+            literal_tail_start <= compress_end
+            and self._align_boundary_backward(messages, literal_tail_start)
+            == literal_tail_start
+        )
+        if not boundary_is_atomic or not self._literal_background_tail_fits(
+            messages,
+            compress_start=compress_start,
+            literal_tail_start=literal_tail_start,
+            summary=summary,
+            display_tokens=display_tokens,
+        ):
+            return None
+
+        return summary, literal_tail_start, "prepared-prefix-literal-delta"
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
@@ -3500,7 +3636,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 )
             return messages
 
-        turns_to_summarize = messages[compress_start:compress_end]
+        turns_start = compress_start
+        turns_to_summarize = messages[turns_start:compress_end]
         # A persisted handoff summary can sit in the protected head after a
         # resume (commonly immediately after the system prompt). Search from
         # the first non-system message through the compression window so we can
@@ -3517,7 +3654,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         if summary_idx is not None:
             if summary_body and not self._previous_summary:
                 self._previous_summary = summary_body
-            turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+            turns_start = max(compress_start, summary_idx + 1)
+            turns_to_summarize = messages[turns_start:compress_end]
         elif self._previous_summary:
             # No handoff summary found in the current messages, but
             # _previous_summary is non-empty — it was set by a different
@@ -3548,38 +3686,83 @@ This compaction should PRIORITISE preserving all information related to the focu
                 tail_msgs,
             )
 
-        # Phase 3: Generate structured summary. A valid background candidate
-        # covers an immutable prefix; when the hard gate moves, only the newly
-        # appended suffix is summarized synchronously. If the matching worker
-        # is still running, join it instead of issuing the same provider call
-        # twice. A bounded join timeout preserves the raw transcript unchanged.
+        # Phase 3: Generate structured summary. Prefer any already-ready exact
+        # prefix candidate before joining a newer worker. Continuous-growth
+        # sessions commonly have both: an older ready candidate and a newer
+        # in-flight refresh. Waiting for the refresh first turns useful prepared
+        # work into a user-visible 120-second hard-gate stall.
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        background_join = self._join_compatible_background_preparation(
+        background_tail_mode = None
+        summary = None
+        fast_path = self._prepared_candidate_fast_path(
+            messages,
             turns_to_summarize,
+            turns_start=turns_start,
+            compress_start=compress_start,
+            compress_end=compress_end,
             requested_focus_topic=focus_topic,
+            display_tokens=display_tokens,
         )
-        if background_join is False:
-            self._last_summary_error = (
-                "Timed out waiting for compatible background context preparation"
-            )
-            self._last_compress_aborted = True
-            if not self.quiet_mode:
-                logger.warning(
-                    "Compression aborted after waiting %.0fs for matching "
-                    "background preparation; transcript preserved",
-                    _BACKGROUND_JOIN_TIMEOUT_SECONDS,
-                )
-            return original_messages
-        summary = self._consume_background_candidate(
-            turns_to_summarize,
-            summary_focus_topic,
-            requested_focus_topic=focus_topic,
-        )
-        if not summary:
-            summary = self._generate_summary(
+
+        if fast_path is None:
+            background_join = self._join_compatible_background_preparation(
                 turns_to_summarize,
-                focus_topic=summary_focus_topic,
+                requested_focus_topic=focus_topic,
             )
+            if background_join is False:
+                self._last_summary_error = (
+                    "Timed out waiting for compatible background context preparation"
+                )
+                self._last_compress_aborted = True
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression aborted after waiting %.0fs for matching "
+                        "background preparation; transcript preserved",
+                        _BACKGROUND_JOIN_TIMEOUT_SECONDS,
+                    )
+                return original_messages
+            # A successful join may have published a fresher exact candidate.
+            fast_path = self._prepared_candidate_fast_path(
+                messages,
+                turns_to_summarize,
+                turns_start=turns_start,
+                compress_start=compress_start,
+                compress_end=compress_end,
+                requested_focus_topic=focus_topic,
+                display_tokens=display_tokens,
+            )
+
+        if fast_path is not None:
+            summary, prepared_end, background_tail_mode = fast_path
+            prepared_count = prepared_end - turns_start
+            compress_end = prepared_end
+            turns_to_summarize = messages[turns_start:compress_end]
+            logger.info(
+                "Background context candidate consumed without foreground summary: "
+                "session=%s prepared=%d literal_tail=%d",
+                self._session_id or "none",
+                prepared_count,
+                n_messages - compress_end,
+            )
+        else:
+            matching_candidate = self._matching_background_candidate(
+                turns_to_summarize,
+                requested_focus_topic=focus_topic,
+            )
+            if matching_candidate is not None:
+                covered = int(matching_candidate.get("count") or 0)
+                summary = self._consume_background_candidate(
+                    turns_to_summarize,
+                    summary_focus_topic,
+                    requested_focus_topic=focus_topic,
+                )
+                if summary and covered < len(turns_to_summarize):
+                    background_tail_mode = "prepared-prefix-summarized-delta"
+            if not summary:
+                summary = self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=summary_focus_topic,
+                )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -3737,11 +3920,14 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = summary + "\n\n" + _SUMMARY_END_MARKER
 
         if not _merge_summary_into_tail:
-            compressed.append({
+            summary_message = {
                 "role": summary_role,
                 "content": summary,
                 COMPRESSED_SUMMARY_METADATA_KEY: True,
-            })
+            }
+            if background_tail_mode:
+                summary_message[BACKGROUND_TAIL_MODE_METADATA_KEY] = background_tail_mode
+            compressed.append(summary_message)
 
         for i in range(compress_end, n_messages):
             msg = _fresh_compaction_message_copy(messages[i])
@@ -3770,6 +3956,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # Mark the merged message so frontends can identify it as
                 # containing a compression summary prefix.
                 msg[COMPRESSED_SUMMARY_METADATA_KEY] = True
+                if background_tail_mode:
+                    msg[BACKGROUND_TAIL_MODE_METADATA_KEY] = background_tail_mode
                 _merge_summary_into_tail = False
             compressed.append(msg)
 

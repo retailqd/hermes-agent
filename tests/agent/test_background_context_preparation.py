@@ -5,7 +5,10 @@ from typing import Any
 
 import pytest
 
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import (
+    ContextCompressor,
+    BACKGROUND_TAIL_MODE_METADATA_KEY,
+)
 
 
 def _compressor() -> ContextCompressor:
@@ -223,47 +226,185 @@ def test_background_candidate_summarizes_only_appended_tail():
     assert captured == turns[3:]
 
 
-def test_compress_append_after_watermark_summarizes_only_public_path_delta(monkeypatch):
+def test_compress_append_after_watermark_uses_literal_delta_when_it_fits(monkeypatch):
     compressor = _compressor()
+    compressor.threshold_tokens = 1000
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "head user"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-head",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-head", "content": "head tool result"},
+        {"role": "assistant", "content": "prepared prefix assistant"},
+        {"role": "user", "content": "prepared prefix user"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-literal",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-literal", "content": "literal tool result"},
+        {"role": "user", "content": "literal follow-up user"},
+        {"role": "assistant", "content": "tail assistant"},
+        {"role": "user", "content": "tail user"},
+    ]
+    prepared_count = 2
+    compressor._background_candidate = {
+        "namespace": compressor._background_namespace(),
+        "source_hash": compressor._background_source_hash(messages[4:4 + prepared_count]),
+        "count": prepared_count,
+        "focus_topic": "topic",
+        "requested_focus_topic": None,
+        "summary": "prepared prefix summary",
+    }
+
+    monkeypatch.setattr(
+        compressor,
+        "_generate_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("literal delta path should not re-summarize the tail")
+        ),
+    )
+    monkeypatch.setattr(compressor, "_protect_head_size", lambda _: 4)
+    monkeypatch.setattr(compressor, "_align_boundary_forward", lambda _messages, idx: idx)
+    monkeypatch.setattr(compressor, "_find_tail_cut_by_tokens", lambda _messages, head_end, token_budget=None: 9)
+
+    result = compressor.compress(messages, current_tokens=200)
+
+    summary_msg = next(m for m in result if m.get("_compressed_summary"))
+    assert summary_msg[BACKGROUND_TAIL_MODE_METADATA_KEY] == "prepared-prefix-literal-delta"
+    assert result[0]["role"] == "system"
+    assert result[1:4] == messages[1:4]
+    assert result[5:8] == messages[6:9]
+    assert result[8:10] == messages[9:11]
+    assert result[5]["tool_calls"][0]["id"] == "call-literal"
+    assert result[6]["tool_call_id"] == "call-literal"
+
+
+def test_ready_prefix_bypasses_newer_inflight_worker(monkeypatch):
+    compressor = _compressor()
+    compressor.threshold_tokens = 5000
     messages = _messages()
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    calls = []
 
     class Worker:
         _previous_summary = None
 
         def _generate_summary(self, turns, focus_topic=None):
-            return "prepared prefix summary"
+            calls.append(copy.deepcopy(turns))
+            if len(calls) == 1:
+                return "older ready prefix"
+            refresh_started.set()
+            release_refresh.wait(2)
+            return "newer refresh"
 
     monkeypatch.setattr(compressor, "_clone_for_background", lambda: Worker())
-    assert compressor.maybe_prepare_background(messages, current_tokens=80)
+    assert compressor.maybe_prepare_background(messages, current_tokens=4000)
     assert compressor.wait_for_background_preparation(1)
-    candidate = compressor._background_candidate
-    assert candidate is not None
-    prepared_count = int(candidate["count"])
 
     appended = messages + [
-        {"role": "user", "content": "append-only user delta"},
-        {"role": "assistant", "content": "append-only assistant delta"},
+        {"role": "user", "content": "small append-only delta"},
+        {"role": "assistant", "content": "small append-only answer"},
     ]
-    hard_gate_window = compressor._background_window(appended)
-    assert hard_gate_window is not None
-    expected_delta = hard_gate_window["turns"][prepared_count:]
-    received = []
-
-    def summarize_delta(turns, focus_topic=None):
-        received.append(copy.deepcopy(turns))
-        return "prepared prefix plus delta summary"
-
-    monkeypatch.setattr(compressor, "_generate_summary", summarize_delta)
-
-    result = compressor.compress(appended, current_tokens=200)
-
-    assert received == [expected_delta]
-    assert result[0] == appended[0]
-    assert result[-2:] == appended[-2:]
-    assert any(
-        "prepared prefix plus delta summary" in str(item.get("content"))
-        for item in result
+    assert compressor.maybe_prepare_background(appended, current_tokens=4000)
+    assert refresh_started.wait(1)
+    monkeypatch.setattr(
+        compressor,
+        "_generate_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ready-prefix path started a foreground summary")
+        ),
     )
+
+    started_at = time.monotonic()
+    result = compressor.compress(appended, current_tokens=4000)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.2
+    assert compressor._last_compress_aborted is False
+    assert any("older ready prefix" in str(m.get("content")) for m in result)
+    assert result[-2:] == appended[-2:]
+    release_refresh.set()
+
+
+def test_compress_append_after_watermark_rejects_oversized_literal_delta_and_summarizes_tail(monkeypatch):
+    compressor = _compressor()
+    compressor.threshold_tokens = 250
+    long_literal = "literal delta " * 120
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "head user"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-head",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-head", "content": "head tool result"},
+        {"role": "assistant", "content": "prepared prefix assistant"},
+        {"role": "user", "content": "prepared prefix user"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-literal",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-literal", "content": long_literal},
+        {"role": "assistant", "content": "tail assistant"},
+        {"role": "user", "content": "tail user"},
+    ]
+    prepared_count = 2
+    compressor._background_candidate = {
+        "namespace": compressor._background_namespace(),
+        "source_hash": compressor._background_source_hash(messages[4:4 + prepared_count]),
+        "count": prepared_count,
+        "focus_topic": "topic",
+        "requested_focus_topic": None,
+        "summary": "prepared prefix summary",
+    }
+    captured = []
+
+    def summarize_tail(turns, focus_topic=None):
+        captured.append(copy.deepcopy(turns))
+        return "prepared-prefix summarized-delta"
+
+    monkeypatch.setattr(compressor, "_generate_summary", summarize_tail)
+    monkeypatch.setattr(compressor, "_protect_head_size", lambda _: 4)
+    monkeypatch.setattr(compressor, "_align_boundary_forward", lambda _messages, idx: idx)
+    monkeypatch.setattr(compressor, "_find_tail_cut_by_tokens", lambda _messages, head_end, token_budget=None: 10)
+
+    result = compressor.compress(messages, current_tokens=200)
+
+    assert captured == [messages[6:10]]
+    summary_msg = next(m for m in result if m.get("_compressed_summary"))
+    assert summary_msg[BACKGROUND_TAIL_MODE_METADATA_KEY] == "prepared-prefix-summarized-delta"
+    assert any(long_literal in str(m.get("content")) for m in result) is False
 
 
 def test_concurrent_hard_gates_coalesce_identical_candidate_consumption(monkeypatch):
@@ -673,6 +814,81 @@ def test_background_capacity_exhaustion_skips_model_call(monkeypatch):
     )
 
     assert compressor.maybe_prepare_background(_messages(), current_tokens=80)
+    assert compressor.wait_for_background_preparation(1) is False
+    assert compressor._background_candidate is None
+
+
+def test_hard_gate_uses_remaining_worker_budget_not_full_timeout(monkeypatch):
+    compressor = _compressor()
+    window = compressor._background_window(_messages())
+    assert window is not None
+    wait_calls = []
+
+    class PendingDone:
+        def wait(self, timeout):
+            wait_calls.append(timeout)
+            return False
+
+        def is_set(self):
+            return False
+
+    done = PendingDone()
+    window["generation"] = 1
+    window["started_monotonic"] = 1000.0
+    compressor._background_generation = 1
+    compressor._background_active = window
+    monkeypatch.setattr(compressor, "_background_done", done)
+    monkeypatch.setattr(time, "monotonic", lambda: 1105.9)
+
+    assert compressor._join_compatible_background_preparation(
+        window["turns"], timeout=120.0
+    ) is False
+    assert wait_calls == [pytest.approx(14.1)]
+    assert window["timed_out"] is True
+    assert compressor._background_generation == 2
+
+    # The same expired worker remains the active single flight until its thread
+    # exits, but a second hard gate must not pay another wait budget.
+    assert compressor._join_compatible_background_preparation(
+        window["turns"], timeout=120.0
+    ) is False
+    assert wait_calls == [pytest.approx(14.1)]
+
+    # A different manual-focus request is not the same timed-out operation.
+    assert compressor._join_compatible_background_preparation(
+        window["turns"], requested_focus_topic="different", timeout=120.0
+    ) is None
+    assert wait_calls == [pytest.approx(14.1)]
+
+
+def test_timed_out_generation_ignores_late_result():
+    compressor = _compressor()
+    messages = _messages()
+    release = threading.Event()
+    started = threading.Event()
+
+    class Worker:
+        _previous_summary = None
+
+        def _generate_summary(self, turns, focus_topic=None):
+            started.set()
+            release.wait(2)
+            return "late timed-out summary"
+
+    setattr(compressor, "_clone_for_background", lambda: Worker())
+    assert compressor.maybe_prepare_background(messages, current_tokens=80)
+    assert started.wait(1)
+    window = compressor._background_window(messages)
+    assert window is not None
+
+    assert compressor._join_compatible_background_preparation(
+        window["turns"], timeout=0.0
+    ) is False
+    assert compressor._join_compatible_background_preparation(
+        window["turns"], timeout=120.0
+    ) is False
+
+    release.set()
     assert compressor.wait_for_background_preparation(1) is False
     assert compressor._background_candidate is None
 
