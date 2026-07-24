@@ -610,6 +610,39 @@ def test_create_persists_recoverable_blocked_state_on_tampered_source_marker(rig
     assert resumed.last_error is None
 
 
+@pytest.mark.parametrize(
+    "props",
+    [
+        {"cockpit_relay_marker": "[cockpit-link:task-props]", "cockpit_relay_schema": True},
+        {"cockpit_relay_marker": "[cockpit-link:task-props]", "cockpit_relay_schema": 1.0},
+        {"cockpit_relay_marker": "[cockpit-link:task-props]", "cockpit_relay_schema": "1"},
+        {"plugin_metadata": "unexpected"},
+    ],
+)
+def test_create_rejects_non_integer_schema_and_nonempty_unrelated_props(rig, props):
+    service, _, bot, _, _, _, _ = rig
+    bot.create_post(
+        MAIN,
+        "[cockpit-link:task-props]\nWRONG",
+        root_id=SOURCE_ROOT,
+        props=props,
+    )
+    source_post_ids_before = set(bot.posts)
+
+    with pytest.raises(ValueError, match="relay props mismatch"):
+        service.create(
+            task_id="task-props",
+            title="Props validation",
+            handoff="handoff",
+            source_channel_id=MAIN,
+            source_root_id=SOURCE_ROOT,
+            source_post_id=SOURCE_POST,
+            dedupe_key="source:props",
+        )
+
+    assert set(bot.posts) == source_post_ids_before
+
+
 def test_close_rejects_tampered_existing_evidence_marker(rig):
     service, store, bot, owner, _, _, _ = rig
     task = service.create(
@@ -713,6 +746,64 @@ def test_resume_owner_decision_requires_exact_source_binding_and_dedupes(rig):
     assert len(bridge.posts) == before + 1
     assert bridge.posts[-1][1] == task.execution_root_id
     assert bridge.posts[-1][0].startswith("[cockpit-decision:gate-one:approve]")
+
+
+def test_resume_owner_decision_reuses_post_after_resolve_failure(rig, monkeypatch):
+    service, store, bot, owner, bridge, _, _ = rig
+    task = service.create(
+        task_id="task-decision-retry",
+        title="Decision retry",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:decision-retry",
+    )
+    service.open_gate(task.task_id, gate_id="gate-retry", prompt="Pode aprovar?")
+    decision = {
+        "id": DECISION_POST,
+        "channel_id": MAIN,
+        "user_id": OWNER,
+        "root_id": SOURCE_ROOT,
+        "message": "aprovado",
+        "create_at": 4000,
+    }
+    for client in (bot, owner):
+        client.posts[DECISION_POST] = dict(decision)
+    original_resolve_gate = store.resolve_gate
+    resolve_calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls == 1:
+            raise RuntimeError("resolve failed after post")
+        return original_resolve_gate(*args, **kwargs)
+
+    monkeypatch.setattr(store, "resolve_gate", fail_once)
+    with pytest.raises(RuntimeError, match="resolve failed after post"):
+        service.resume_owner_message(
+            task.task_id,
+            gate_id="gate-retry",
+            decision=GateDecision.APPROVE,
+            source_root_id=SOURCE_ROOT,
+            source_post_id=DECISION_POST,
+            message="aprovado",
+        )
+    posted_count = len(bridge.posts)
+
+    resumed = service.resume_owner_message(
+        task.task_id,
+        gate_id="gate-retry",
+        decision=GateDecision.APPROVE,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=DECISION_POST,
+        message="aprovado",
+    )
+
+    assert resumed.lifecycle is Lifecycle.RUNNING
+    assert len(bridge.posts) == posted_count
+    assert store.get_gate("gate-retry").active is False
 
 
 def test_close_success_requires_evidence_then_relays_unfollows_stops_and_terminalizes(rig):

@@ -324,49 +324,56 @@ class CockpitService:
             raise ValueError("owner decision predates active gate")
 
         destination_body = f"[cockpit-decision:{gate_id}:{decision.value}]\n{source_body}"
-        if not gate.active:
-            if (
-                gate.decision is not decision
-                or gate.source_owner_post_id != source_post_id
-                or gate.source_body != source_body
-                or gate.destination_body != destination_body
-                or not gate.destination_post_id
-            ):
-                raise ValueError("resolved gate replay mismatch")
-            self._validate_owner_reply(
-                self.owner_client.get_post(gate.destination_post_id),
-                task,
-                expected_message=destination_body,
+        with self._gate_lock(task.task_id):
+            gate = self.store.get_gate(gate_id)
+            if gate is None or gate.task_id != task.task_id:
+                raise ValueError("active gate mismatch")
+            if not gate.active:
+                if (
+                    gate.decision is not decision
+                    or gate.source_owner_post_id != source_post_id
+                    or gate.source_body != source_body
+                    or gate.destination_body != destination_body
+                    or not gate.destination_post_id
+                ):
+                    raise ValueError("resolved gate replay mismatch")
+                self._validate_owner_reply(
+                    self.owner_client.get_post(gate.destination_post_id),
+                    task,
+                    expected_message=destination_body,
+                )
+                current = self._require_task(task_id)
+                if current.lifecycle is Lifecycle.WAITING_OWNER:
+                    current = self.store.mark_running(task_id, expected_version=current.version)
+                return current
+            current = self._require_open_bound_task(task_id)
+            if current.lifecycle is not Lifecycle.WAITING_OWNER:
+                raise ValueError("task is not waiting on this gate")
+            destination = self._find_owner_reply(task, expected_message=destination_body)
+            if destination is None:
+                result = self.bridge.post_owner(
+                    destination_body,
+                    timeout=30,
+                    team=self.team_name,
+                    channel=self.executions_channel_name,
+                    root_id=task.execution_root_id,
+                )
+                if not result.post_id:
+                    raise ValueError("owner helper returned no post id")
+                destination = self._validate_owner_reply(
+                    self.owner_client.get_post(result.post_id),
+                    task,
+                    expected_message=destination_body,
+                )
+            resolved = self.store.resolve_gate(
+                gate_id,
+                task_id=task.task_id,
+                decision=decision,
+                source_owner_post_id=source_post_id,
+                source_body=source_body,
+                destination_post_id=str(destination["id"]),
+                destination_body=destination_body,
             )
-            current = self._require_task(task_id)
-            if current.lifecycle is Lifecycle.WAITING_OWNER:
-                current = self.store.mark_running(task_id, expected_version=current.version)
-            return current
-        if task.lifecycle is not Lifecycle.WAITING_OWNER:
-            raise ValueError("task is not waiting on this gate")
-        result = self.bridge.post_owner(
-            destination_body,
-            timeout=30,
-            team=self.team_name,
-            channel=self.executions_channel_name,
-            root_id=task.execution_root_id,
-        )
-        if not result.post_id:
-            raise ValueError("owner helper returned no post id")
-        destination = self._validate_owner_reply(
-            self.owner_client.get_post(result.post_id),
-            task,
-            expected_message=destination_body,
-        )
-        resolved = self.store.resolve_gate(
-            gate_id,
-            task_id=task.task_id,
-            decision=decision,
-            source_owner_post_id=source_post_id,
-            source_body=source_body,
-            destination_post_id=str(destination["id"]),
-            destination_body=destination_body,
-        )
         current = self._require_task(task_id)
         if current.lifecycle is Lifecycle.WAITING_OWNER:
             current = self.store.mark_running(task_id, expected_version=current.version)
@@ -592,6 +599,27 @@ class CockpitService:
             raise ValueError("execution kickoff mismatch")
         return post
 
+    def _find_owner_reply(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        expected_message: str,
+    ) -> dict[str, Any] | None:
+        if not task.execution_root_id:
+            raise ValueError("execution root is not bound")
+        thread = self.owner_client.get_thread(task.execution_root_id)
+        posts = thread.get("posts") or {}
+        matching = [
+            post
+            for post in posts.values()
+            if str(post.get("message") or "") == expected_message
+        ]
+        if len(matching) > 1:
+            raise ValueError("multiple execution owner relays found")
+        if not matching:
+            return None
+        return self._validate_owner_reply(matching[0], task, expected_message=expected_message)
+
     def _validate_owner_reply(
         self,
         post: dict[str, Any],
@@ -659,17 +687,18 @@ class CockpitService:
             raise ValueError("relay author mismatch")
         body = str(post.get("message") or "")
         props = post.get("props")
-        if props is None or (
-            isinstance(props, Mapping)
-            and "cockpit_relay_marker" not in props
-            and "cockpit_relay_schema" not in props
-        ):
+        if props is None or (isinstance(props, Mapping) and not props):
             if body != f"{marker}\n{message}":
                 raise ValueError("relay body mismatch")
             return post
         if not isinstance(props, Mapping):
             raise ValueError("relay props mismatch")
-        if props.get("cockpit_relay_marker") != marker or props.get("cockpit_relay_schema") != _RELAY_SCHEMA:
+        schema = props.get("cockpit_relay_schema")
+        if (
+            props.get("cockpit_relay_marker") != marker
+            or type(schema) is not int
+            or schema != _RELAY_SCHEMA
+        ):
             raise ValueError("relay props mismatch")
         if body != message:
             raise ValueError("relay body mismatch")
