@@ -17,6 +17,8 @@ from hermes_cli.mattermost_cockpit.helpers import (
 _JSON_LIMIT = 4096
 _MAX_JSON_BODY = 16 * 1024 * 1024
 _ERROR_BODY_LIMIT = 1024
+_THREADS_PER_PAGE = 200
+_MAX_THREAD_PAGES = 100
 _AUTH_RE = re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer|token)\s+)([^\s\r\n]+)")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+([^\s\r\n]+)")
 _GENERIC_TOKEN_RE = re.compile(r"(?i)\btoken(?:\s*[:=]?\s*)([^\s\r\n]+)")
@@ -111,20 +113,50 @@ class MattermostClient:
             f"/api/v4/users/me/teams/{team_id}/threads/{thread_id}/following",
         )
 
-    def get_thread_following(self, *, team_id: str, thread_id: str) -> dict[str, Any]:
-        return self._request_json_object(
-            "GET",
-            f"/api/v4/users/me/teams/{team_id}/threads/{thread_id}/following",
-        )
-
-    def is_thread_following(self, *, user_id: str, team_id: str, thread_id: str) -> bool:
-        try:
-            self.get_thread_following(team_id=team_id, thread_id=thread_id)
-        except MattermostAPIError as exc:
-            if exc.status_code == 404:
+    def is_thread_following(
+        self, *, user_id: str, team_id: str, thread_id: str
+    ) -> bool:
+        _ = user_id  # The authenticated owner's `me` route is the readback authority.
+        before: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(_MAX_THREAD_PAGES):
+            path = (
+                f"/api/v4/users/me/teams/{team_id}/threads"
+                f"?per_page={_THREADS_PER_PAGE}&extended=false"
+            )
+            if before is not None:
+                path += f"&before={urllib.parse.quote(before, safe='')}"
+            payload = self._request_json_object("GET", path)
+            threads = payload.get("threads")
+            if not isinstance(threads, list):
+                raise MattermostClientError(
+                    "thread following readback returned invalid threads"
+                )
+            for thread in threads:
+                if not isinstance(thread, dict):
+                    continue
+                post = thread.get("post")
+                if thread.get("id") == thread_id or (
+                    isinstance(post, dict) and post.get("id") == thread_id
+                ):
+                    return True
+            if len(threads) < _THREADS_PER_PAGE:
                 return False
-            raise
-        return True
+            last_thread = threads[-1]
+            if not isinstance(last_thread, dict):
+                raise MattermostClientError(
+                    "thread following readback returned invalid cursor"
+                )
+            cursor = last_thread.get("id")
+            if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                raise MattermostClientError(
+                    "thread following readback repeated or invalid cursor"
+                )
+            seen_cursors.add(cursor)
+            before = cursor
+        raise MattermostClientError(
+            "thread following readback exceeded pagination limit"
+        )
 
     def _request_json_object(
         self,

@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
@@ -220,31 +221,82 @@ class TestMattermostClient:
         )
         assert captured["body"] is None
 
-    def test_is_thread_following_maps_only_404_to_false(self):
-        def not_found(request, timeout):
-            raise urllib.error.HTTPError(
-                request.full_url,
-                404,
-                "not found",
-                Message(),
-                io.BytesIO(b'{"message":"not found"}'),
+    def test_is_thread_following_reads_cursor_paginated_thread_list(self):
+        urls: list[str] = []
+
+        def urlopen(request, timeout):
+            urls.append(request.full_url)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)
+            before = query.get("before", [None])[0]
+            threads = (
+                [{"id": f"other-{index}"} for index in range(200)]
+                if before is None
+                else [{"id": "root-1", "post": {"id": "root-1"}}]
+            )
+            return FakeResponse(
+                200,
+                json.dumps({"threads": threads}).encode(),
+                {"Content-Type": "application/json"},
             )
 
-        client = make_client(not_found)
-        assert client.is_thread_following(user_id="user-1", team_id="team-1", thread_id="root-1") is False
+        client = make_client(urlopen)
+        assert client.is_thread_following(
+            user_id="user-1", team_id="team-1", thread_id="root-1"
+        ) is True
+        assert len(urls) == 2
+        assert urls[0].endswith(
+            "/api/v4/users/me/teams/team-1/threads?per_page=200&extended=false"
+        )
+        assert urls[1].endswith("&before=other-199")
 
-        def unauthorized(request, timeout):
-            raise urllib.error.HTTPError(
-                request.full_url,
-                401,
-                "unauthorized",
-                Message(),
-                io.BytesIO(b'{"message":"unauthorized"}'),
+    def test_is_thread_following_returns_false_after_last_cursor_page(self):
+        def urlopen(request, timeout):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)
+            before = query.get("before", [None])[0]
+            threads = (
+                [{"id": f"other-{index}"} for index in range(200)]
+                if before is None
+                else []
+            )
+            return FakeResponse(
+                200,
+                json.dumps({"threads": threads}).encode(),
+                {"Content-Type": "application/json"},
             )
 
-        client = make_client(unauthorized)
-        with pytest.raises(MattermostClientError):
-            client.is_thread_following(user_id="user-1", team_id="team-1", thread_id="root-1")
+        client = make_client(urlopen)
+        assert client.is_thread_following(
+            user_id="user-1", team_id="team-1", thread_id="root-1"
+        ) is False
+
+    def test_is_thread_following_rejects_repeated_cursor(self):
+        def urlopen(request, timeout):
+            threads = [{"id": f"other-{index}"} for index in range(200)]
+            return FakeResponse(
+                200,
+                json.dumps({"threads": threads}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+        with pytest.raises(MattermostClientError, match="repeated or invalid cursor"):
+            client.is_thread_following(
+                user_id="user-1", team_id="team-1", thread_id="root-1"
+            )
+
+    def test_is_thread_following_rejects_invalid_list_response(self):
+        def urlopen(request, timeout):
+            return FakeResponse(
+                200,
+                json.dumps({"threads": {}}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+        with pytest.raises(MattermostClientError, match="invalid threads"):
+            client.is_thread_following(
+                user_id="user-1", team_id="team-1", thread_id="root-1"
+            )
 
     def test_success_response_body_is_bounded(self):
         def urlopen(request, timeout):
