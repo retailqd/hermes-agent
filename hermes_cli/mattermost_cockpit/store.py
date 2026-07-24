@@ -728,7 +728,7 @@ class MattermostCockpitStore:
             if cursor.rowcount != 1:
                 raise ValueError("gate prompt bind race")
             updated = conn.execute(GATE_SELECT_SQL, (gate_id,)).fetchone()
-            return MattermostCockpitGateRelay.from_row(updated)  # type: ignore[arg-type]
+            return MattermostCockpitGateRelay.from_row(updated)
 
     def resolve_gate(
         self,

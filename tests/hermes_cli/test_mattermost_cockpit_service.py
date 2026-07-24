@@ -266,6 +266,36 @@ def test_gate_reservation_recovers_after_publish_failure(rig, monkeypatch):
     assert len(bot.posts) == posts_before + 1
 
 
+def test_gate_retry_reuses_post_after_bind_failure(rig, monkeypatch):
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-gate-bind-recovery", title="Gate bind recovery", handoff="handoff",
+        source_channel_id=MAIN, source_root_id=SOURCE_ROOT, source_post_id=SOURCE_POST,
+        dedupe_key="source:gate-bind-recovery",
+    )
+    posts_before = len(bot.posts)
+    original = store.bind_gate_prompt
+
+    def fail_bind(*args, **kwargs):
+        raise RuntimeError("gate bind failed")
+
+    monkeypatch.setattr(store, "bind_gate_prompt", fail_bind)
+    with pytest.raises(RuntimeError, match="gate bind failed"):
+        service.open_gate(task.task_id, gate_id="gate-bind-recovery", prompt="Pode aprovar?")
+    reserved = store.get_active_gate(task.task_id)
+    assert reserved is not None
+    assert reserved.prompt_post_id == service._pending_gate_prompt_id(task.task_id, "gate-bind-recovery")
+    assert len(bot.posts) == posts_before + 1
+
+    monkeypatch.setattr(store, "bind_gate_prompt", original)
+    waiting = service.open_gate(task.task_id, gate_id="gate-bind-recovery", prompt="Pode aprovar?")
+    bound = store.get_active_gate(task.task_id)
+    assert waiting.lifecycle is Lifecycle.WAITING_OWNER
+    assert bound is not None
+    assert bound.prompt_post_id != reserved.prompt_post_id
+    assert len(bot.posts) == posts_before + 1
+
+
 def test_create_reconciles_existing_marked_root_without_duplicate(rig):
     service, _, _, owner, bridge, _, _ = rig
     existing = {
