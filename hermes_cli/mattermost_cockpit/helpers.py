@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -34,7 +35,7 @@ class HelperBridge:
         owner_post_script: Path | str,
         poll_script: Path | str,
         watch_script: Path | str,
-        python_bin: str = "python3",
+        python_bin: str = sys.executable,
         default_team: str = "pht",
         default_channel: str = "execucoes",
         run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
@@ -104,6 +105,8 @@ class HelperBridge:
         *,
         timeout: float | None = None,
     ) -> HelperRunResult:
+        if not root_ids:
+            raise ValueError("at least one root id is required")
         command = [self.python_bin, "-P", str(self.watch_script), *[str(root) for root in root_ids]]
         return self._run_script(command, timeout=timeout, label="watch-main")
 

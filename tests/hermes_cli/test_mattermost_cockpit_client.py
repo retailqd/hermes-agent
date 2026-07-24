@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import sys
 import urllib.error
 from email.message import Message
 from pathlib import Path
@@ -149,6 +150,73 @@ class TestMattermostClient:
             "root_id": "root-9",
         }
 
+    def test_update_post_includes_required_post_id(self):
+        captured: dict[str, object] = {}
+
+        def urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode())
+            return FakeResponse(
+                200,
+                json.dumps({"id": "post-77", "message": "updated"}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+        client.update_post("post-77", "updated")
+
+        assert str(captured["url"]).endswith("/api/v4/posts/post-77")
+        assert captured["body"] == {"id": "post-77", "message": "updated"}
+
+    def test_set_thread_following_uses_user_team_thread_endpoint(self):
+        captured: dict[str, object] = {}
+
+        def urlopen(request, timeout):
+            captured["method"] = request.method
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode())
+            return FakeResponse(
+                200,
+                json.dumps({"status": "OK"}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+        client.set_thread_following(
+            user_id="user-1",
+            team_id="team-1",
+            thread_id="root-1",
+            following=False,
+        )
+
+        assert captured["method"] == "PUT"
+        assert str(captured["url"]).endswith(
+            "/api/v4/users/user-1/teams/team-1/threads/root-1/following"
+        )
+        assert captured["body"] == {"following": False}
+
+    def test_success_response_body_is_bounded(self):
+        def urlopen(request, timeout):
+            return FakeResponse(
+                200,
+                b'{' + b'"payload":"' + b"x" * (16 * 1024 * 1024) + b'"}',
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+        with pytest.raises(MattermostClientError, match="too large"):
+            client.get_thread("root-1")
+
+    def test_url_error_reason_is_redacted(self):
+        def urlopen(request, timeout):
+            raise urllib.error.URLError("Authorization: Bearer network-secret-token")
+
+        client = make_client(urlopen)
+        with pytest.raises(MattermostClientError) as exc:
+            client.get_post("post-1")
+
+        assert "network-secret-token" not in str(exc.value)
+
 
 class TestHelperBridge:
     def test_post_owner_runs_canonical_script_with_stdin_and_reports_post_id(self):
@@ -171,7 +239,7 @@ class TestHelperBridge:
         run.assert_called_once()
         called_args, called_kwargs = run.call_args
         assert called_args[0] == [
-            "python3",
+            sys.executable,
             "-P",
             "/fake/post_as_owner.py",
             "--team",
@@ -224,7 +292,7 @@ class TestHelperBridge:
         run.assert_called_once()
         called_args, called_kwargs = run.call_args
         assert called_args[0] == [
-            "python3",
+            sys.executable,
             "-P",
             "/fake/watch_main.py",
             "root-a",
@@ -233,3 +301,9 @@ class TestHelperBridge:
         assert "timeout" not in called_kwargs
         assert result.returncode == 0
         assert result.stdout.startswith("WAKE:")
+
+    def test_watch_main_rejects_empty_root_list(self):
+        bridge = make_bridge(Mock())
+
+        with pytest.raises(ValueError, match="root"):
+            bridge.watch_main([])

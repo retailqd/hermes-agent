@@ -15,6 +15,7 @@ from hermes_cli.mattermost_cockpit.helpers import (
 
 
 _JSON_LIMIT = 4096
+_MAX_JSON_BODY = 16 * 1024 * 1024
 _ERROR_BODY_LIMIT = 1024
 _AUTH_RE = re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer|token)\s+)([^\s\r\n]+)")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+([^\s\r\n]+)")
@@ -83,13 +84,25 @@ class MattermostClient:
         return self._request_json_object("POST", "/api/v4/posts", payload)
 
     def update_post(self, post_id: str, message: str) -> dict[str, Any]:
-        return self._request_json_object("PUT", f"/api/v4/posts/{post_id}", {"message": message})
+        return self._request_json_object(
+            "PUT",
+            f"/api/v4/posts/{post_id}",
+            {"id": post_id, "message": message},
+        )
 
-    def follow_thread(self, post_id: str) -> dict[str, Any]:
-        return self._request_json_object("POST", f"/api/v4/posts/{post_id}/thread/follow")
-
-    def unfollow_thread(self, post_id: str) -> dict[str, Any]:
-        return self._request_json_object("DELETE", f"/api/v4/posts/{post_id}/thread/follow")
+    def set_thread_following(
+        self,
+        *,
+        user_id: str,
+        team_id: str,
+        thread_id: str,
+        following: bool,
+    ) -> dict[str, Any]:
+        return self._request_json_object(
+            "PUT",
+            f"/api/v4/users/{user_id}/teams/{team_id}/threads/{thread_id}/following",
+            {"following": bool(following)},
+        )
 
     def _request_json_object(
         self,
@@ -125,7 +138,11 @@ class MattermostClient:
                         body,
                         reason=getattr(response, "reason", None),
                     )
-                body = response.read()
+                body = response.read(_MAX_JSON_BODY + 1)
+                if len(body) > _MAX_JSON_BODY:
+                    raise MattermostClientError(
+                        f"{method} {request.full_url} returned a JSON body that is too large"
+                    )
                 return self._decode_json_body(method, request.full_url, body, response.headers)
         except urllib.error.HTTPError as exc:
             body = exc.read(_ERROR_BODY_LIMIT + 1)
@@ -137,7 +154,8 @@ class MattermostClient:
                 reason=getattr(exc, "reason", None),
             ) from exc
         except urllib.error.URLError as exc:
-            raise MattermostClientError(f"{method} {request.full_url} failed: {exc.reason}") from exc
+            reason = self._redact(str(exc.reason))
+            raise MattermostClientError(f"{method} {request.full_url} failed: {reason}") from exc
         except UnicodeDecodeError as exc:
             raise MattermostClientError(f"{method} {request.full_url} returned invalid utf-8") from exc
 
