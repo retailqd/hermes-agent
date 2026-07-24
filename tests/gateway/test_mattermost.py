@@ -194,7 +194,7 @@ def _make_adapter():
     config = PlatformConfig(
         enabled=True,
         token="test-token",
-        extra={"url": "https://mm.example.com"},
+        extra={"url": "https://mm.example.com", "allowed_channels": ""},
     )
     adapter = MattermostAdapter(config)
     return adapter
@@ -816,6 +816,59 @@ class TestMattermostFileUpload:
 
         assert result.success is True
         assert result.message_id == "post_with_file"
+
+
+# ---------------------------------------------------------------------------
+# Channel allowlist
+# ---------------------------------------------------------------------------
+
+
+class TestMattermostChannelAllowlist:
+    MAIN_CHANNEL = "1axfo6xfxjg5txcfddmbja8jkh"
+    EXECUTIONS_CHANNEL = "c5rhkxsp6t8w9ezuetij5e4gur"
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter.config.extra["allowed_channels"] = [
+            self.MAIN_CHANNEL,
+            self.EXECUTIONS_CHANNEL,
+        ]
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter._bot_username = "hermes-bot"
+        self.handle_message_mock = AsyncMock()
+        self.adapter.handle_message = self.handle_message_mock
+
+    @staticmethod
+    def _event(channel_id: str, post_id: str) -> dict:
+        post_data = {
+            "id": post_id,
+            "user_id": "user_123",
+            "channel_id": channel_id,
+            "message": "@hermes-bot execute",
+        }
+        return {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "O",
+                "sender_name": "@alice",
+            },
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id", [MAIN_CHANNEL, EXECUTIONS_CHANNEL])
+    async def test_only_cockpit_channels_are_allowed(self, channel_id):
+        await self.adapter._handle_ws_event(self._event(channel_id, channel_id[:8]))
+
+        assert self.handle_message_mock.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_third_channel_is_blocked(self):
+        await self.adapter._handle_ws_event(
+            self._event("third-channel-id", "third-post-id")
+        )
+
+        assert self.handle_message_mock.call_count == 0
 
 
 # ---------------------------------------------------------------------------
