@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .client import MattermostClient
 from .contracts import (
@@ -31,6 +31,7 @@ _MAX_EVIDENCE_CHARS = 8000
 _MAX_VALIDATION_CHARS = 1000
 _UNFOLLOW_READBACK_ATTEMPTS = 10
 _UNFOLLOW_READBACK_INTERVAL_SECONDS = 0.5
+_RELAY_SCHEMA = 1
 
 
 class UnitController:
@@ -154,10 +155,7 @@ class CockpitService:
             self._ensure_source_relay(
                 task,
                 marker=f"[cockpit-link:{task.task_id}]",
-                message=(
-                    f"[cockpit-link:{task.task_id}]\n"
-                    f"Execução iniciada: [{task.title}]({task.execution_permalink})"
-                ),
+                message=f"Execução iniciada: [{task.title}]({task.execution_permalink})",
             )
             self.units.start(task.task_id)
             is_active = getattr(self.units, "is_active", None)
@@ -238,7 +236,7 @@ class CockpitService:
                     )
                 )
             if gate.prompt_post_id == pending_prompt_post_id:
-                post = self._ensure_source_relay(task, marker=marker, message=message)
+                post = self._ensure_source_relay(task, marker=marker, message=prompt)
                 gate = self.store.bind_gate_prompt(
                     gate_id,
                     task_id=task.task_id,
@@ -247,10 +245,11 @@ class CockpitService:
                     prompt_body=message,
                 )
             else:
-                self._validate_bot_reply(
+                self._validate_source_relay_post(
                     self.bot_client.get_post(gate.prompt_post_id),
                     task,
-                    expected_message=message,
+                    marker=marker,
+                    message=prompt,
                 )
         if not gate.active:
             raise ValueError("gate is already resolved")
@@ -311,10 +310,15 @@ class CockpitService:
         source_body = message.strip()
         if str(source.get("message") or "").strip() != source_body:
             raise ValueError("owner decision body mismatch")
-        prompt_post = self._validate_bot_reply(
+        prompt_marker, separator, prompt_message = gate.prompt_body.partition("\n")
+        expected_prompt_marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
+        if not separator or prompt_marker != expected_prompt_marker:
+            raise ValueError("gate prompt body mismatch")
+        prompt_post = self._validate_source_relay_post(
             self.bot_client.get_post(gate.prompt_post_id),
             task,
-            expected_message=gate.prompt_body,
+            marker=expected_prompt_marker,
+            message=prompt_message,
         )
         if int(source.get("create_at") or 0) < int(prompt_post.get("create_at") or 0):
             raise ValueError("owner decision predates active gate")
@@ -451,7 +455,6 @@ class CockpitService:
                 else f"{len(evidence)} item(ns) de evidência registrado(s)"
             )
             message = (
-                f"{marker}\n"
                 f"**Resultado:** {summary}\n"
                 f"**Validação:** {validation_text}\n"
                 f"Detalhes: [execução]({task.execution_permalink})"
@@ -510,7 +513,7 @@ class CockpitService:
             bounded = output[:_MAX_RELAY_CHARS]
             digest = hashlib.sha256(bounded.encode("utf-8")).hexdigest()[:16]
             marker = f"[cockpit-relay:{task_id}:{digest}]"
-            self._ensure_source_relay(task, marker=marker, message=f"{marker}\n{bounded}")
+            self._ensure_source_relay(task, marker=marker, message=bounded)
         thread = self.bot_client.get_thread(task.execution_root_id)
         posts = thread.get("posts") or {}
         max_cursor = max((int(post.get("create_at") or 0) for post in posts.values()), default=task.execution_cursor_ms)
@@ -606,17 +609,71 @@ class CockpitService:
             raise ValueError("execution owner relay body mismatch")
         return post
 
+    @staticmethod
+    def _source_relay_props(marker: str) -> dict[str, object]:
+        return {"cockpit_relay_marker": marker, "cockpit_relay_schema": _RELAY_SCHEMA}
+
+    @staticmethod
+    def _post_relay_marker(post: Mapping[str, Any]) -> str | None:
+        props = post.get("props")
+        if isinstance(props, Mapping):
+            value = props.get("cockpit_relay_marker")
+            if isinstance(value, str) and value:
+                return value
+        message = str(post.get("message") or "")
+        if not message:
+            return None
+        first_line = message.splitlines()[0]
+        return first_line if first_line.startswith("[cockpit-") else None
+
     def _ensure_source_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
         thread = self.bot_client.get_thread(task.source_root_id)
         posts = thread.get("posts") or {}
-        existing = [post for post in posts.values() if marker in str(post.get("message") or "")]
+        existing = [post for post in posts.values() if self._post_relay_marker(post) == marker]
         if len(existing) > 1:
             raise ValueError("multiple source relays found for marker")
         if existing:
-            return self._validate_bot_reply(existing[0], task, expected_message=message)
-        created = self.bot_client.create_post(task.source_channel_id, message, root_id=task.source_root_id)
+            return self._validate_source_relay_post(existing[0], task, marker=marker, message=message)
+        created = self.bot_client.create_post(
+            task.source_channel_id,
+            message,
+            root_id=task.source_root_id,
+            props=self._source_relay_props(marker),
+        )
         readback = self.bot_client.get_post(str(created.get("id") or ""))
-        return self._validate_bot_reply(readback, task, expected_message=message)
+        return self._validate_source_relay_post(readback, task, marker=marker, message=message)
+
+    def _validate_source_relay_post(
+        self,
+        post: dict[str, Any],
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+    ) -> dict[str, Any]:
+        if post.get("channel_id") != task.source_channel_id:
+            raise ValueError("relay channel mismatch")
+        if post.get("root_id") != task.source_root_id:
+            raise ValueError("relay root mismatch")
+        if post.get("user_id") != task.watcher_user_id:
+            raise ValueError("relay author mismatch")
+        body = str(post.get("message") or "")
+        props = post.get("props")
+        if props is None or (
+            isinstance(props, Mapping)
+            and "cockpit_relay_marker" not in props
+            and "cockpit_relay_schema" not in props
+        ):
+            if body != f"{marker}\n{message}":
+                raise ValueError("relay body mismatch")
+            return post
+        if not isinstance(props, Mapping):
+            raise ValueError("relay props mismatch")
+        if props.get("cockpit_relay_marker") != marker or props.get("cockpit_relay_schema") != _RELAY_SCHEMA:
+            raise ValueError("relay props mismatch")
+        if body != message:
+            raise ValueError("relay body mismatch")
+        return post
 
     def _ensure_execution_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
         if not task.execution_root_id:

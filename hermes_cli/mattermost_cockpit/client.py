@@ -86,10 +86,13 @@ class MattermostClient:
         message: str,
         *,
         root_id: str | None = None,
+        props: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"channel_id": channel_id, "message": message}
         if root_id:
             payload["root_id"] = root_id
+        if props is not None:
+            payload["props"] = dict(props)
         return self._request_json_object("POST", "/api/v4/posts", payload)
 
     def update_post(self, post_id: str, message: str) -> dict[str, Any]:

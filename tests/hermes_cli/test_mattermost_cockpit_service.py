@@ -52,7 +52,14 @@ class FakeClient:
     def get_channel(self, channel_id: str) -> dict:
         return self.channels[channel_id]
 
-    def create_post(self, channel_id: str, message: str, *, root_id: str | None = None) -> dict:
+    def create_post(
+        self,
+        channel_id: str,
+        message: str,
+        *,
+        root_id: str | None = None,
+        props: dict | None = None,
+    ) -> dict:
         self._counter += 1
         post_id = f"p{self._counter:025d}"
         post = {
@@ -61,6 +68,7 @@ class FakeClient:
             "user_id": self.user_id,
             "root_id": root_id or "",
             "message": message,
+            "props": dict(props or {}),
             "create_at": 1000 + self._counter,
         }
         self.posts[post_id] = post
@@ -192,17 +200,55 @@ def test_create_is_idempotent_and_posts_exactly_one_execution_root(rig):
     assert first.task_id == second.task_id == "task-one"
     assert first.lifecycle is Lifecycle.RUNNING
     assert len([p for p in owner.posts.values() if p["channel_id"] == EXEC and not p["root_id"]]) == 1
-    assert len(
-        [
-            p
-            for p in bot.posts.values()
-            if p.get("root_id") == SOURCE_ROOT and "[cockpit-link:task-one]" in p.get("message", "")
-        ]
-    ) == 1
+    source_relays = [
+        p
+        for p in bot.posts.values()
+        if p.get("root_id") == SOURCE_ROOT and p.get("user_id") == BOT
+    ]
+    assert len(source_relays) == 1
+    source_relay = source_relays[0]
+    assert "[cockpit-link:" not in source_relay["message"]
+    assert source_relay["props"]["cockpit_relay_marker"] == "[cockpit-link:task-one]"
+    assert source_relay["props"]["cockpit_relay_schema"] == 1
     assert units.started == ["task-one", "task-one"]
     assert store.get_task("task-one").execution_root_id == first.execution_root_id
     assert owner.following is False
     assert True not in owner.following_calls
+
+
+def test_create_replays_exact_legacy_visible_marker_without_duplicate(rig):
+    service, _, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-legacy",
+        title="Legacy relay",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:legacy",
+    )
+    source_relay = next(
+        post
+        for post in bot.posts.values()
+        if post.get("root_id") == SOURCE_ROOT and post.get("user_id") == BOT
+    )
+    marker = source_relay["props"].pop("cockpit_relay_marker")
+    source_relay["props"].pop("cockpit_relay_schema")
+    source_relay["message"] = f"{marker}\n{source_relay['message']}"
+    post_ids_before = set(bot.posts)
+
+    replayed = service.create(
+        task_id="ignored-retry-id",
+        title="Legacy relay",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:legacy",
+    )
+
+    assert replayed.task_id == task.task_id
+    assert set(bot.posts) == post_ids_before
 
 
 def test_create_explicitly_unfollows_execution_root_before_starting_watcher(rig):
@@ -405,7 +451,11 @@ def test_second_active_gate_fails_before_posting_orphan_prompt(rig):
     with pytest.raises(ValueError, match="active gate"):
         service.open_gate(task.task_id, gate_id="gate-two", prompt="Segundo gate")
     assert len(bot.posts) == posts_before
-    assert not any("[cockpit-gate:task-single-gate:gate-two]" in post["message"] for post in bot.posts.values())
+    assert not any(
+        post.get("props", {}).get("cockpit_relay_marker")
+        == "[cockpit-gate:task-single-gate:gate-two]"
+        for post in bot.posts.values()
+    )
     assert store.get_active_gate(task.task_id).gate_id == "gate-one"
 
 
@@ -514,11 +564,18 @@ def test_create_fails_closed_on_wrong_source_author(rig):
 
 def test_create_persists_recoverable_blocked_state_on_tampered_source_marker(rig):
     service, store, bot, _, _, _, _ = rig
+    marker = "[cockpit-link:task-tampered]"
     marker_post = bot.create_post(
         MAIN,
-        "[cockpit-link:task-tampered]\nWRONG",
+        "WRONG",
         root_id=SOURCE_ROOT,
+        props={"cockpit_relay_marker": marker, "cockpit_relay_schema": 1},
     )
+    source_post_ids_before = {
+        post_id
+        for post_id, post in bot.posts.items()
+        if post.get("root_id") == SOURCE_ROOT and post.get("user_id") == BOT
+    }
     with pytest.raises(ValueError, match="relay body mismatch"):
         service.create(
             task_id="task-tampered",
@@ -533,11 +590,13 @@ def test_create_persists_recoverable_blocked_state_on_tampered_source_marker(rig
     assert blocked.lifecycle is Lifecycle.BLOCKED
     assert blocked.execution_root_id
     assert "relay body mismatch" in (blocked.last_error or "")
+    assert {
+        post_id
+        for post_id, post in bot.posts.items()
+        if post.get("root_id") == SOURCE_ROOT and post.get("user_id") == BOT
+    } == source_post_ids_before
 
-    marker_post["message"] = (
-        "[cockpit-link:task-tampered]\n"
-        f"Execução iniciada: [Tampered]({blocked.execution_permalink})"
-    )
+    marker_post["message"] = f"Execução iniciada: [Tampered]({blocked.execution_permalink})"
     resumed = service.create(
         task_id="task-tampered",
         title="Tampered",
@@ -684,7 +743,7 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
     source_final = next(
         p
         for p in bot.posts.values()
-        if "[cockpit-final:task-close]" in p["message"]
+        if p.get("props", {}).get("cockpit_relay_marker") == "[cockpit-final:task-close]"
     )
     execution_evidence = next(
         p
@@ -720,7 +779,11 @@ def test_close_resumes_after_unfollow_already_completed(rig):
 
     assert closed.lifecycle is Lifecycle.SUCCEEDED
     assert False not in owner.following_calls
-    assert any("[cockpit-final:task-close-retry]" in p["message"] for p in bot.posts.values())
+    assert any(
+        p.get("props", {}).get("cockpit_relay_marker")
+        == "[cockpit-final:task-close-retry]"
+        for p in bot.posts.values()
+    )
 
 
 def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
@@ -751,7 +814,8 @@ def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
     assert pending.pending_outcome is Lifecycle.SUCCEEDED
     assert "unfollow failed" in (pending.last_error or "")
     assert not any(
-        "[cockpit-final:task-close-cleanup-fail]" in post["message"]
+        post.get("props", {}).get("cockpit_relay_marker")
+        == "[cockpit-final:task-close-cleanup-fail]"
         for post in bot.posts.values()
     )
 

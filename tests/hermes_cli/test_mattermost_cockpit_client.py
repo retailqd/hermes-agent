@@ -165,7 +165,12 @@ class TestMattermostClient:
             )
 
         client = make_client(urlopen)
-        payload = client.create_post("channel-7", "hello", root_id="root-9")
+        payload = client.create_post(
+            "channel-7",
+            "hello",
+            root_id="root-9",
+            props={"cockpit_relay_marker": "relay-1", "cockpit_relay_schema": 1},
+        )
 
         assert payload == {"id": "post-77"}
         assert captured["authorization"] == "Bearer explicit-token"
@@ -173,6 +178,7 @@ class TestMattermostClient:
             "channel_id": "channel-7",
             "message": "hello",
             "root_id": "root-9",
+            "props": {"cockpit_relay_marker": "relay-1", "cockpit_relay_schema": 1},
         }
 
     def test_update_post_includes_required_post_id(self):
