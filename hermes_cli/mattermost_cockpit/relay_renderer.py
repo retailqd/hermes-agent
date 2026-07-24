@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import urlsplit
@@ -68,6 +69,8 @@ class RenderedRelay:
 
 def _permalink(value: str) -> str:
     value = value.strip()
+    if not value.isascii():
+        raise ValueError("execution permalink contains non-ASCII characters")
     parts = urlsplit(value)
     if parts.scheme not in {"https", "http"} or not parts.netloc:
         raise ValueError("execution permalink must be an absolute HTTP URL")
@@ -82,6 +85,8 @@ def _plain(value: str, *, field: str) -> str:
     value = re.sub(r"\n{3,}", "\n\n", value).strip()
     if not value:
         raise ValueError(f"{field} must not be empty")
+    if any(unicodedata.category(char) == "Cf" for char in value):
+        raise ValueError(f"{field} contains Unicode format characters")
     checks = (
         (_LONG_INTERNAL_ID, "an internal identifier"),
         (_RAW_TIMESTAMP, "a raw timestamp"),

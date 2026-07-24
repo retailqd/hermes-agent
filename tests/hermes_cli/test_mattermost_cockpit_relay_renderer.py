@@ -246,6 +246,9 @@ Falta contexto suficiente.
         "https://mattermost.example.com/x y",
         "https://mattermost.example.com/x\nnext",
         "https://mattermost.example.com/x\tmore",
+        PERMALINK + "\u200b",
+        PERMALINK + "\u202eabc",
+        "https://m\u2066attermost.example.com/pht/pl/execroot123",
     ],
 )
 def test_permalink_rejects_whitespace_control_and_markdown_injection(permalink: str) -> None:
@@ -409,6 +412,11 @@ def test_em_dash_is_normalized_without_changing_business_identifiers() -> None:
         "2026-07-24 17:25:30",
         "2026/07/24 17:25",
         "17:25:30",
+        "[cockpit\u200b-relay:task]",
+        "https://mattermost\u200b.example.com/x",
+        "2026-07-\u200b24 17:25:30",
+        "python\u200b3 debug.py",
+        "kubectl\u202e get pods",
         "Post w8t3hdhbkbdafmwcck61xeo69e atualizado",
     ],
 )
