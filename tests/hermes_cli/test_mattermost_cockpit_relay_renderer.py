@@ -116,30 +116,14 @@ def test_render_closed_failure_variants_are_pt_br(outcome, heading, kind) -> Non
     assert_owner_contract(relay.body)
 
 
-def test_semantic_update_filters_screenshot_equivalent_noise() -> None:
-    raw = """## 5 new posts
-2026-07-24T17:25:30 | retailqd | post-id-123
-[cockpit-decision:task:gate-auth-shared-client-default]
+def test_semantic_update_accepts_clean_business_state_update() -> None:
+    raw = """[cockpit-owner-state]
 Autorizo a correção da NF 000119.
----
-Interrupting current task...
-compression started
-working...
-watcher heartbeat
-401 Unauthorized
-$ hermes-mattermost-cockpit gate --gate-id gate-auth-shared-client-default
----
-[cockpit-owner-blocked]
-**Bloqueado**
-A correção não foi aplicada porque faltou autenticação do conversor de PDF.
-
-**Preciso de você**
-Autorizar a credencial compartilhada para concluir a NF 000119.
 """
     relay = render_execution_update(raw, PERMALINK)
     assert relay is not None
-    assert "faltou autenticação" in relay.body
-    assert "Autorizar a credencial compartilhada" in relay.body
+    assert relay.kind is RelayKind.UPDATE
+    assert "NF 000119" in relay.body
     assert_owner_contract(relay.body)
 
 
@@ -170,3 +154,80 @@ def test_long_body_is_bounded_without_breaking_the_link() -> None:
     )
     assert len(relay.body) <= MAX_RELAY_CHARS
     assert relay.body.endswith(f"[Abrir detalhes técnicos]({PERMALINK})")
+
+
+def test_render_gate_keeps_blocker_and_decision_when_sections_are_long() -> None:
+    relay = render_gate(
+        f"""[cockpit-gate:task:gate-auth-shared-client-default]
+**Bloqueado**
+{('Motivo técnico muito longo. ' * 80).strip()}
+
+**Preciso de você**
+{('Autorizar a credencial compartilhada para concluir e validar a NF 000119. ' * 20).strip()}
+""",
+        PERMALINK,
+    )
+    assert relay.body.count("**Bloqueado**") == 1
+    assert relay.body.count("**Preciso de você**") == 1
+    assert "Motivo técnico muito longo" in relay.body
+    assert "Autorizar a credencial compartilhada" in relay.body
+    assert len(relay.body) <= MAX_RELAY_CHARS
+    assert relay.body.count("**") % 2 == 0
+
+
+def test_render_closed_keeps_validation_section_when_summary_is_long() -> None:
+    relay = render_closed(
+        outcome="SUCCEEDED",
+        summary="Resultado validado. " * 120,
+        validation="PDF gerado e conferido no pedido correto. " * 40,
+        permalink=PERMALINK,
+    )
+    assert relay.body.startswith("**Concluído**")
+    assert "**Validado**" in relay.body
+    assert "PDF gerado e conferido" in relay.body
+    assert len(relay.body) <= MAX_RELAY_CHARS
+
+
+def test_execution_update_requires_marker_as_the_first_non_empty_line() -> None:
+    raw = """Observação anterior
+[cockpit-owner-state]
+Autorizo a correção da NF 000119.
+"""
+    assert render_execution_update(raw, PERMALINK) is None
+
+
+def test_malformed_blocked_semantic_update_fails_closed() -> None:
+    raw = """[cockpit-owner-blocked]
+**Bloqueado**
+Falta contexto suficiente.
+"""
+    assert render_execution_update(raw, PERMALINK) is None
+
+
+@pytest.mark.parametrize(
+    "permalink",
+    [
+        "https://mattermost.example.com/x) [segundo](https://evil.example)",
+        "https://mattermost.example.com/x y",
+        "https://mattermost.example.com/x\nnext",
+        "https://mattermost.example.com/x\tmore",
+    ],
+)
+def test_permalink_rejects_whitespace_control_and_markdown_injection(permalink: str) -> None:
+    with pytest.raises(ValueError, match="permalink"):
+        render_started("Corrigir conversão da NF 000119", permalink)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[cockpit-owner-state]\n⚡ Interrupting current task",
+        "[cockpit-owner-state]\n⚡ compression working...",
+        "[cockpit-owner-state]\nHTTP 401",
+        "[cockpit-owner-state]\nstatus=500",
+        "[cockpit-owner-state]\nIntrodução [cockpit-owner-state] ainda não deve renderizar",
+        "[cockpit-owner-state]\nPrecisamos executar hermes-mattermost-cockpit gate --gate-id gate-auth-shared-client-default",
+    ],
+)
+def test_execution_update_rejects_raw_technical_noise(raw: str) -> None:
+    assert render_execution_update(raw, PERMALINK) is None

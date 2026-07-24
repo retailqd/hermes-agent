@@ -8,17 +8,24 @@ MAX_RELAY_CHARS = 1200
 _LINK_LABEL = "Abrir detalhes técnicos"
 
 _MARKER_LINE = re.compile(r"(?m)^\[(?:cockpit-[^\]]+|cockpit:[^\]]+)\]\s*$")
+_INLINE_MARKER = re.compile(r"\[(?:cockpit-[^\]]+|cockpit:[^\]]+)\]")
 _LONG_INTERNAL_ID = re.compile(r"\b[a-z0-9]{26}\b")
 _RAW_TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?")
 _RAW_HTTP = re.compile(
-    r"(?i)\b(?:HTTP(?:/\d(?:\.\d)?)?\s*)?[1-5]\d{2}\s+"
-    r"(?:unauthorized|forbidden|not found|bad gateway|service unavailable|internal server error)\b"
+    r"(?i)\b(?:HTTP(?:/\d(?:\.\d)?)?\s*[1-5]\d{2}|status\s*=?\s*[1-5]\d{2})(?:\b|$)"
 )
 _ROUTINE = re.compile(
-    r"(?im)^(?:interrupting current task|working|watcher|wake|heartbeat|compression|context compaction)(?:\b|\W)"
+    r"(?im)^[^\w\n]*(?:"
+    r"interrupting(?: current task)?|"
+    r"working(?:\.\.\.)?|"
+    r"watcher(?: heartbeat)?|"
+    r"wake|heartbeat|"
+    r"compression(?:\s+(?:started|working(?:\.\.\.)?))?|"
+    r"context compaction"
+    r")(?:\b|\W)"
 )
 _HELPER_PREAMBLE = re.compile(r"(?im)^##\s+\d+\s+new posts?\b")
-_SHELL_LINE = re.compile(r"(?m)^\s*(?:\$\s+|hermes-mattermost-cockpit\s+)")
+_SHELL_LINE = re.compile(r"(?i)\bhermes-mattermost-cockpit\b")
 _GATE_TOKEN = re.compile(r"(?i)\bgate[-_:][a-z0-9_.:-]+\b")
 _AUTH_MATERIAL = re.compile(r"(?i)\b(?:authorization\s*:\s*bearer|bearer\s+\S+)\b")
 _VISIBLE_URL = re.compile(r"(?i)(?:https?://|\[[^\]]+\]\([^\)]+\))")
@@ -44,7 +51,9 @@ class RenderedRelay:
 
 def _permalink(value: str) -> str:
     value = value.strip()
-    if not value.startswith(("https://", "http://")) or any(ch in value for ch in "\r\n"):
+    if not value.startswith(("https://", "http://")) or any(
+        ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch in "[]()" for ch in value
+    ):
         raise ValueError("execution permalink must be an absolute HTTP URL")
     return value
 
@@ -67,6 +76,7 @@ def _plain(value: str, *, field: str) -> str:
         (_AUTH_MATERIAL, "authorization material"),
         (_VISIBLE_URL, "an extra link"),
         (_EXTRA_HEADING, "an unsupported heading"),
+        (_INLINE_MARKER, "a cockpit marker"),
     )
     for pattern, reason in checks:
         if pattern.search(value):
@@ -83,6 +93,35 @@ def _truncate_text(value: str, limit: int) -> str:
 
 def _bounded(sections: list[str], permalink: str) -> str:
     link = f"[{_LINK_LABEL}]({_permalink(permalink)})"
+    structured: list[tuple[str, str]] = []
+    for section in sections:
+        heading, separator, content = section.partition("\n")
+        if not separator or not heading.startswith("**") or not heading.endswith("**"):
+            structured = []
+            break
+        structured.append((heading, content))
+
+    if structured:
+        separator_chars = 2 * (len(structured) - 1)
+        fixed_chars = sum(len(heading) + 1 for heading, _ in structured) + separator_chars + len(link)
+        if fixed_chars <= MAX_RELAY_CHARS:
+            body_budget = MAX_RELAY_CHARS - fixed_chars
+            total_content = sum(len(content) for _, content in structured)
+            rendered_sections: list[str] = []
+            if total_content <= body_budget:
+                rendered_sections = [f"{heading}\n{content}" for heading, content in structured]
+            else:
+                count = len(structured)
+                base = body_budget // count
+                extra = body_budget % count
+                for index, (heading, content) in enumerate(structured):
+                    quota = base + (1 if index < extra else 0)
+                    rendered_content = content if len(content) <= quota else _truncate_text(content, quota)
+                    rendered_sections.append(f"{heading}\n{rendered_content}")
+            body = "\n\n".join(rendered_sections + [link])
+            if len(body) <= MAX_RELAY_CHARS:
+                return body
+
     budget = MAX_RELAY_CHARS - len(link) - 2
     kept: list[str] = []
     for section in sections:
@@ -99,6 +138,18 @@ def _bounded(sections: list[str], permalink: str) -> str:
     if len(body) > MAX_RELAY_CHARS:
         raise AssertionError("owner relay length invariant failed")
     return body
+
+
+def _semantic_update(message: str) -> tuple[str, str] | None:
+    lines = message.replace("\r", "\n").split("\n")
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped not in {"[cockpit-owner-state]", "[cockpit-owner-blocked]"}:
+            return None
+        return stripped, "\n".join(lines[index + 1 :])
+    return None
 
 
 def _sections(prompt: str) -> tuple[str, str]:
@@ -147,14 +198,17 @@ def render_closed(
 
 
 def render_execution_update(message: str, permalink: str) -> RenderedRelay | None:
-    if "[cockpit-owner-blocked]" in message:
-        semantic = message.split("[cockpit-owner-blocked]", 1)[1]
-        return render_gate(semantic, permalink)
-    if "[cockpit-owner-state]" in message:
-        semantic = message.split("[cockpit-owner-state]", 1)[1]
+    semantic = _semantic_update(message)
+    if semantic is None:
+        return None
+    marker, tail = semantic
+    if marker == "[cockpit-owner-blocked]":
         try:
-            state = _plain(semantic, field="state")
+            return render_gate(tail, permalink)
         except ValueError:
             return None
-        return RenderedRelay(RelayKind.UPDATE, _bounded([f"**Em andamento**\n{state}"], permalink))
-    return None
+    try:
+        state = _plain(tail, field="state")
+    except ValueError:
+        return None
+    return RenderedRelay(RelayKind.UPDATE, _bounded([f"**Em andamento**\n{state}"], permalink))
