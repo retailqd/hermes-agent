@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,6 +16,9 @@ from hermes_cli.mattermost_cockpit.helpers import (
 
 _JSON_LIMIT = 4096
 _ERROR_BODY_LIMIT = 1024
+_AUTH_RE = re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer|token)\s+)([^\s\r\n]+)")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+([^\s\r\n]+)")
+_GENERIC_TOKEN_RE = re.compile(r"(?i)\btoken(?:\s*[:=]?\s*)([^\s\r\n]+)")
 
 
 class MattermostClientError(RuntimeError):
@@ -112,13 +116,26 @@ class MattermostClient:
         try:
             with self._urlopen(request, timeout=self.timeout) as response:
                 status = int(getattr(response, "status", 200) or 200)
-                body = response.read(_JSON_LIMIT + 1)
                 if not 200 <= status < 300:
-                    raise self._error_from_body(method, request.full_url, status, body, None)
+                    body = response.read(_ERROR_BODY_LIMIT + 1)
+                    raise self._error_from_body(
+                        method,
+                        request.full_url,
+                        status,
+                        body,
+                        reason=getattr(response, "reason", None),
+                    )
+                body = response.read()
                 return self._decode_json_body(method, request.full_url, body, response.headers)
         except urllib.error.HTTPError as exc:
             body = exc.read(_ERROR_BODY_LIMIT + 1)
-            raise self._error_from_body(method, request.full_url, int(exc.code), body, exc) from exc
+            raise self._error_from_body(
+                method,
+                request.full_url,
+                int(exc.code),
+                body,
+                reason=getattr(exc, "reason", None),
+            ) from exc
         except urllib.error.URLError as exc:
             raise MattermostClientError(f"{method} {request.full_url} failed: {exc.reason}") from exc
         except UnicodeDecodeError as exc:
@@ -162,13 +179,15 @@ class MattermostClient:
         url: str,
         status_code: int,
         body: bytes,
-        exc: Exception | None,
+        *,
+        reason: str | None,
     ) -> MattermostAPIError:
         text = body.decode("utf-8", errors="replace")
         if len(body) > _ERROR_BODY_LIMIT:
             text = _truncate(text, _ERROR_BODY_LIMIT) + "…[truncated]"
         text = self._redact(text)
-        message = f"{method} {url} failed with HTTP {status_code}: {text or '<empty>'}"
+        reason_text = f" {reason}" if reason else ""
+        message = f"{method} {url} failed with HTTP {status_code}{reason_text}: {text or '<empty>'}"
         return MattermostAPIError(status_code, method, url, message)
 
     def _join_url(self, path: str) -> str:
@@ -194,6 +213,9 @@ class MattermostClient:
     def _redact(self, text: str) -> str:
         text = text.replace(f"Bearer {self.token}", "Bearer <redacted>")
         text = text.replace(self.token, "<redacted>")
+        text = _AUTH_RE.sub(r"\1<redacted>", text)
+        text = _BEARER_RE.sub("Bearer <redacted>", text)
+        text = _GENERIC_TOKEN_RE.sub("token <redacted>", text)
         return text
 
 

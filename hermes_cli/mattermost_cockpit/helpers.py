@@ -10,6 +10,7 @@ from typing import Callable, Sequence
 _TOKEN_RE = re.compile(r"(?i)(MATTERMOST_[A-Z0-9_]*TOKEN\s*=\s*)([^\s\r\n]+)")
 _AUTH_RE = re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer|token)\s+)([^\s\r\n]+)")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+([^\s\r\n]+)")
+_GENERIC_TOKEN_RE = re.compile(r"(?i)\btoken(?:\s*[:=]?\s*)([^\s\r\n]+)")
 _ID_RE = re.compile(r"\bid=([^\s|]+)")
 
 
@@ -172,4 +173,5 @@ class HelperBridge:
         text = _TOKEN_RE.sub(r"\1<redacted>", text)
         text = _AUTH_RE.sub(r"\1<redacted>", text)
         text = _BEARER_RE.sub("Bearer <redacted>", text)
+        text = _GENERIC_TOKEN_RE.sub("token <redacted>", text)
         return text
