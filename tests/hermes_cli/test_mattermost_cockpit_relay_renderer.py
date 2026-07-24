@@ -402,6 +402,13 @@ def test_em_dash_is_normalized_without_changing_business_identifiers() -> None:
     [
         "RuntimeError: backend failed",
         "Traceback (most recent call last):\n  File 'worker.py', line 1",
+        "Task failed with ValueError: missing field",
+        "python3 debug.py",
+        "bash -lc whoami",
+        "kubectl get pods",
+        "2026-07-24 17:25:30",
+        "2026/07/24 17:25",
+        "17:25:30",
         "Post w8t3hdhbkbdafmwcck61xeo69e atualizado",
     ],
 )

@@ -13,7 +13,10 @@ _GATE_MARKER_LINE = re.compile(r"^\[cockpit-gate:[^\]]+\]\s*$")
 _INLINE_MARKER = re.compile(r"\[(?:cockpit-[^\]]+|cockpit:[^\]]+)\]")
 _COCKPIT_TOKEN = re.compile(r"(?i)\bcockpit[-:][a-z0-9][a-z0-9_.:-]*\b")
 _LONG_INTERNAL_ID = re.compile(r"\b[a-z0-9]{26}\b")
-_RAW_TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?")
+_RAW_TIMESTAMP = re.compile(
+    r"\b(?:\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}(?::\d{2})?|"
+    r"(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?)\b"
+)
 _RAW_HTTP = re.compile(
     r"(?i)\b(?:HTTP(?:/\d(?:\.\d)?)?\s*[1-5]\d{2}|status\s*=?\s*[1-5]\d{2}|[1-5]\d{2}\s+[A-Z][A-Za-z-]*(?:\s+[A-Z][A-Za-z-]*)*)\b"
 )
@@ -28,11 +31,18 @@ _ROUTINE = re.compile(
     r")(?:\b|\W)"
 )
 _HELPER_PREAMBLE = re.compile(r"(?im)^##\s+\d+\s+new posts?\b")
-_SHELL_LINE = re.compile(r"(?im)(?:^\s*\$\s+\S+|\bhermes-mattermost-cockpit\b)")
+_SHELL_LINE = re.compile(
+    r"(?im)(?:^\s*\$\s+\S+|^\s*(?:sudo\s+)?(?:"
+    r"bash|sh|zsh|fish|python(?:3(?:\.\d+)?)?|node|ruby|perl|php|java|go|cargo|rustc|"
+    r"git|gh|docker|podman|kubectl|helm|terraform|ansible(?:-playbook)?|curl|wget|ssh|"
+    r"scp|rsync|systemctl|journalctl|pytest|ruff|mypy|uv|uvx|pip3?|npm|pnpm|yarn|make|"
+    r"cmake|ninja|hermes(?:-mattermost-cockpit)?"
+    r")\s+\S+|\bhermes-mattermost-cockpit\b)"
+)
 _GATE_TOKEN = re.compile(r"(?i)\bgate[-_:][a-z0-9_.:-]+\b")
 _AUTH_MATERIAL = re.compile(r"(?i)\b(?:authorization\s*:\s*bearer|bearer\s+\S+)\b")
 _EXCEPTION_INTERNAL = re.compile(
-    r"(?im)(?:^Traceback \(most recent call last\):|^\s*[A-Za-z_][\w.]*?(?:Error|Exception):(?:\s|$))"
+    r"(?i)(?:Traceback \(most recent call last\):|\b[A-Za-z_][\w.]*?(?:Error|Exception):(?:\s|$))"
 )
 _VISIBLE_URL = re.compile(r"(?i)(?:https?://|\[[^\]]+\]\([^\)]+\))")
 _BOLD_HEADING = re.compile(r"(?m)^\*\*[^*\n]+\*\*\s*$")
