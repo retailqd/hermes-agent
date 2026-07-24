@@ -328,6 +328,31 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
     assert "5 passed" in execution_evidence["message"]
 
 
+def test_close_resumes_after_unfollow_already_completed(rig):
+    service, store, bot, owner, bridge, units, _ = rig
+    task = service.create(
+        task_id="task-close-retry",
+        title="Retry close",
+        handoff="Retry partial cleanup",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=f"source:{SOURCE_POST}",
+    )
+    owner.following = False
+
+    closed = service.close(
+        task.task_id,
+        outcome=Lifecycle.SUCCEEDED,
+        summary="retry completed",
+        evidence={"validation": "cleanup retry passed"},
+    )
+
+    assert closed.lifecycle is Lifecycle.SUCCEEDED
+    assert False not in owner.following_calls
+    assert any("[cockpit-final:task-close-retry]" in p["message"] for p in bot.posts.values())
+
+
 def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
     service, store, bot, owner, _, _, _ = rig
     task = service.create(

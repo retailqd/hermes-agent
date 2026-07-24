@@ -220,12 +220,17 @@ class CockpitService:
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
 
-        self.owner_client.set_thread_following(
+        if self.owner_client.is_thread_following(
             user_id=task.owner_author_id,
             team_id=task.team_id,
             thread_id=task.execution_root_id,
-            following=False,
-        )
+        ):
+            self.owner_client.set_thread_following(
+                user_id=task.owner_author_id,
+                team_id=task.team_id,
+                thread_id=task.execution_root_id,
+                following=False,
+            )
         if self.owner_client.is_thread_following(
             user_id=task.owner_author_id,
             team_id=task.team_id,
