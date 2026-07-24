@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
-from .contracts import Lifecycle
+from .contracts import Lifecycle, TERMINAL_LIFECYCLES, validate_mattermost_id, validate_task_id
 
 
 def utc_now() -> datetime:
@@ -29,52 +29,127 @@ def _parse_utc(value: str | None) -> datetime | None:
 
 
 def _require_text(value: str, field_name: str) -> str:
-    value = str(value or "").strip()
-    if not value:
+    text = str(value).strip()
+    if not text:
         raise ValueError(f"{field_name} must not be empty")
-    return value
+    return text
+
+
+def _require_non_negative_int(value: int, field_name: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+    return number
 
 
 @dataclass(frozen=True, slots=True)
 class MattermostCockpitTask:
-    root_id: str
+    task_id: str
     team_id: str
-    channel_id: str
+    source_channel_id: str
+    source_root_id: str
+    source_post_id: str
     owner_author_id: str
-    watcher_user_id: str
+    executions_channel_id: str
+    execution_root_id: str | None = None
+    execution_permalink: str | None = None
+    watcher_user_id: str = ""
+    title: str = ""
     lifecycle: Lifecycle = Lifecycle.OPEN
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     closed_at: datetime | None = None
+    source_cursor_ms: int = 0
+    execution_cursor_ms: int = 0
+    watcher_owner: str | None = None
+    watcher_heartbeat_at: datetime | None = None
+    result_summary: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+    last_error: str | None = None
     dedupe_key: str | None = None
+    version: int = 1
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "root_id", _require_text(self.root_id, "root_id"))
-        object.__setattr__(self, "team_id", _require_text(self.team_id, "team_id"))
-        object.__setattr__(self, "channel_id", _require_text(self.channel_id, "channel_id"))
-        object.__setattr__(self, "owner_author_id", _require_text(self.owner_author_id, "owner_author_id"))
-        object.__setattr__(self, "watcher_user_id", _require_text(self.watcher_user_id, "watcher_user_id"))
+        object.__setattr__(self, "task_id", validate_task_id(self.task_id))
+        object.__setattr__(self, "team_id", validate_mattermost_id(self.team_id, "team_id"))
+        object.__setattr__(self, "source_channel_id", validate_mattermost_id(self.source_channel_id, "source_channel_id"))
+        object.__setattr__(self, "source_root_id", validate_mattermost_id(self.source_root_id, "source_root_id"))
+        object.__setattr__(self, "source_post_id", validate_mattermost_id(self.source_post_id, "source_post_id"))
+        object.__setattr__(self, "owner_author_id", validate_mattermost_id(self.owner_author_id, "owner_author_id"))
+        object.__setattr__(self, "executions_channel_id", validate_mattermost_id(self.executions_channel_id, "executions_channel_id"))
+        object.__setattr__(self, "watcher_user_id", validate_mattermost_id(self.watcher_user_id, "watcher_user_id"))
+        object.__setattr__(self, "title", _require_text(self.title, "title"))
+        if self.execution_root_id is not None:
+            object.__setattr__(self, "execution_root_id", validate_mattermost_id(self.execution_root_id, "execution_root_id"))
+        if self.execution_permalink is not None:
+            object.__setattr__(self, "execution_permalink", _require_text(self.execution_permalink, "execution_permalink"))
         object.__setattr__(self, "created_at", _require_utc(self.created_at, "created_at"))
         object.__setattr__(self, "updated_at", _require_utc(self.updated_at, "updated_at"))
         if self.closed_at is not None:
             object.__setattr__(self, "closed_at", _require_utc(self.closed_at, "closed_at"))
-        if self.lifecycle is Lifecycle.CLOSED and self.closed_at is None:
-            raise ValueError("closed tasks must have closed_at")
-        if self.dedupe_key is not None:
-            object.__setattr__(self, "dedupe_key", _require_text(self.dedupe_key, "dedupe_key"))
+        if self.watcher_heartbeat_at is not None:
+            object.__setattr__(self, "watcher_heartbeat_at", _require_utc(self.watcher_heartbeat_at, "watcher_heartbeat_at"))
+        if self.watcher_owner is not None:
+            object.__setattr__(self, "watcher_owner", _require_text(self.watcher_owner, "watcher_owner"))
+        if self.result_summary is not None:
+            object.__setattr__(self, "result_summary", _require_text(self.result_summary, "result_summary"))
+        if self.last_error is not None:
+            object.__setattr__(self, "last_error", _require_text(self.last_error, "last_error"))
+        object.__setattr__(self, "evidence", dict(self.evidence or {}))
+        object.__setattr__(self, "source_cursor_ms", _require_non_negative_int(self.source_cursor_ms, "source_cursor_ms"))
+        object.__setattr__(self, "execution_cursor_ms", _require_non_negative_int(self.execution_cursor_ms, "execution_cursor_ms"))
+        object.__setattr__(self, "version", _require_non_negative_int(self.version, "version"))
+        if self.version < 1:
+            raise ValueError("version must be >= 1")
+        if self.lifecycle in TERMINAL_LIFECYCLES:
+            if self.closed_at is None:
+                raise ValueError("closed_at is required for terminal lifecycle")
+        elif self.closed_at is not None:
+            raise ValueError("nonterminal lifecycle must not carry closed_at")
+        if self.lifecycle is Lifecycle.SUCCEEDED:
+            if self.result_summary is None:
+                raise ValueError("result_summary is required for succeeded tasks")
+            if not self.evidence:
+                raise ValueError("evidence is required for succeeded tasks")
+
+    def creation_binding(self) -> tuple[Any, ...]:
+        return (
+            self.team_id,
+            self.source_channel_id,
+            self.source_root_id,
+            self.source_post_id,
+            self.owner_author_id,
+            self.executions_channel_id,
+            self.watcher_user_id,
+            self.title,
+        )
 
     def to_record(self) -> dict[str, Any]:
         return {
-            "root_id": self.root_id,
+            "task_id": self.task_id,
             "team_id": self.team_id,
-            "channel_id": self.channel_id,
+            "source_channel_id": self.source_channel_id,
+            "source_root_id": self.source_root_id,
+            "source_post_id": self.source_post_id,
             "owner_author_id": self.owner_author_id,
+            "executions_channel_id": self.executions_channel_id,
+            "execution_root_id": self.execution_root_id,
+            "execution_permalink": self.execution_permalink,
             "watcher_user_id": self.watcher_user_id,
+            "title": self.title,
             "lifecycle": self.lifecycle.value,
             "created_at": _format_utc(self.created_at),
             "updated_at": _format_utc(self.updated_at),
             "closed_at": _format_utc(self.closed_at) if self.closed_at else None,
+            "source_cursor_ms": self.source_cursor_ms,
+            "execution_cursor_ms": self.execution_cursor_ms,
+            "watcher_owner": self.watcher_owner,
+            "watcher_heartbeat_at": _format_utc(self.watcher_heartbeat_at) if self.watcher_heartbeat_at else None,
+            "result_summary": self.result_summary,
+            "evidence_json": json.dumps(self.evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+            "last_error": self.last_error,
             "dedupe_key": self.dedupe_key,
+            "version": self.version,
         }
 
     @classmethod
@@ -83,23 +158,42 @@ class MattermostCockpitTask:
         updated_at = _parse_utc(row["updated_at"])
         if created_at is None or updated_at is None:
             raise ValueError("task row timestamps must be present")
+        evidence_json = row["evidence_json"]
+        if evidence_json in (None, ""):
+            evidence = {}
+        else:
+            evidence = json.loads(evidence_json)
         return cls(
-            root_id=row["root_id"],
+            task_id=row["task_id"],
             team_id=row["team_id"],
-            channel_id=row["channel_id"],
+            source_channel_id=row["source_channel_id"],
+            source_root_id=row["source_root_id"],
+            source_post_id=row["source_post_id"],
             owner_author_id=row["owner_author_id"],
+            executions_channel_id=row["executions_channel_id"],
+            execution_root_id=row["execution_root_id"],
+            execution_permalink=row["execution_permalink"],
             watcher_user_id=row["watcher_user_id"],
+            title=row["title"],
             lifecycle=Lifecycle(row["lifecycle"]),
             created_at=created_at,
             updated_at=updated_at,
             closed_at=_parse_utc(row["closed_at"]),
-            dedupe_key=row.get("dedupe_key") if hasattr(row, "get") else row["dedupe_key"],
+            source_cursor_ms=row["source_cursor_ms"],
+            execution_cursor_ms=row["execution_cursor_ms"],
+            watcher_owner=row["watcher_owner"],
+            watcher_heartbeat_at=_parse_utc(row["watcher_heartbeat_at"]),
+            result_summary=row["result_summary"],
+            evidence=evidence,
+            last_error=row["last_error"],
+            dedupe_key=row["dedupe_key"],
+            version=row["version"],
         )
 
 
 @dataclass(frozen=True, slots=True)
 class MattermostCockpitAuditEvent:
-    root_id: str
+    task_id: str
     event_type: str
     actor_user_id: str
     created_at: datetime
@@ -107,9 +201,9 @@ class MattermostCockpitAuditEvent:
     dedupe_key: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "root_id", _require_text(self.root_id, "root_id"))
+        object.__setattr__(self, "task_id", validate_task_id(self.task_id))
         object.__setattr__(self, "event_type", _require_text(self.event_type, "event_type"))
-        object.__setattr__(self, "actor_user_id", _require_text(self.actor_user_id, "actor_user_id"))
+        object.__setattr__(self, "actor_user_id", validate_mattermost_id(self.actor_user_id, "actor_user_id"))
         object.__setattr__(self, "created_at", _require_utc(self.created_at, "created_at"))
         object.__setattr__(self, "payload", dict(self.payload or {}))
         if self.dedupe_key is not None:
@@ -117,7 +211,7 @@ class MattermostCockpitAuditEvent:
 
     def to_record(self) -> dict[str, Any]:
         return {
-            "root_id": self.root_id,
+            "task_id": self.task_id,
             "event_type": self.event_type,
             "actor_user_id": self.actor_user_id,
             "created_at": _format_utc(self.created_at),
@@ -127,15 +221,15 @@ class MattermostCockpitAuditEvent:
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "MattermostCockpitAuditEvent":
-        payload_json = row["payload_json"]
         created_at = _parse_utc(row["created_at"])
         if created_at is None:
             raise ValueError("audit event timestamps must be present")
+        payload_json = row["payload_json"]
         return cls(
-            root_id=row["root_id"],
+            task_id=row["task_id"],
             event_type=row["event_type"],
             actor_user_id=row["actor_user_id"],
             created_at=created_at,
             payload=json.loads(payload_json) if payload_json else {},
-            dedupe_key=row.get("dedupe_key") if hasattr(row, "get") else row["dedupe_key"],
+            dedupe_key=row["dedupe_key"],
         )
