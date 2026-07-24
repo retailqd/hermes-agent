@@ -17,6 +17,9 @@ from .models import MattermostCockpitAuditEvent, MattermostCockpitTask, utc_now
 from .store import MattermostCockpitStore
 
 _MAX_RELAY_CHARS = 3500
+_MAX_SUMMARY_CHARS = 2000
+_MAX_EVIDENCE_CHARS = 8000
+_MAX_VALIDATION_CHARS = 1000
 
 
 class UnitController:
@@ -202,8 +205,13 @@ class CockpitService:
         summary = summary.strip()
         if not summary:
             raise ValueError("summary must not be empty")
+        if len(summary) > _MAX_SUMMARY_CHARS:
+            raise ValueError("summary is too large")
         if outcome is Lifecycle.SUCCEEDED and not evidence:
             raise ValueError("evidence is required for succeeded tasks")
+        evidence_json = json.dumps(evidence, sort_keys=True, ensure_ascii=False)
+        if len(evidence_json) > _MAX_EVIDENCE_CHARS:
+            raise ValueError("evidence is too large")
         task = self._require_task(task_id)
         if task.lifecycle in TERMINAL_LIFECYCLES:
             if task.lifecycle is not outcome:
@@ -212,10 +220,6 @@ class CockpitService:
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
 
-        marker = f"[cockpit-final:{task.task_id}]"
-        message = f"{marker}\n**Resultado:** {summary}\n**Evidência:** `{json.dumps(evidence, sort_keys=True, ensure_ascii=False)}`"
-        final_post = self._ensure_source_relay(task, marker=marker, message=message)
-        self._validate_bot_reply(final_post, task)
         self.owner_client.set_thread_following(
             user_id=task.owner_author_id,
             team_id=task.team_id,
@@ -229,6 +233,29 @@ class CockpitService:
         ):
             raise ValueError("owner unfollow readback mismatch")
         self.units.stop(task.task_id)
+
+        evidence_digest = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()[:16]
+        evidence_marker = f"[cockpit-evidence:{task.task_id}:{evidence_digest}]"
+        self._ensure_execution_relay(
+            task,
+            marker=evidence_marker,
+            message=f"{evidence_marker}\n**Evidência final:** `{evidence_json}`",
+        )
+        marker = f"[cockpit-final:{task.task_id}]"
+        validation = evidence.get("validation")
+        validation_text = (
+            validation.strip()[:_MAX_VALIDATION_CHARS]
+            if isinstance(validation, str) and validation.strip()
+            else f"{len(evidence)} item(ns) de evidência registrado(s)"
+        )
+        message = (
+            f"{marker}\n"
+            f"**Resultado:** {summary}\n"
+            f"**Validação:** {validation_text}\n"
+            f"Detalhes: [execução]({task.execution_permalink})"
+        )
+        final_post = self._ensure_source_relay(task, marker=marker, message=message)
+        self._validate_bot_reply(final_post, task)
         current = self._require_task(task_id)
         closed = self.store.transition(
             task_id,
@@ -371,6 +398,33 @@ class CockpitService:
         created = self.bot_client.create_post(task.source_channel_id, message, root_id=task.source_root_id)
         readback = self.bot_client.get_post(str(created.get("id") or ""))
         return self._validate_bot_reply(readback, task)
+
+    def _ensure_execution_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
+        if not task.execution_root_id:
+            raise ValueError("execution root is not bound")
+        thread = self.bot_client.get_thread(task.execution_root_id)
+        posts = thread.get("posts") or {}
+        existing = [post for post in posts.values() if marker in str(post.get("message") or "")]
+        if len(existing) > 1:
+            raise ValueError("multiple execution relays found for marker")
+        if existing:
+            return self._validate_execution_bot_reply(existing[0], task)
+        created = self.bot_client.create_post(
+            task.executions_channel_id,
+            message,
+            root_id=task.execution_root_id,
+        )
+        readback = self.bot_client.get_post(str(created.get("id") or ""))
+        return self._validate_execution_bot_reply(readback, task)
+
+    def _validate_execution_bot_reply(self, post: dict[str, Any], task: MattermostCockpitTask) -> dict[str, Any]:
+        if post.get("channel_id") != task.executions_channel_id:
+            raise ValueError("execution relay channel mismatch")
+        if post.get("root_id") != task.execution_root_id:
+            raise ValueError("execution relay root mismatch")
+        if post.get("user_id") != task.watcher_user_id:
+            raise ValueError("execution relay author mismatch")
+        return post
 
     def _validate_bot_reply(self, post: dict[str, Any], task: MattermostCockpitTask) -> dict[str, Any]:
         if post.get("channel_id") != task.source_channel_id:

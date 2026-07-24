@@ -32,6 +32,7 @@ class FakeClient:
         }
         self.following_calls: list[bool] = []
         self.following = False
+        self.fail_unfollow = False
         self._counter = 0
 
     def get_post(self, post_id: str) -> dict:
@@ -71,6 +72,8 @@ class FakeClient:
 
     def set_thread_following(self, *, user_id: str, team_id: str, thread_id: str, following: bool) -> dict:
         assert user_id == OWNER and team_id == TEAM
+        if not following and self.fail_unfollow:
+            raise RuntimeError("unfollow failed")
         self.following_calls.append(following)
         self.following = following
         self.events.append(f"follow:{following}")
@@ -308,7 +311,49 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
     assert units.stopped == [task.task_id]
     assert events.index("follow:False") < events.index("unit:stop")
     assert store.get_task(task.task_id).evidence == {"tests": "5 passed"}
-    assert any("[cockpit-final:task-close]" in p["message"] for p in bot.posts.values())
+    source_final = next(
+        p
+        for p in bot.posts.values()
+        if "[cockpit-final:task-close]" in p["message"]
+    )
+    execution_evidence = next(
+        p
+        for p in bot.posts.values()
+        if "[cockpit-evidence:task-close:" in p["message"]
+    )
+    assert source_final["channel_id"] == MAIN
+    assert "5 passed" not in source_final["message"]
+    assert execution_evidence["channel_id"] == EXEC
+    assert execution_evidence["root_id"] == task.execution_root_id
+    assert "5 passed" in execution_evidence["message"]
+
+
+def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-close-cleanup-fail",
+        title="Close cleanup failure",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:close-cleanup-fail",
+    )
+    owner.fail_unfollow = True
+
+    with pytest.raises(RuntimeError, match="unfollow failed"):
+        service.close(
+            task.task_id,
+            outcome=Lifecycle.SUCCEEDED,
+            summary="done",
+            evidence={"tests": "5 passed"},
+        )
+
+    assert store.get_task(task.task_id).lifecycle is Lifecycle.RUNNING
+    assert not any(
+        "[cockpit-final:task-close-cleanup-fail]" in post["message"]
+        for post in bot.posts.values()
+    )
 
 
 def test_watch_once_exits_without_helper_call_for_terminal_task(rig):
