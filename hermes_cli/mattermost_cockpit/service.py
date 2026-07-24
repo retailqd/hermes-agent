@@ -29,8 +29,8 @@ _MAX_RELAY_CHARS = 3500
 _MAX_SUMMARY_CHARS = 2000
 _MAX_EVIDENCE_CHARS = 8000
 _MAX_VALIDATION_CHARS = 1000
-_FOLLOW_READBACK_ATTEMPTS = 10
-_FOLLOW_READBACK_INTERVAL_SECONDS = 0.5
+_UNFOLLOW_READBACK_ATTEMPTS = 10
+_UNFOLLOW_READBACK_INTERVAL_SECONDS = 0.5
 
 
 class UnitController:
@@ -146,19 +146,11 @@ class CockpitService:
                     expected_message=kickoff,
                 )
 
-            if not self.owner_client.is_thread_following(
+            self._ensure_owner_unfollowed(
                 user_id=self.contracts.owner_author_id,
                 team_id=self.contracts.team_id,
                 thread_id=str(execution_post["id"]),
-            ):
-                self.owner_client.set_thread_following(
-                    user_id=self.contracts.owner_author_id,
-                    team_id=self.contracts.team_id,
-                    thread_id=str(execution_post["id"]),
-                    following=True,
-                )
-            if not self._wait_for_owner_follow(str(execution_post["id"])):
-                raise ValueError("owner follow readback mismatch")
+            )
             self._ensure_source_relay(
                 task,
                 marker=f"[cockpit-link:{task.task_id}]",
@@ -192,17 +184,32 @@ class CockpitService:
                     pass
             raise
 
-    def _wait_for_owner_follow(self, thread_id: str) -> bool:
-        for attempt in range(_FOLLOW_READBACK_ATTEMPTS):
-            if self.owner_client.is_thread_following(
-                user_id=self.contracts.owner_author_id,
-                team_id=self.contracts.team_id,
+    def _ensure_owner_unfollowed(self, *, user_id: str, team_id: str, thread_id: str) -> None:
+        observed_unfollowed = False
+        delete_sent = False
+        for attempt in range(_UNFOLLOW_READBACK_ATTEMPTS):
+            following = self.owner_client.is_thread_following(
+                user_id=user_id,
+                team_id=team_id,
                 thread_id=thread_id,
-            ):
-                return True
-            if attempt + 1 < _FOLLOW_READBACK_ATTEMPTS:
-                self.sleep(_FOLLOW_READBACK_INTERVAL_SECONDS)
-        return False
+            )
+            if following:
+                if not delete_sent or observed_unfollowed:
+                    self.owner_client.set_thread_following(
+                        user_id=user_id,
+                        team_id=team_id,
+                        thread_id=thread_id,
+                        following=False,
+                    )
+                    delete_sent = True
+                observed_unfollowed = False
+            elif observed_unfollowed:
+                return
+            else:
+                observed_unfollowed = True
+            if attempt + 1 < _UNFOLLOW_READBACK_ATTEMPTS:
+                self.sleep(_UNFOLLOW_READBACK_INTERVAL_SECONDS)
+        raise ValueError("owner unfollow readback mismatch")
 
     def open_gate(self, task_id: str, *, gate_id: str, prompt: str) -> MattermostCockpitTask:
         task = self._require_open_bound_task(task_id)
@@ -419,23 +426,11 @@ class CockpitService:
                 last_error=last_error,
             )
         try:
-            if self.owner_client.is_thread_following(
+            self._ensure_owner_unfollowed(
                 user_id=task.owner_author_id,
                 team_id=task.team_id,
                 thread_id=execution_root_id,
-            ):
-                self.owner_client.set_thread_following(
-                    user_id=task.owner_author_id,
-                    team_id=task.team_id,
-                    thread_id=execution_root_id,
-                    following=False,
-                )
-            if self.owner_client.is_thread_following(
-                user_id=task.owner_author_id,
-                team_id=task.team_id,
-                thread_id=execution_root_id,
-            ):
-                raise ValueError("owner unfollow readback mismatch")
+            )
             self.units.stop(task.task_id)
             is_active = getattr(self.units, "is_active", None)
             if callable(is_active) and is_active(task.task_id):

@@ -164,6 +164,7 @@ def rig(tmp_path: Path):
         executions_channel_name="execucoes",
         watcher_owner="test-watcher",
         state_dir=tmp_path / "watchers",
+        sleep=lambda _: None,
     )
     return service, store, bot, owner, bridge, units, events
 
@@ -200,31 +201,17 @@ def test_create_is_idempotent_and_posts_exactly_one_execution_root(rig):
     ) == 1
     assert units.started == ["task-one", "task-one"]
     assert store.get_task("task-one").execution_root_id == first.execution_root_id
+    assert owner.following is False
+    assert True not in owner.following_calls
 
 
-def test_create_retries_eventually_consistent_owner_follow_readback(rig):
-    service, store, _, owner, _, _, _ = rig
-    original = owner.is_thread_following
-    after_set_readbacks = iter([False, False, True])
-    sleeps: list[float] = []
-    readback_calls = 0
-
-    def delayed_readback(**kwargs):
-        nonlocal readback_calls
-        readback_calls += 1
-        current = original(**kwargs)
-        if readback_calls == 1:
-            assert current is False
-            return False
-        assert current is True
-        return next(after_set_readbacks)
-
-    owner.is_thread_following = delayed_readback
-    service.sleep = sleeps.append
+def test_create_explicitly_unfollows_execution_root_before_starting_watcher(rig):
+    service, store, _, owner, _, units, events = rig
+    owner.following = True
 
     task = service.create(
-        task_id="task-eventual-follow",
-        title="Eventual follow",
+        task_id="task-unfollow-on-create",
+        title="Unfollow on create",
         handoff="handoff",
         source_channel_id=MAIN,
         source_root_id=SOURCE_ROOT,
@@ -234,19 +221,102 @@ def test_create_retries_eventually_consistent_owner_follow_readback(rig):
 
     assert task.lifecycle is Lifecycle.RUNNING
     assert store.get_task(task.task_id).last_error is None
-    assert sleeps == [0.5, 0.5]
+    assert owner.following is False
+    assert owner.following_calls == [False]
+    assert events.index("follow:False") < events.index("unit:start")
+    assert units.started == [task.task_id]
 
 
-def test_create_blocks_after_owner_follow_readback_retry_exhaustion(rig):
-    service, store, _, owner, _, _, _ = rig
+def test_create_is_idempotent_when_execution_root_is_already_unfollowed(rig):
+    service, _, _, owner, _, units, _ = rig
+
+    task = service.create(
+        task_id="task-already-unfollowed",
+        title="Already unfollowed",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=f"source:{SOURCE_POST}",
+    )
+
+    assert task.lifecycle is Lifecycle.RUNNING
+    assert owner.following is False
+    assert owner.following_calls == []
+    assert units.started == [task.task_id]
+
+
+def test_create_removes_delayed_auto_follow_after_initial_unfollowed_readback(rig):
+    service, _, _, owner, _, units, _ = rig
+    readbacks = iter([False, True, False, False])
     sleeps: list[float] = []
-    owner.is_thread_following = lambda **_: False
+    owner.is_thread_following = lambda **_: next(readbacks)
     service.sleep = sleeps.append
 
-    with pytest.raises(ValueError, match="owner follow readback mismatch"):
+    task = service.create(
+        task_id="task-delayed-auto-follow",
+        title="Delayed auto follow",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:delayed-auto-follow",
+    )
+
+    assert task.lifecycle is Lifecycle.RUNNING
+    assert owner.following_calls == [False]
+    assert sleeps == [0.5, 0.5, 0.5]
+    assert units.started == [task.task_id]
+
+
+def test_create_retries_eventually_consistent_owner_unfollow_readback(rig):
+    service, store, _, owner, _, _, _ = rig
+    owner.following = True
+    original = owner.is_thread_following
+    after_set_readbacks = iter([True, True, False, False])
+    sleeps: list[float] = []
+    readback_calls = 0
+
+    def delayed_readback(**kwargs):
+        nonlocal readback_calls
+        readback_calls += 1
+        current = original(**kwargs)
+        if readback_calls == 1:
+            assert current is True
+            return True
+        assert current is False
+        return next(after_set_readbacks)
+
+    owner.is_thread_following = delayed_readback
+    service.sleep = sleeps.append
+
+    task = service.create(
+        task_id="task-eventual-unfollow",
+        title="Eventual unfollow",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=f"source:{SOURCE_POST}",
+    )
+
+    assert task.lifecycle is Lifecycle.RUNNING
+    assert store.get_task(task.task_id).last_error is None
+    assert sleeps == [0.5, 0.5, 0.5, 0.5]
+    assert owner.following_calls == [False]
+
+
+def test_create_blocks_after_owner_unfollow_readback_retry_exhaustion_without_duplicate_root(rig):
+    service, store, _, owner, bridge, units, _ = rig
+    sleeps: list[float] = []
+    owner.following = True
+    owner.is_thread_following = lambda **_: True
+    service.sleep = sleeps.append
+
+    with pytest.raises(ValueError, match="owner unfollow readback mismatch"):
         service.create(
-            task_id="task-follow-timeout",
-            title="Follow timeout",
+            task_id="task-unfollow-timeout",
+            title="Unfollow timeout",
             handoff="handoff",
             source_channel_id=MAIN,
             source_root_id=SOURCE_ROOT,
@@ -254,12 +324,56 @@ def test_create_blocks_after_owner_follow_readback_retry_exhaustion(rig):
             dedupe_key=f"source:{SOURCE_POST}",
         )
 
-    blocked = store.get_task("task-follow-timeout")
+    blocked = store.get_task("task-unfollow-timeout")
     assert blocked.lifecycle is Lifecycle.BLOCKED
+    assert blocked.execution_root_id
+    assert len([post for post, root_id in bridge.posts if root_id is None]) == 1
+    assert units.started == []
     assert sleeps == [0.5] * 9
 
 
-def test_create_replay_preserves_waiting_owner_lifecycle(rig):
+def test_create_recovers_blocked_unfollow_on_same_root_without_replacement(rig):
+    service, store, _, owner, bridge, units, _ = rig
+    owner.following = True
+    original = owner.is_thread_following
+    owner.is_thread_following = lambda **_: True
+    service.sleep = lambda _: None
+
+    with pytest.raises(ValueError, match="owner unfollow readback mismatch"):
+        service.create(
+            task_id="task-unfollow-recovery",
+            title="Unfollow recovery",
+            handoff="handoff",
+            source_channel_id=MAIN,
+            source_root_id=SOURCE_ROOT,
+            source_post_id=SOURCE_POST,
+            dedupe_key="source:unfollow-recovery",
+        )
+
+    blocked = store.get_task("task-unfollow-recovery")
+    original_root_id = blocked.execution_root_id
+    assert blocked.lifecycle is Lifecycle.BLOCKED
+    assert original_root_id
+    assert len([post for post, root_id in bridge.posts if root_id is None]) == 1
+
+    owner.is_thread_following = original
+    recovered = service.create(
+        task_id="task-unfollow-recovery",
+        title="Unfollow recovery",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:unfollow-recovery",
+    )
+
+    assert recovered.lifecycle is Lifecycle.RUNNING
+    assert recovered.execution_root_id == original_root_id
+    assert len([post for post, root_id in bridge.posts if root_id is None]) == 1
+    assert units.started == ["task-unfollow-recovery"]
+
+
+def test_create_replay_preserves_waiting_owner_state(rig):
     service, store, bot, _, _, _, _ = rig
     task = service.create(
         task_id="task-waiting", title="Waiting", handoff="handoff",
@@ -364,6 +478,7 @@ def test_create_reconciles_existing_marked_root_without_duplicate(rig):
         "create_at": 30,
     }
     owner.posts[EXEC_ROOT] = existing
+    owner.following = True
     task = service.create(
         task_id="task-two",
         title="Reconciliar",
@@ -375,6 +490,8 @@ def test_create_reconciles_existing_marked_root_without_duplicate(rig):
     )
     assert task.execution_root_id == EXEC_ROOT
     assert bridge.posts == []
+    assert owner.following is False
+    assert owner.following_calls == [False]
 
 
 def test_create_fails_closed_on_wrong_source_author(rig):
@@ -552,6 +669,7 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
     )
     with pytest.raises(ValueError, match="evidence"):
         service.close(task.task_id, outcome=Lifecycle.SUCCEEDED, summary="done", evidence={})
+    owner.following = True
     closed = service.close(
         task.task_id,
         outcome=Lifecycle.SUCCEEDED,
@@ -616,6 +734,7 @@ def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
         source_post_id=SOURCE_POST,
         dedupe_key="source:close-cleanup-fail",
     )
+    owner.following = True
     owner.fail_unfollow = True
 
     with pytest.raises(RuntimeError, match="unfollow failed"):
@@ -646,6 +765,29 @@ def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
     assert closed.lifecycle is Lifecycle.SUCCEEDED
     assert closed.cleanup_state is None
     assert closed.pending_outcome is None
+
+
+def test_watch_once_operates_while_owner_does_not_follow_execution_thread(rig):
+    service, store, bot, owner, bridge, _, _ = rig
+    task = service.create(
+        task_id="task-watcher-unfollowed",
+        title="Watcher unfollowed",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watcher-unfollowed",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+
+    assert owner.following is False
+    assert service.watch_once(task.task_id) is True
+    assert bridge.watch_calls == 1
+    watched = store.get_task(task.task_id)
+    assert watched.watcher_owner == "test-watcher"
+    assert watched.watcher_heartbeat_at is not None
+    assert owner.following is False
+    assert owner.following_calls == []
 
 
 def test_watch_once_exits_without_helper_call_for_terminal_task(rig):
