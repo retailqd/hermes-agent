@@ -18,6 +18,7 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from gateway.config import Platform
@@ -30,6 +31,14 @@ from gateway.whatsapp_identity import (
 
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
+
+    @staticmethod
+    def _split_allowlist_entries(raw: str) -> set[str]:
+        return {
+            entry.strip()
+            for entry in re.split(r"[\s,]+", raw)
+            if entry.strip()
+        }
 
     def _authorization_adapter(
         self,
@@ -280,6 +289,17 @@ class GatewayAuthorizationMixin:
         # the adapter itself — no user allowlist applies.
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
+
+        # Mattermost requires an explicit chat allowlist gate when configured.
+        # If MATTERMOST_ALLOWED_CHATS is set, only listed chats may proceed to
+        # the normal authz chain below; missing chat IDs or unknown chats are
+        # denied before relay/pairing/allow-all/user checks can short-circuit.
+        if source.platform == Platform.MATTERMOST:
+            raw_allowed_chats = os.getenv("MATTERMOST_ALLOWED_CHATS", "").strip()
+            if raw_allowed_chats:
+                allowed_chat_ids = self._split_allowlist_entries(raw_allowed_chats)
+                if "*" not in allowed_chat_ids and source.chat_id not in allowed_chat_ids:
+                    return False
 
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this

@@ -21,6 +21,7 @@ def _clear_auth_env(monkeypatch) -> None:
         "EMAIL_ALLOWED_USERS",
         "SMS_ALLOWED_USERS",
         "MATTERMOST_ALLOWED_USERS",
+        "MATTERMOST_ALLOWED_CHATS",
         "MATRIX_ALLOWED_USERS",
         "DINGTALK_ALLOWED_USERS", "FEISHU_ALLOWED_USERS", "WECOM_ALLOWED_USERS",
         "QQ_ALLOWED_USERS", "QQ_GROUP_ALLOWED_USERS",
@@ -72,6 +73,50 @@ def _make_runner(platform: Platform, config: GatewayConfig):
     runner.hooks = SimpleNamespace(dispatch=AsyncMock(return_value=None))
     runner._sessions = {}
     return runner, adapter
+
+
+def test_mattermost_allowed_chats_blocks_unlisted_chat_even_with_allow_all(monkeypatch):
+    """A configured chat gate must win before Mattermost allow-all/user auth."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_ALLOWED_CHATS", "allowed-room")
+    monkeypatch.setenv("MATTERMOST_ALLOW_ALL_USERS", "true")
+
+    runner, _adapter = _make_runner(
+        Platform.MATTERMOST,
+        GatewayConfig(platforms={Platform.MATTERMOST: PlatformConfig(enabled=True)}),
+    )
+
+    source = SessionSource(
+        platform=Platform.MATTERMOST,
+        user_id="owner",
+        chat_id="blocked-room",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+    assert runner._is_user_authorized(source) is False
+
+
+def test_mattermost_allowed_chats_blocks_missing_chat_id_even_with_pairing(monkeypatch):
+    """The chat gate must also deny Mattermost events that lack chat_id."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_ALLOWED_CHATS", "allowed-room")
+
+    runner, _adapter = _make_runner(
+        Platform.MATTERMOST,
+        GatewayConfig(platforms={Platform.MATTERMOST: PlatformConfig(enabled=True)}),
+    )
+    runner.pairing_store.is_approved.return_value = True
+
+    source = SessionSource(
+        platform=Platform.MATTERMOST,
+        user_id="pairme",
+        chat_id="",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+    assert runner._is_user_authorized(source) is False
 
 
 def test_whatsapp_lid_user_matches_phone_allowlist_via_session_mapping(monkeypatch, tmp_path):
