@@ -102,7 +102,7 @@ def _bounded(sections: list[str], permalink: str) -> str:
         structured.append((heading, content))
 
     if structured:
-        separator_chars = 2 * (len(structured) - 1)
+        separator_chars = 2 * len(structured)
         fixed_chars = sum(len(heading) + 1 for heading, _ in structured) + separator_chars + len(link)
         if fixed_chars <= MAX_RELAY_CHARS:
             body_budget = MAX_RELAY_CHARS - fixed_chars
@@ -111,12 +111,16 @@ def _bounded(sections: list[str], permalink: str) -> str:
             if total_content <= body_budget:
                 rendered_sections = [f"{heading}\n{content}" for heading, content in structured]
             else:
+                content_budget = max(0, body_budget - len(structured))
                 count = len(structured)
-                base = body_budget // count
-                extra = body_budget % count
+                base = content_budget // count
+                extra = content_budget % count
                 for index, (heading, content) in enumerate(structured):
                     quota = base + (1 if index < extra else 0)
-                    rendered_content = content if len(content) <= quota else _truncate_text(content, quota)
+                    if quota <= 0:
+                        rendered_content = ""
+                    else:
+                        rendered_content = content if len(content) <= quota else _truncate_text(content, quota)
                     rendered_sections.append(f"{heading}\n{rendered_content}")
             body = "\n\n".join(rendered_sections + [link])
             if len(body) <= MAX_RELAY_CHARS:

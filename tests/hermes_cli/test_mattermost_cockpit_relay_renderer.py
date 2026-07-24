@@ -175,6 +175,26 @@ def test_render_gate_keeps_blocker_and_decision_when_sections_are_long() -> None
     assert relay.body.count("**") % 2 == 0
 
 
+def test_render_gate_handles_no_whitespace_sections_without_falling_back() -> None:
+    relay = render_gate(
+        f"""[cockpit-gate:task:gate-auth-shared-client-default]
+**Bloqueado**
+{'A' * 2500}
+
+**Preciso de você**
+{'B' * 2500}
+""",
+        PERMALINK,
+    )
+    assert relay.kind is RelayKind.BLOCKED
+    assert relay.requires_decision is True
+    assert len(relay.body) <= MAX_RELAY_CHARS
+    assert relay.body.count("[Abrir detalhes técnicos]") == 1
+    assert "**Bloqueado**" in relay.body
+    assert "**Preciso de você**" in relay.body
+    assert relay.body.count("**") % 2 == 0
+
+
 def test_render_closed_keeps_validation_section_when_summary_is_long() -> None:
     relay = render_closed(
         outcome="SUCCEEDED",
@@ -186,6 +206,21 @@ def test_render_closed_keeps_validation_section_when_summary_is_long() -> None:
     assert "**Validado**" in relay.body
     assert "PDF gerado e conferido" in relay.body
     assert len(relay.body) <= MAX_RELAY_CHARS
+
+
+def test_render_closed_handles_no_whitespace_validation_without_falling_back() -> None:
+    relay = render_closed(
+        outcome="SUCCEEDED",
+        summary="C" * 2500,
+        validation="D" * 2500,
+        permalink=PERMALINK,
+    )
+    assert relay.kind is RelayKind.SUCCEEDED
+    assert len(relay.body) <= MAX_RELAY_CHARS
+    assert relay.body.count("[Abrir detalhes técnicos]") == 1
+    assert "**Concluído**" in relay.body
+    assert "**Validado**" in relay.body
+    assert relay.body.count("**") % 2 == 0
 
 
 def test_execution_update_requires_marker_as_the_first_non_empty_line() -> None:
