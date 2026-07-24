@@ -266,3 +266,90 @@ def test_permalink_rejects_whitespace_control_and_markdown_injection(permalink: 
 )
 def test_execution_update_rejects_raw_technical_noise(raw: str) -> None:
     assert render_execution_update(raw, PERMALINK) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[cockpit-owner-state]\n401 Unauthorized",
+        "[cockpit-owner-state]\n503 Service Unavailable",
+        "[cockpit-owner-state]\n$ python3 debug.py",
+        "[cockpit-owner-state]\nExecutar hermes-mattermost-cockpit status",
+        "[cockpit-owner-state]\n# Failed",
+        "[cockpit-owner-state]\n## Runtime",
+    ],
+)
+def test_execution_update_rejects_remaining_status_command_and_heading_noise(raw: str) -> None:
+    assert render_execution_update(raw, PERMALINK) is None
+
+
+def test_business_order_heading_without_space_is_preserved() -> None:
+    relay = render_execution_update(
+        "[cockpit-owner-state]\nPedido #221921 e NF 000119 conferidos.",
+        PERMALINK,
+    )
+    assert relay is not None
+    assert "#221921" in relay.body
+    assert "NF 000119" in relay.body
+
+
+def test_started_rejects_bare_cockpit_token() -> None:
+    with pytest.raises(ValueError, match="cockpit"):
+        render_started("Task mentions cockpit-owner-state in body", PERMALINK)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        """**Bloqueado**
+Falta contexto.
+[cockpit-owner-state]
+
+**Preciso de você**
+Autorizar a correção.
+""",
+        """Observação anterior
+**Bloqueado**
+Falta contexto.
+
+**Preciso de você**
+Autorizar a correção.
+""",
+        """[cockpit-owner-state]
+**Bloqueado**
+Falta contexto.
+
+**Preciso de você**
+Autorizar a correção.
+""",
+    ],
+)
+def test_render_gate_rejects_nonleading_internal_marker_preamble_and_wrong_marker(
+    prompt: str,
+) -> None:
+    with pytest.raises(ValueError):
+        render_gate(prompt, PERMALINK)
+
+
+def test_blocked_semantic_update_with_internal_marker_fails_closed() -> None:
+    raw = """[cockpit-owner-blocked]
+**Bloqueado**
+Falta contexto.
+[cockpit-owner-state]
+
+**Preciso de você**
+Autorizar a correção.
+"""
+    assert render_execution_update(raw, PERMALINK) is None
+
+
+@pytest.mark.parametrize(
+    "permalink",
+    [
+        "https://",
+        "https://mattermost.example.com/" + ("x" * 1300),
+    ],
+)
+def test_permalink_rejects_missing_host_and_oversized_link(permalink: str) -> None:
+    with pytest.raises(ValueError, match="permalink"):
+        render_started("Corrigir conversão da NF 000119", permalink)

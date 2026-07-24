@@ -3,16 +3,19 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urlsplit
 
 MAX_RELAY_CHARS = 1200
 _LINK_LABEL = "Abrir detalhes técnicos"
 
 _MARKER_LINE = re.compile(r"(?m)^\[(?:cockpit-[^\]]+|cockpit:[^\]]+)\]\s*$")
+_GATE_MARKER_LINE = re.compile(r"^\[cockpit-gate:[^\]]+\]\s*$")
 _INLINE_MARKER = re.compile(r"\[(?:cockpit-[^\]]+|cockpit:[^\]]+)\]")
+_COCKPIT_TOKEN = re.compile(r"(?i)\bcockpit[-:][a-z0-9][a-z0-9_.:-]*\b")
 _LONG_INTERNAL_ID = re.compile(r"\b[a-z0-9]{26}\b")
 _RAW_TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?")
 _RAW_HTTP = re.compile(
-    r"(?i)\b(?:HTTP(?:/\d(?:\.\d)?)?\s*[1-5]\d{2}|status\s*=?\s*[1-5]\d{2})(?:\b|$)"
+    r"(?i)\b(?:HTTP(?:/\d(?:\.\d)?)?\s*[1-5]\d{2}|status\s*=?\s*[1-5]\d{2}|[1-5]\d{2}\s+[A-Z][A-Za-z-]*(?:\s+[A-Z][A-Za-z-]*)*)\b"
 )
 _ROUTINE = re.compile(
     r"(?im)^[^\w\n]*(?:"
@@ -25,11 +28,12 @@ _ROUTINE = re.compile(
     r")(?:\b|\W)"
 )
 _HELPER_PREAMBLE = re.compile(r"(?im)^##\s+\d+\s+new posts?\b")
-_SHELL_LINE = re.compile(r"(?i)\bhermes-mattermost-cockpit\b")
+_SHELL_LINE = re.compile(r"(?im)(?:^\s*\$\s+\S+|\bhermes-mattermost-cockpit\b)")
 _GATE_TOKEN = re.compile(r"(?i)\bgate[-_:][a-z0-9_.:-]+\b")
 _AUTH_MATERIAL = re.compile(r"(?i)\b(?:authorization\s*:\s*bearer|bearer\s+\S+)\b")
 _VISIBLE_URL = re.compile(r"(?i)(?:https?://|\[[^\]]+\]\([^\)]+\))")
-_EXTRA_HEADING = re.compile(r"(?m)^\*\*[^*\n]+\*\*\s*$")
+_BOLD_HEADING = re.compile(r"(?m)^\*\*[^*\n]+\*\*\s*$")
+_ATX_HEADING = re.compile(r"(?m)^\s{0,3}#{1,6}\s+\S")
 _SECTION = re.compile(r"(?m)^\*\*(Bloqueado|Preciso de você)\*\*\s*$")
 
 
@@ -51,16 +55,16 @@ class RenderedRelay:
 
 def _permalink(value: str) -> str:
     value = value.strip()
-    if not value.startswith(("https://", "http://")) or any(
-        ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch in "[]()" for ch in value
-    ):
+    parts = urlsplit(value)
+    if parts.scheme not in {"https", "http"} or not parts.netloc:
+        raise ValueError("execution permalink must be an absolute HTTP URL")
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch in "[]()" for ch in value):
         raise ValueError("execution permalink must be an absolute HTTP URL")
     return value
 
 
 def _plain(value: str, *, field: str) -> str:
     value = value.replace("\r", "\n").replace("—", ", ")
-    value = _MARKER_LINE.sub("", value)
     value = re.sub(r"[ \t]+\n", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value).strip()
     if not value:
@@ -75,8 +79,10 @@ def _plain(value: str, *, field: str) -> str:
         (_GATE_TOKEN, "an internal gate token"),
         (_AUTH_MATERIAL, "authorization material"),
         (_VISIBLE_URL, "an extra link"),
-        (_EXTRA_HEADING, "an unsupported heading"),
+        (_BOLD_HEADING, "an unsupported heading"),
+        (_ATX_HEADING, "an unsupported heading"),
         (_INLINE_MARKER, "a cockpit marker"),
+        (_COCKPIT_TOKEN, "a cockpit token"),
     )
     for pattern, reason in checks:
         if pattern.search(value):
@@ -93,6 +99,8 @@ def _truncate_text(value: str, limit: int) -> str:
 
 def _bounded(sections: list[str], permalink: str) -> str:
     link = f"[{_LINK_LABEL}]({_permalink(permalink)})"
+    if len(link) > MAX_RELAY_CHARS:
+        raise ValueError("execution permalink is too long for the owner relay contract")
     structured: list[tuple[str, str]] = []
     for section in sections:
         heading, separator, content = section.partition("\n")
@@ -157,7 +165,29 @@ def _semantic_update(message: str) -> tuple[str, str] | None:
 
 
 def _sections(prompt: str) -> tuple[str, str]:
-    prompt = _MARKER_LINE.sub("", prompt.replace("\r", "\n")).strip()
+    lines = prompt.replace("\r", "\n").split("\n")
+    non_empty = [index for index, line in enumerate(lines) if line.strip()]
+    if not non_empty:
+        raise ValueError("gate prompt must not be empty")
+
+    marker_indexes = [index for index in non_empty if _MARKER_LINE.fullmatch(lines[index].strip())]
+    if marker_indexes:
+        if (
+            marker_indexes != [non_empty[0]]
+            or len(marker_indexes) != 1
+            or not _GATE_MARKER_LINE.fullmatch(lines[marker_indexes[0]].strip())
+        ):
+            raise ValueError("gate prompt marker must be the first non-empty line")
+        del lines[marker_indexes[0]]
+
+    if any(_MARKER_LINE.fullmatch(line.strip()) for line in lines if line.strip()):
+        raise ValueError("gate prompt contains an internal marker")
+
+    first_non_empty = next((line.strip() for line in lines if line.strip()), "")
+    if first_non_empty != "**Bloqueado**":
+        raise ValueError("gate prompt requires exactly one blocker and exactly one decision")
+
+    prompt = "\n".join(lines)
     matches = list(_SECTION.finditer(prompt))
     labels = [match.group(1) for match in matches]
     if labels.count("Bloqueado") != 1 or labels.count("Preciso de você") != 1:
