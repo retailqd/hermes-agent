@@ -71,6 +71,13 @@ class MattermostClient:
     def get_user_by_username(self, username: str) -> dict[str, Any]:
         return self._request_json_object("GET", f"/api/v4/users/username/{username}")
 
+    def search_posts(self, team_id: str, terms: str) -> dict[str, Any]:
+        return self._request_json_object(
+            "POST",
+            f"/api/v4/teams/{team_id}/posts/search",
+            {"terms": terms, "is_or_search": False},
+        )
+
     def create_post(
         self,
         channel_id: str,
@@ -98,11 +105,26 @@ class MattermostClient:
         thread_id: str,
         following: bool,
     ) -> dict[str, Any]:
+        method = "PUT" if following else "DELETE"
         return self._request_json_object(
-            "PUT",
+            method,
             f"/api/v4/users/{user_id}/teams/{team_id}/threads/{thread_id}/following",
-            {"following": bool(following)},
         )
+
+    def get_user_thread(self, *, user_id: str, team_id: str, thread_id: str) -> dict[str, Any]:
+        return self._request_json_object(
+            "GET",
+            f"/api/v4/users/{user_id}/teams/{team_id}/threads/{thread_id}",
+        )
+
+    def is_thread_following(self, *, user_id: str, team_id: str, thread_id: str) -> bool:
+        try:
+            self.get_user_thread(user_id=user_id, team_id=team_id, thread_id=thread_id)
+        except MattermostAPIError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+        return True
 
     def _request_json_object(
         self,

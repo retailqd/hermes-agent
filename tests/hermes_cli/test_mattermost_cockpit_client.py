@@ -127,6 +127,30 @@ class TestMattermostClient:
         with pytest.raises(MattermostClientError):
             client.get_channel("channel-1")
 
+    def test_search_posts_uses_exact_team_endpoint_and_and_search(self):
+        captured: dict[str, object] = {}
+
+        def urlopen(request, timeout):
+            captured["method"] = request.method
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode())
+            return FakeResponse(
+                200,
+                json.dumps({"order": [], "posts": {}}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+        payload = client.search_posts("team-1", "[cockpit-task:task-one]")
+
+        assert payload == {"order": [], "posts": {}}
+        assert captured["method"] == "POST"
+        assert str(captured["url"]).endswith("/api/v4/teams/team-1/posts/search")
+        assert captured["body"] == {
+            "terms": "[cockpit-task:task-one]",
+            "is_or_search": False,
+        }
+
     def test_create_post_uses_explicit_token_only(self):
         captured: dict[str, object] = {}
 
@@ -168,13 +192,14 @@ class TestMattermostClient:
         assert str(captured["url"]).endswith("/api/v4/posts/post-77")
         assert captured["body"] == {"id": "post-77", "message": "updated"}
 
-    def test_set_thread_following_uses_user_team_thread_endpoint(self):
+    @pytest.mark.parametrize("following,expected_method", [(True, "PUT"), (False, "DELETE")])
+    def test_set_thread_following_uses_user_team_thread_endpoint(self, following, expected_method):
         captured: dict[str, object] = {}
 
         def urlopen(request, timeout):
             captured["method"] = request.method
             captured["url"] = request.full_url
-            captured["body"] = json.loads(request.data.decode())
+            captured["body"] = None if request.data is None else json.loads(request.data.decode())
             return FakeResponse(
                 200,
                 json.dumps({"status": "OK"}).encode(),
@@ -186,14 +211,40 @@ class TestMattermostClient:
             user_id="user-1",
             team_id="team-1",
             thread_id="root-1",
-            following=False,
+            following=following,
         )
 
-        assert captured["method"] == "PUT"
+        assert captured["method"] == expected_method
         assert str(captured["url"]).endswith(
             "/api/v4/users/user-1/teams/team-1/threads/root-1/following"
         )
-        assert captured["body"] == {"following": False}
+        assert captured["body"] is None
+
+    def test_is_thread_following_maps_only_404_to_false(self):
+        def not_found(request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                404,
+                "not found",
+                Message(),
+                io.BytesIO(b'{"message":"not found"}'),
+            )
+
+        client = make_client(not_found)
+        assert client.is_thread_following(user_id="user-1", team_id="team-1", thread_id="root-1") is False
+
+        def unauthorized(request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                "unauthorized",
+                Message(),
+                io.BytesIO(b'{"message":"unauthorized"}'),
+            )
+
+        client = make_client(unauthorized)
+        with pytest.raises(MattermostClientError):
+            client.is_thread_following(user_id="user-1", team_id="team-1", thread_id="root-1")
 
     def test_success_response_body_is_bounded(self):
         def urlopen(request, timeout):
