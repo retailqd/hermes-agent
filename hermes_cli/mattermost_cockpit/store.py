@@ -689,6 +689,47 @@ class MattermostCockpitStore:
             ).fetchone()
             return MattermostCockpitGateRelay.from_row(row) if row is not None else None
 
+    def bind_gate_prompt(
+        self,
+        gate_id: str,
+        *,
+        task_id: str,
+        expected_prompt_post_id: str,
+        prompt_post_id: str,
+        prompt_body: str,
+    ) -> MattermostCockpitGateRelay:
+        expected_prompt_post_id = validate_mattermost_id(expected_prompt_post_id, "expected_prompt_post_id")
+        prompt_post_id = validate_mattermost_id(prompt_post_id, "prompt_post_id")
+        prompt_body = _require_text(prompt_body, "prompt_body")
+        with self.connect() as conn, write_txn(conn):
+            row = conn.execute(GATE_SELECT_SQL, (gate_id,)).fetchone()
+            if row is None:
+                raise ValueError("gate does not exist")
+            current = MattermostCockpitGateRelay.from_row(row)
+            if current.task_id != task_id:
+                raise ValueError("gate task mismatch")
+            if current.prompt_body != prompt_body:
+                raise ValueError("gate prompt body mismatch")
+            if not current.active:
+                raise ValueError("gate is already resolved")
+            if current.prompt_post_id == prompt_post_id:
+                return current
+            if current.prompt_post_id != expected_prompt_post_id:
+                raise ValueError("gate prompt already bound")
+            now = utc_now().isoformat().replace("+00:00", "Z")
+            try:
+                cursor = conn.execute(
+                    "UPDATE cockpit_gate_relays SET prompt_post_id = ?, updated_at = ? "
+                    "WHERE gate_id = ? AND task_id = ? AND active = 1 AND prompt_post_id = ?",
+                    (prompt_post_id, now, gate_id, task_id, expected_prompt_post_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("gate prompt post collision") from exc
+            if cursor.rowcount != 1:
+                raise ValueError("gate prompt bind race")
+            updated = conn.execute(GATE_SELECT_SQL, (gate_id,)).fetchone()
+            return MattermostCockpitGateRelay.from_row(updated)  # type: ignore[arg-type]
+
     def resolve_gate(
         self,
         gate_id: str,

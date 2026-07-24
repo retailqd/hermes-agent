@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -170,7 +171,7 @@ class CockpitService:
             if callable(is_active) and not is_active(task.task_id):
                 raise ValueError("watcher unit start readback mismatch")
             current = self._require_task(task.task_id)
-            if current.lifecycle is not Lifecycle.RUNNING or current.last_error is not None:
+            if current.lifecycle in (Lifecycle.OPEN, Lifecycle.BLOCKED):
                 task = self.store.mark_running(task.task_id, expected_version=current.version)
             else:
                 task = current
@@ -197,17 +198,40 @@ class CockpitService:
             raise ValueError("gate prompt must not be empty")
         marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
         message = f"{marker}\n{prompt}"
-        post = self._ensure_source_relay(task, marker=marker, message=message)
-        gate = self.store.create_gate(
-            MattermostCockpitGateRelay(
-                gate_id=gate_id,
-                task_id=task.task_id,
-                prompt_post_id=str(post["id"]),
-                prompt_body=message,
-                created_at=self.now().astimezone(UTC),
-                updated_at=self.now().astimezone(UTC),
-            )
-        )
+        pending_prompt_post_id = self._pending_gate_prompt_id(task.task_id, gate_id)
+        with self._gate_lock(task.task_id):
+            gate = self.store.get_gate(gate_id)
+            if gate is not None:
+                if gate.task_id != task.task_id or gate.prompt_body != message:
+                    raise ValueError("gate id collision")
+                if not gate.active:
+                    raise ValueError("gate is already resolved")
+            else:
+                gate = self.store.create_gate(
+                    MattermostCockpitGateRelay(
+                        gate_id=gate_id,
+                        task_id=task.task_id,
+                        prompt_post_id=pending_prompt_post_id,
+                        prompt_body=message,
+                        created_at=self.now().astimezone(UTC),
+                        updated_at=self.now().astimezone(UTC),
+                    )
+                )
+            if gate.prompt_post_id == pending_prompt_post_id:
+                post = self._ensure_source_relay(task, marker=marker, message=message)
+                gate = self.store.bind_gate_prompt(
+                    gate_id,
+                    task_id=task.task_id,
+                    expected_prompt_post_id=pending_prompt_post_id,
+                    prompt_post_id=str(post["id"]),
+                    prompt_body=message,
+                )
+            else:
+                self._validate_bot_reply(
+                    self.bot_client.get_post(gate.prompt_post_id),
+                    task,
+                    expected_message=message,
+                )
         if not gate.active:
             raise ValueError("gate is already resolved")
         current = self._require_task(task.task_id)
@@ -219,6 +243,26 @@ class CockpitService:
             )
         self._audit(current, "owner_gate_opened", {"gate_id": gate_id, "prompt_post_id": gate.prompt_post_id}, f"gate:{gate_id}")
         return current
+
+    @staticmethod
+    def _pending_gate_prompt_id(task_id: str, gate_id: str) -> str:
+        digest = hashlib.sha256(f"{task_id}\0{gate_id}".encode()).hexdigest()
+        return "0" + digest[:25]
+
+    @contextlib.contextmanager
+    def _gate_lock(self, task_id: str):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.state_dir / f".{validate_task_id(task_id)}.gate.lock"
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            try:
+                import fcntl
+            except ImportError as exc:  # pragma: no cover - cockpit requires POSIX/systemd
+                raise RuntimeError("cockpit gate locking requires POSIX") from exc
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
     def resume_owner_message(
         self,

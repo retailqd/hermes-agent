@@ -202,6 +202,70 @@ def test_create_is_idempotent_and_posts_exactly_one_execution_root(rig):
     assert store.get_task("task-one").execution_root_id == first.execution_root_id
 
 
+def test_create_replay_preserves_waiting_owner_lifecycle(rig):
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-waiting", title="Waiting", handoff="handoff",
+        source_channel_id=MAIN, source_root_id=SOURCE_ROOT, source_post_id=SOURCE_POST,
+        dedupe_key="source:waiting",
+    )
+    waiting = service.open_gate(task.task_id, gate_id="gate-waiting", prompt="Pode aprovar?")
+    posts_before = len(bot.posts)
+    replay = service.create(
+        task_id="different-retry-id", title="Waiting", handoff="handoff",
+        source_channel_id=MAIN, source_root_id=SOURCE_ROOT, source_post_id=SOURCE_POST,
+        dedupe_key="source:waiting",
+    )
+    assert replay.lifecycle is Lifecycle.WAITING_OWNER
+    assert replay.version == waiting.version
+    assert len(bot.posts) == posts_before
+    assert store.get_active_gate(task.task_id).gate_id == "gate-waiting"
+
+
+def test_second_active_gate_fails_before_posting_orphan_prompt(rig):
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-single-gate", title="Single gate", handoff="handoff",
+        source_channel_id=MAIN, source_root_id=SOURCE_ROOT, source_post_id=SOURCE_POST,
+        dedupe_key="source:single-gate",
+    )
+    service.open_gate(task.task_id, gate_id="gate-one", prompt="Primeiro gate")
+    posts_before = len(bot.posts)
+    with pytest.raises(ValueError, match="active gate"):
+        service.open_gate(task.task_id, gate_id="gate-two", prompt="Segundo gate")
+    assert len(bot.posts) == posts_before
+    assert not any("[cockpit-gate:task-single-gate:gate-two]" in post["message"] for post in bot.posts.values())
+    assert store.get_active_gate(task.task_id).gate_id == "gate-one"
+
+
+def test_gate_reservation_recovers_after_publish_failure(rig, monkeypatch):
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-gate-recovery", title="Gate recovery", handoff="handoff",
+        source_channel_id=MAIN, source_root_id=SOURCE_ROOT, source_post_id=SOURCE_POST,
+        dedupe_key="source:gate-recovery",
+    )
+    posts_before = len(bot.posts)
+    original = service._ensure_source_relay
+    def fail_publish(*args, **kwargs):
+        raise RuntimeError("source publish failed")
+    monkeypatch.setattr(service, "_ensure_source_relay", fail_publish)
+    with pytest.raises(RuntimeError, match="source publish failed"):
+        service.open_gate(task.task_id, gate_id="gate-recovery", prompt="Pode aprovar?")
+    reserved = store.get_active_gate(task.task_id)
+    assert reserved is not None
+    assert reserved.prompt_post_id == service._pending_gate_prompt_id(task.task_id, "gate-recovery")
+    assert len(bot.posts) == posts_before
+    assert store.get_task(task.task_id).lifecycle is Lifecycle.RUNNING
+    monkeypatch.setattr(service, "_ensure_source_relay", original)
+    waiting = service.open_gate(task.task_id, gate_id="gate-recovery", prompt="Pode aprovar?")
+    bound = store.get_active_gate(task.task_id)
+    assert waiting.lifecycle is Lifecycle.WAITING_OWNER
+    assert bound is not None
+    assert bound.prompt_post_id != reserved.prompt_post_id
+    assert len(bot.posts) == posts_before + 1
+
+
 def test_create_reconciles_existing_marked_root_without_duplicate(rig):
     service, _, _, owner, bridge, _, _ = rig
     existing = {
