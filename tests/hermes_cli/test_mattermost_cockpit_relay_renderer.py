@@ -353,3 +353,57 @@ Autorizar a correção.
 def test_permalink_rejects_missing_host_and_oversized_link(permalink: str) -> None:
     with pytest.raises(ValueError, match="permalink"):
         render_started("Corrigir conversão da NF 000119", permalink)
+
+
+def test_permalink_rejects_near_cap_link_that_cannot_preserve_structured_headings() -> None:
+    prefix = "https://mattermost.example.com/"
+    permalink = prefix + ("x" * (1155 - len(prefix)))
+    assert len(permalink) == 1155
+    with pytest.raises(ValueError, match="permalink"):
+        render_started("Corrigir conversão da NF 000119", permalink)
+    with pytest.raises(ValueError, match="permalink"):
+        render_gate(
+            """**Bloqueado**
+Falta contexto.
+
+**Preciso de você**
+Autorizar a correção.
+""",
+            permalink,
+        )
+
+
+def test_screenshot_equivalent_five_post_helper_output_is_never_relayed() -> None:
+    owner_text = "Autorizo a correção da NF 000119."
+    raw = f"""## 5 new posts
+2026-07-24T17:25:30 retailqd (w8t3hdhbkbdafmwcck61xeo69e)
+{owner_text}
+────────
+⚡ Interrupting current task
+compression started
+working...
+HTTP 401 Unauthorized
+[cockpit-gate:task:gate-auth-shared-client-default]
+$ hermes-mattermost-cockpit status
+"""
+    assert render_execution_update(raw, PERMALINK) is None
+    assert raw.count(owner_text) == 1
+
+
+def test_em_dash_is_normalized_without_changing_business_identifiers() -> None:
+    relay = render_started("NF 000119 — pedido #221921 conferido", PERMALINK)
+    assert "—" not in relay.body
+    assert "NF 000119" in relay.body
+    assert "#221921" in relay.body
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "RuntimeError: backend failed",
+        "Traceback (most recent call last):\n  File 'worker.py', line 1",
+        "Post w8t3hdhbkbdafmwcck61xeo69e atualizado",
+    ],
+)
+def test_semantic_update_rejects_exception_internals_and_mattermost_ids(unsafe: str) -> None:
+    assert render_execution_update(f"[cockpit-owner-state]\n{unsafe}", PERMALINK) is None

@@ -31,6 +31,9 @@ _HELPER_PREAMBLE = re.compile(r"(?im)^##\s+\d+\s+new posts?\b")
 _SHELL_LINE = re.compile(r"(?im)(?:^\s*\$\s+\S+|\bhermes-mattermost-cockpit\b)")
 _GATE_TOKEN = re.compile(r"(?i)\bgate[-_:][a-z0-9_.:-]+\b")
 _AUTH_MATERIAL = re.compile(r"(?i)\b(?:authorization\s*:\s*bearer|bearer\s+\S+)\b")
+_EXCEPTION_INTERNAL = re.compile(
+    r"(?im)(?:^Traceback \(most recent call last\):|^\s*[A-Za-z_][\w.]*?(?:Error|Exception):(?:\s|$))"
+)
 _VISIBLE_URL = re.compile(r"(?i)(?:https?://|\[[^\]]+\]\([^\)]+\))")
 _BOLD_HEADING = re.compile(r"(?m)^\*\*[^*\n]+\*\*\s*$")
 _ATX_HEADING = re.compile(r"(?m)^\s{0,3}#{1,6}\s+\S")
@@ -78,6 +81,7 @@ def _plain(value: str, *, field: str) -> str:
         (_SHELL_LINE, "a shell command"),
         (_GATE_TOKEN, "an internal gate token"),
         (_AUTH_MATERIAL, "authorization material"),
+        (_EXCEPTION_INTERNAL, "exception internals"),
         (_VISIBLE_URL, "an extra link"),
         (_BOLD_HEADING, "an unsupported heading"),
         (_ATX_HEADING, "an unsupported heading"),
@@ -112,6 +116,8 @@ def _bounded(sections: list[str], permalink: str) -> str:
     if structured:
         separator_chars = 2 * len(structured)
         fixed_chars = sum(len(heading) + 1 for heading, _ in structured) + separator_chars + len(link)
+        if fixed_chars + len(structured) > MAX_RELAY_CHARS:
+            raise ValueError("execution permalink is too long for the owner relay contract")
         if fixed_chars <= MAX_RELAY_CHARS:
             body_budget = MAX_RELAY_CHARS - fixed_chars
             total_content = sum(len(content) for _, content in structured)
