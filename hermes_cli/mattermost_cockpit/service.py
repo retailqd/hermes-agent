@@ -31,6 +31,7 @@ _MAX_EVIDENCE_CHARS = 8000
 _MAX_VALIDATION_CHARS = 1000
 _UNFOLLOW_READBACK_ATTEMPTS = 10
 _UNFOLLOW_READBACK_INTERVAL_SECONDS = 0.5
+_UNFOLLOW_STABLE_READS = 5
 
 
 class UnitController:
@@ -93,6 +94,7 @@ class CockpitService:
         self.state_dir = state_dir or (MattermostCockpitStore.default_db_path().parent / "watchers")
         self.now = now
         self.sleep = sleep
+        self._watcher_unfollow_initialized: set[str] = set()
 
     def create(
         self,
@@ -184,9 +186,24 @@ class CockpitService:
                     pass
             raise
 
-    def _ensure_owner_unfollowed(self, *, user_id: str, team_id: str, thread_id: str) -> None:
-        observed_unfollowed = False
+    def _ensure_owner_unfollowed(
+        self,
+        *,
+        user_id: str,
+        team_id: str,
+        thread_id: str,
+        force_delete: bool = True,
+    ) -> None:
         delete_sent = False
+        if force_delete:
+            self.owner_client.set_thread_following(
+                user_id=user_id,
+                team_id=team_id,
+                thread_id=thread_id,
+                following=False,
+            )
+            delete_sent = True
+        consecutive_unfollowed = 0
         for attempt in range(_UNFOLLOW_READBACK_ATTEMPTS):
             following = self.owner_client.is_thread_following(
                 user_id=user_id,
@@ -194,7 +211,7 @@ class CockpitService:
                 thread_id=thread_id,
             )
             if following:
-                if not delete_sent or observed_unfollowed:
+                if not delete_sent or consecutive_unfollowed:
                     self.owner_client.set_thread_following(
                         user_id=user_id,
                         team_id=team_id,
@@ -202,11 +219,11 @@ class CockpitService:
                         following=False,
                     )
                     delete_sent = True
-                observed_unfollowed = False
-            elif observed_unfollowed:
-                return
+                consecutive_unfollowed = 0
             else:
-                observed_unfollowed = True
+                consecutive_unfollowed += 1
+                if consecutive_unfollowed >= _UNFOLLOW_STABLE_READS:
+                    return
             if attempt + 1 < _UNFOLLOW_READBACK_ATTEMPTS:
                 self.sleep(_UNFOLLOW_READBACK_INTERVAL_SECONDS)
         raise ValueError("owner unfollow readback mismatch")
@@ -295,6 +312,9 @@ class CockpitService:
         message: str,
     ) -> MattermostCockpitTask:
         task = self._require_open_bound_task(task_id)
+        execution_root_id = task.execution_root_id
+        if not execution_root_id:
+            raise ValueError("execution root is not bound")
         gate = self.store.get_gate(gate_id)
         if gate is None or gate.task_id != task.task_id:
             raise ValueError("active gate mismatch")
@@ -334,6 +354,11 @@ class CockpitService:
                 task,
                 expected_message=destination_body,
             )
+            self._ensure_owner_unfollowed(
+                user_id=task.owner_author_id,
+                team_id=task.team_id,
+                thread_id=execution_root_id,
+            )
             current = self._require_task(task_id)
             if current.lifecycle is Lifecycle.WAITING_OWNER:
                 current = self.store.mark_running(task_id, expected_version=current.version)
@@ -362,6 +387,11 @@ class CockpitService:
             source_body=source_body,
             destination_post_id=str(destination["id"]),
             destination_body=destination_body,
+        )
+        self._ensure_owner_unfollowed(
+            user_id=task.owner_author_id,
+            team_id=task.team_id,
+            thread_id=execution_root_id,
         )
         current = self._require_task(task_id)
         if current.lifecycle is Lifecycle.WAITING_OWNER:
@@ -485,6 +515,13 @@ class CockpitService:
             return False
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
+        if task.task_id not in self._watcher_unfollow_initialized:
+            self._ensure_owner_unfollowed(
+                user_id=task.owner_author_id,
+                team_id=task.team_id,
+                thread_id=task.execution_root_id,
+            )
+            self._watcher_unfollow_initialized.add(task.task_id)
         now = self.now().astimezone(UTC)
         self.store.claim_watcher(
             task_id,
@@ -496,6 +533,11 @@ class CockpitService:
         current = self._require_task(task_id)
         if current.lifecycle in TERMINAL_LIFECYCLES:
             return False
+        self._ensure_owner_unfollowed(
+            user_id=current.owner_author_id,
+            team_id=current.team_id,
+            thread_id=task.execution_root_id,
+        )
         state_path = self.state_dir / f"{task_id}.json"
         state_path.parent.mkdir(parents=True, exist_ok=True)
         poll = self.bridge.poll_main(
