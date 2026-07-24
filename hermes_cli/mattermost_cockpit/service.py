@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import subprocess
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,8 @@ _MAX_RELAY_CHARS = 3500
 _MAX_SUMMARY_CHARS = 2000
 _MAX_EVIDENCE_CHARS = 8000
 _MAX_VALIDATION_CHARS = 1000
+_FOLLOW_READBACK_ATTEMPTS = 10
+_FOLLOW_READBACK_INTERVAL_SECONDS = 0.5
 
 
 class UnitController:
@@ -75,6 +78,7 @@ class CockpitService:
         watcher_owner: str | None = None,
         state_dir: Path | None = None,
         now: Callable[[], datetime] = utc_now,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.store = store
         self.contracts = contracts
@@ -88,6 +92,7 @@ class CockpitService:
         self.watcher_owner = watcher_owner or f"{socket.gethostname()}:{os.getpid()}"
         self.state_dir = state_dir or (MattermostCockpitStore.default_db_path().parent / "watchers")
         self.now = now
+        self.sleep = sleep
 
     def create(
         self,
@@ -152,11 +157,7 @@ class CockpitService:
                     thread_id=str(execution_post["id"]),
                     following=True,
                 )
-            if not self.owner_client.is_thread_following(
-                user_id=self.contracts.owner_author_id,
-                team_id=self.contracts.team_id,
-                thread_id=str(execution_post["id"]),
-            ):
+            if not self._wait_for_owner_follow(str(execution_post["id"])):
                 raise ValueError("owner follow readback mismatch")
             self._ensure_source_relay(
                 task,
@@ -190,6 +191,18 @@ class CockpitService:
                 except Exception:
                     pass
             raise
+
+    def _wait_for_owner_follow(self, thread_id: str) -> bool:
+        for attempt in range(_FOLLOW_READBACK_ATTEMPTS):
+            if self.owner_client.is_thread_following(
+                user_id=self.contracts.owner_author_id,
+                team_id=self.contracts.team_id,
+                thread_id=thread_id,
+            ):
+                return True
+            if attempt + 1 < _FOLLOW_READBACK_ATTEMPTS:
+                self.sleep(_FOLLOW_READBACK_INTERVAL_SECONDS)
+        return False
 
     def open_gate(self, task_id: str, *, gate_id: str, prompt: str) -> MattermostCockpitTask:
         task = self._require_open_bound_task(task_id)

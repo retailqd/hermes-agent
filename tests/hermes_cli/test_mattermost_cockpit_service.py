@@ -202,6 +202,63 @@ def test_create_is_idempotent_and_posts_exactly_one_execution_root(rig):
     assert store.get_task("task-one").execution_root_id == first.execution_root_id
 
 
+def test_create_retries_eventually_consistent_owner_follow_readback(rig):
+    service, store, _, owner, _, _, _ = rig
+    original = owner.is_thread_following
+    after_set_readbacks = iter([False, False, True])
+    sleeps: list[float] = []
+    readback_calls = 0
+
+    def delayed_readback(**kwargs):
+        nonlocal readback_calls
+        readback_calls += 1
+        current = original(**kwargs)
+        if readback_calls == 1:
+            assert current is False
+            return False
+        assert current is True
+        return next(after_set_readbacks)
+
+    owner.is_thread_following = delayed_readback
+    service.sleep = sleeps.append
+
+    task = service.create(
+        task_id="task-eventual-follow",
+        title="Eventual follow",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=f"source:{SOURCE_POST}",
+    )
+
+    assert task.lifecycle is Lifecycle.RUNNING
+    assert store.get_task(task.task_id).last_error is None
+    assert sleeps == [0.5, 0.5]
+
+
+def test_create_blocks_after_owner_follow_readback_retry_exhaustion(rig):
+    service, store, _, owner, _, _, _ = rig
+    sleeps: list[float] = []
+    owner.is_thread_following = lambda **_: False
+    service.sleep = sleeps.append
+
+    with pytest.raises(ValueError, match="owner follow readback mismatch"):
+        service.create(
+            task_id="task-follow-timeout",
+            title="Follow timeout",
+            handoff="handoff",
+            source_channel_id=MAIN,
+            source_root_id=SOURCE_ROOT,
+            source_post_id=SOURCE_POST,
+            dedupe_key=f"source:{SOURCE_POST}",
+        )
+
+    blocked = store.get_task("task-follow-timeout")
+    assert blocked.lifecycle is Lifecycle.BLOCKED
+    assert sleeps == [0.5] * 9
+
+
 def test_create_replay_preserves_waiting_owner_lifecycle(rig):
     service, store, bot, _, _, _, _ = rig
     task = service.create(
