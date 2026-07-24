@@ -23,12 +23,12 @@ from .contracts import (
 )
 from .helpers import HelperBridge
 from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, utc_now
+from .relay_renderer import render_closed, render_gate, render_started
 from .store import MattermostCockpitStore
 
 _MAX_RELAY_CHARS = 3500
 _MAX_SUMMARY_CHARS = 2000
 _MAX_EVIDENCE_CHARS = 8000
-_MAX_VALIDATION_CHARS = 1000
 _UNFOLLOW_READBACK_ATTEMPTS = 10
 _UNFOLLOW_READBACK_INTERVAL_SECONDS = 0.5
 _RELAY_SCHEMA = 1
@@ -134,7 +134,7 @@ class CockpitService:
         try:
             if task.execution_root_id is None:
                 execution_post = self._find_or_create_execution_root(task, kickoff)
-                permalink = f"{self.base_url}/{self.team_name}/pl/{execution_post['id']}"
+                permalink = self._permalink(str(execution_post["id"]))
                 task = self.store.attach_execution(
                     task.task_id,
                     expected_version=task.version,
@@ -152,10 +152,17 @@ class CockpitService:
                 team_id=self.contracts.team_id,
                 thread_id=str(execution_post["id"]),
             )
+            relay = render_started(task.title, self._permalink(task.execution_root_id))
             self._ensure_source_relay(
                 task,
-                marker=f"[cockpit-link:{task.task_id}]",
-                message=f"Execução iniciada: [{task.title}]({task.execution_permalink})",
+                marker=f"[cockpit-relay:{task.task_id}:started]",
+                message=relay.body,
+                legacy_relays=(
+                    (
+                        f"[cockpit-link:{task.task_id}]",
+                        f"Execução iniciada: [{task.title}]({task.execution_permalink})",
+                    ),
+                ),
             )
             self.units.start(task.task_id)
             is_active = getattr(self.units, "is_active", None)
@@ -215,12 +222,29 @@ class CockpitService:
         if not prompt:
             raise ValueError("gate prompt must not be empty")
         marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
-        message = f"{marker}\n{prompt}"
+        legacy_prompt_body = f"{marker}\n{prompt}"
+        existing_gate = self.store.get_gate(gate_id)
+        if (
+            existing_gate is not None
+            and existing_gate.task_id == task.task_id
+            and existing_gate.prompt_body == legacy_prompt_body
+        ):
+            prompt_body = legacy_prompt_body
+            source_message = prompt
+        else:
+            relay = render_gate(prompt, self._permalink(task.execution_root_id))
+            prompt_body = relay.body
+            source_message = relay.body
         pending_prompt_post_id = self._pending_gate_prompt_id(task.task_id, gate_id)
         with self._gate_lock(task.task_id):
             gate = self.store.get_gate(gate_id)
             if gate is not None:
-                if gate.task_id != task.task_id or gate.prompt_body != message:
+                if gate.task_id != task.task_id:
+                    raise ValueError("gate id collision")
+                if gate.prompt_body == legacy_prompt_body:
+                    prompt_body = legacy_prompt_body
+                    source_message = prompt
+                elif gate.prompt_body != prompt_body:
                     raise ValueError("gate id collision")
                 if not gate.active:
                     raise ValueError("gate is already resolved")
@@ -230,26 +254,30 @@ class CockpitService:
                         gate_id=gate_id,
                         task_id=task.task_id,
                         prompt_post_id=pending_prompt_post_id,
-                        prompt_body=message,
+                        prompt_body=prompt_body,
                         created_at=self.now().astimezone(UTC),
                         updated_at=self.now().astimezone(UTC),
                     )
                 )
             if gate.prompt_post_id == pending_prompt_post_id:
-                post = self._ensure_source_relay(task, marker=marker, message=prompt)
+                post = self._ensure_source_relay(
+                    task,
+                    marker=marker,
+                    message=source_message,
+                )
                 gate = self.store.bind_gate_prompt(
                     gate_id,
                     task_id=task.task_id,
                     expected_prompt_post_id=pending_prompt_post_id,
                     prompt_post_id=str(post["id"]),
-                    prompt_body=message,
+                    prompt_body=prompt_body,
                 )
             else:
                 self._validate_source_relay_post(
                     self.bot_client.get_post(gate.prompt_post_id),
                     task,
                     marker=marker,
-                    message=prompt,
+                    message=source_message,
                 )
         if not gate.active:
             raise ValueError("gate is already resolved")
@@ -310,10 +338,13 @@ class CockpitService:
         source_body = message.strip()
         if str(source.get("message") or "").strip() != source_body:
             raise ValueError("owner decision body mismatch")
-        prompt_marker, separator, prompt_message = gate.prompt_body.partition("\n")
         expected_prompt_marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
-        if not separator or prompt_marker != expected_prompt_marker:
-            raise ValueError("gate prompt body mismatch")
+        legacy_prefix = f"{expected_prompt_marker}\n"
+        prompt_message = (
+            gate.prompt_body[len(legacy_prefix) :]
+            if gate.prompt_body.startswith(legacy_prefix)
+            else gate.prompt_body
+        )
         prompt_post = self._validate_source_relay_post(
             self.bot_client.get_post(gate.prompt_post_id),
             task,
@@ -424,6 +455,18 @@ class CockpitService:
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
         execution_root_id = task.execution_root_id
+        validation_value = evidence.get("validation")
+        validation = (
+            validation_value.strip()
+            if isinstance(validation_value, str) and validation_value.strip()
+            else None
+        )
+        relay = render_closed(
+            outcome=outcome.value,
+            summary=summary,
+            validation=validation,
+            permalink=self._permalink(execution_root_id),
+        )
         if task.cleanup_state == CLEANUP_PENDING_STATE:
             if task.pending_outcome is not outcome or task.result_summary != summary or task.evidence != evidence:
                 raise ValueError("cleanup retry intent mismatch")
@@ -455,18 +498,18 @@ class CockpitService:
                 message=f"{evidence_marker}\n**Evidência final:** `{evidence_json}`",
             )
             marker = f"[cockpit-final:{task.task_id}]"
-            validation = evidence.get("validation")
-            validation_text = (
-                validation.strip()[:_MAX_VALIDATION_CHARS]
-                if isinstance(validation, str) and validation.strip()
-                else f"{len(evidence)} item(ns) de evidência registrado(s)"
-            )
-            message = (
+            legacy_validation_text = validation or f"{len(evidence)} item(ns) de evidência registrado(s)"
+            legacy_message = (
                 f"**Resultado:** {summary}\n"
-                f"**Validação:** {validation_text}\n"
+                f"**Validação:** {legacy_validation_text}\n"
                 f"Detalhes: [execução]({task.execution_permalink})"
             )
-            self._ensure_source_relay(task, marker=marker, message=message)
+            self._ensure_source_relay(
+                task,
+                marker=marker,
+                message=relay.body,
+                legacy_relays=((marker, legacy_message),),
+            )
         except Exception as exc:
             current = self._require_task(task_id)
             if current.cleanup_state == CLEANUP_PENDING_STATE:
@@ -654,14 +697,36 @@ class CockpitService:
         first_line = message.splitlines()[0]
         return first_line if first_line.startswith("[cockpit-") else None
 
-    def _ensure_source_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
+    def _ensure_source_relay(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+        legacy_relays: tuple[tuple[str, str], ...] = (),
+    ) -> dict[str, Any]:
         thread = self.bot_client.get_thread(task.source_root_id)
         posts = thread.get("posts") or {}
-        existing = [post for post in posts.values() if self._post_relay_marker(post) == marker]
+        relay_contracts = ((marker, message), *legacy_relays)
+        markers = {relay_marker for relay_marker, _ in relay_contracts}
+        existing = [post for post in posts.values() if self._post_relay_marker(post) in markers]
         if len(existing) > 1:
             raise ValueError("multiple source relays found for marker")
         if existing:
-            return self._validate_source_relay_post(existing[0], task, marker=marker, message=message)
+            existing_marker = self._post_relay_marker(existing[0])
+            last_error: ValueError | None = None
+            for relay_marker, relay_message in relay_contracts:
+                if relay_marker != existing_marker:
+                    continue
+                try:
+                    return self._validate_source_relay_post(
+                        existing[0], task, marker=relay_marker, message=relay_message
+                    )
+                except ValueError as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
+            raise ValueError("relay marker mismatch")
         created = self.bot_client.create_post(
             task.source_channel_id,
             message,
@@ -761,6 +826,11 @@ class CockpitService:
         if not text:
             raise ValueError("handoff must not be empty")
         return f"[cockpit-task:{task_id}]\n# {title.strip()}\n\n{text}"
+
+    def _permalink(self, execution_root_id: str | None) -> str:
+        if not execution_root_id:
+            raise ValueError("execution root is not bound")
+        return f"{self.base_url}/{self.team_name}/pl/{execution_root_id}"
 
     def _require_task(self, task_id: str) -> MattermostCockpitTask:
         task = self.store.get_task(task_id)

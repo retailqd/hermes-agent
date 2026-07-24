@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli.mattermost_cockpit.contracts import GateDecision, Lifecycle, MattermostCockpitContracts
+from hermes_cli.mattermost_cockpit.models import MattermostCockpitGateRelay
 from hermes_cli.mattermost_cockpit.service import CockpitService
 from hermes_cli.mattermost_cockpit.store import MattermostCockpitStore
 
@@ -21,6 +22,18 @@ SOURCE_ROOT = "a" * 26
 SOURCE_POST = "b" * 26
 EXEC_ROOT = "c" * 26
 DECISION_POST = "d" * 26
+GATE_PROMPT = """**Bloqueado**
+A correção não foi aplicada porque faltou autenticação do conversor de PDF.
+
+**Preciso de você**
+Autorizar a credencial compartilhada para concluir a NF 000119.
+"""
+SECOND_GATE_PROMPT = """**Bloqueado**
+A segunda etapa depende de autorização.
+
+**Preciso de você**
+Autorizar a segunda etapa controlada.
+"""
 
 
 class FakeClient:
@@ -207,8 +220,12 @@ def test_create_is_idempotent_and_posts_exactly_one_execution_root(rig):
     ]
     assert len(source_relays) == 1
     source_relay = source_relays[0]
-    assert "[cockpit-link:" not in source_relay["message"]
-    assert source_relay["props"]["cockpit_relay_marker"] == "[cockpit-link:task-one]"
+    assert source_relay["message"] == (
+        "**Em andamento**\nImplementar teste\n\n"
+        f"[Abrir detalhes técnicos]({service._permalink(first.execution_root_id)})"
+    )
+    assert "cockpit" not in source_relay["message"]
+    assert source_relay["props"]["cockpit_relay_marker"] == "[cockpit-relay:task-one:started]"
     assert source_relay["props"]["cockpit_relay_schema"] == 1
     assert units.started == ["task-one", "task-one"]
     assert store.get_task("task-one").execution_root_id == first.execution_root_id
@@ -426,7 +443,7 @@ def test_create_replay_preserves_waiting_owner_state(rig):
         source_channel_id=MAIN, source_root_id=SOURCE_ROOT, source_post_id=SOURCE_POST,
         dedupe_key="source:waiting",
     )
-    waiting = service.open_gate(task.task_id, gate_id="gate-waiting", prompt="Pode aprovar?")
+    waiting = service.open_gate(task.task_id, gate_id="gate-waiting", prompt=GATE_PROMPT)
     posts_before = len(bot.posts)
     replay = service.create(
         task_id="different-retry-id", title="Waiting", handoff="handoff",
@@ -439,6 +456,93 @@ def test_create_replay_preserves_waiting_owner_state(rig):
     assert store.get_active_gate(task.task_id).gate_id == "gate-waiting"
 
 
+def test_open_gate_renders_plain_owner_body_and_persists_same_prompt(rig):
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-rendered-gate",
+        title="Rendered gate",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:rendered-gate",
+    )
+
+    waiting = service.open_gate(task.task_id, gate_id="gate-auth", prompt=GATE_PROMPT)
+
+    gate = store.get_active_gate(task.task_id)
+    assert waiting.lifecycle is Lifecycle.WAITING_OWNER
+    assert gate is not None
+    gate_post = bot.get_post(gate.prompt_post_id)
+    assert gate.prompt_body == gate_post["message"]
+    assert gate_post["message"].startswith("**Bloqueado**")
+    assert gate_post["message"].count("**Preciso de você**") == 1
+    assert "gate-auth" not in gate_post["message"]
+    assert gate_post["message"].endswith(
+        f"[Abrir detalhes técnicos]({service._permalink(task.execution_root_id)})"
+    )
+    assert gate_post["props"]["cockpit_relay_marker"] == (
+        "[cockpit-gate:task-rendered-gate:gate-auth]"
+    )
+
+
+def test_open_gate_rejects_unstructured_prompt_before_reservation_or_source_write(rig):
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-invalid-gate",
+        title="Invalid gate",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:invalid-gate",
+    )
+    source_posts_before = set(bot.posts)
+
+    with pytest.raises(ValueError):
+        service.open_gate(task.task_id, gate_id="gate-invalid", prompt="Pode aprovar?")
+
+    assert store.get_active_gate(task.task_id) is None
+    assert set(bot.posts) == source_posts_before
+
+
+def test_open_gate_replays_existing_legacy_reservation_without_rewriting_body(rig):
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-legacy-gate",
+        title="Legacy gate",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:legacy-gate",
+    )
+    gate_id = "legacy-gate"
+    marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
+    legacy_prompt = "Pode aprovar?"
+    legacy_body = f"{marker}\n{legacy_prompt}"
+    now = service.now().astimezone(UTC)
+    store.create_gate(
+        MattermostCockpitGateRelay(
+            gate_id=gate_id,
+            task_id=task.task_id,
+            prompt_post_id=service._pending_gate_prompt_id(task.task_id, gate_id),
+            prompt_body=legacy_body,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    service.open_gate(task.task_id, gate_id=gate_id, prompt=legacy_prompt)
+
+    gate = store.get_gate(gate_id)
+    assert gate is not None
+    assert gate.prompt_body == legacy_body
+    post = bot.get_post(gate.prompt_post_id)
+    assert post["message"] == legacy_prompt
+    assert post["props"]["cockpit_relay_marker"] == marker
+
+
 def test_second_active_gate_fails_before_posting_orphan_prompt(rig):
     service, store, bot, _, _, _, _ = rig
     task = service.create(
@@ -446,10 +550,10 @@ def test_second_active_gate_fails_before_posting_orphan_prompt(rig):
         source_channel_id=MAIN, source_root_id=SOURCE_ROOT, source_post_id=SOURCE_POST,
         dedupe_key="source:single-gate",
     )
-    service.open_gate(task.task_id, gate_id="gate-one", prompt="Primeiro gate")
+    service.open_gate(task.task_id, gate_id="gate-one", prompt=GATE_PROMPT)
     posts_before = len(bot.posts)
     with pytest.raises(ValueError, match="active gate"):
-        service.open_gate(task.task_id, gate_id="gate-two", prompt="Segundo gate")
+        service.open_gate(task.task_id, gate_id="gate-two", prompt=SECOND_GATE_PROMPT)
     assert len(bot.posts) == posts_before
     assert not any(
         post.get("props", {}).get("cockpit_relay_marker")
@@ -472,14 +576,14 @@ def test_gate_reservation_recovers_after_publish_failure(rig, monkeypatch):
         raise RuntimeError("source publish failed")
     monkeypatch.setattr(service, "_ensure_source_relay", fail_publish)
     with pytest.raises(RuntimeError, match="source publish failed"):
-        service.open_gate(task.task_id, gate_id="gate-recovery", prompt="Pode aprovar?")
+        service.open_gate(task.task_id, gate_id="gate-recovery", prompt=GATE_PROMPT)
     reserved = store.get_active_gate(task.task_id)
     assert reserved is not None
     assert reserved.prompt_post_id == service._pending_gate_prompt_id(task.task_id, "gate-recovery")
     assert len(bot.posts) == posts_before
     assert store.get_task(task.task_id).lifecycle is Lifecycle.RUNNING
     monkeypatch.setattr(service, "_ensure_source_relay", original)
-    waiting = service.open_gate(task.task_id, gate_id="gate-recovery", prompt="Pode aprovar?")
+    waiting = service.open_gate(task.task_id, gate_id="gate-recovery", prompt=GATE_PROMPT)
     bound = store.get_active_gate(task.task_id)
     assert waiting.lifecycle is Lifecycle.WAITING_OWNER
     assert bound is not None
@@ -502,14 +606,14 @@ def test_gate_retry_reuses_post_after_bind_failure(rig, monkeypatch):
 
     monkeypatch.setattr(store, "bind_gate_prompt", fail_bind)
     with pytest.raises(RuntimeError, match="gate bind failed"):
-        service.open_gate(task.task_id, gate_id="gate-bind-recovery", prompt="Pode aprovar?")
+        service.open_gate(task.task_id, gate_id="gate-bind-recovery", prompt=GATE_PROMPT)
     reserved = store.get_active_gate(task.task_id)
     assert reserved is not None
     assert reserved.prompt_post_id == service._pending_gate_prompt_id(task.task_id, "gate-bind-recovery")
     assert len(bot.posts) == posts_before + 1
 
     monkeypatch.setattr(store, "bind_gate_prompt", original)
-    waiting = service.open_gate(task.task_id, gate_id="gate-bind-recovery", prompt="Pode aprovar?")
+    waiting = service.open_gate(task.task_id, gate_id="gate-bind-recovery", prompt=GATE_PROMPT)
     bound = store.get_active_gate(task.task_id)
     assert waiting.lifecycle is Lifecycle.WAITING_OWNER
     assert bound is not None
@@ -706,7 +810,7 @@ def test_resume_owner_decision_requires_exact_source_binding_and_dedupes(rig):
         source_post_id=SOURCE_POST,
         dedupe_key="source:decision",
     )
-    service.open_gate(task.task_id, gate_id="gate-one", prompt="Pode aprovar?")
+    service.open_gate(task.task_id, gate_id="gate-one", prompt=GATE_PROMPT)
     decision = {
         "id": DECISION_POST,
         "channel_id": MAIN,
@@ -727,6 +831,11 @@ def test_resume_owner_decision_requires_exact_source_binding_and_dedupes(rig):
             message="aprovado",
         )
     before = len(bridge.posts)
+    source_relay_ids_before = {
+        post_id
+        for post_id, post in bot.posts.items()
+        if post.get("root_id") == SOURCE_ROOT and post.get("user_id") == BOT
+    }
     service.resume_owner_message(
         task.task_id,
         gate_id="gate-one",
@@ -746,6 +855,12 @@ def test_resume_owner_decision_requires_exact_source_binding_and_dedupes(rig):
     assert len(bridge.posts) == before + 1
     assert bridge.posts[-1][1] == task.execution_root_id
     assert bridge.posts[-1][0].startswith("[cockpit-decision:gate-one:approve]")
+    assert bridge.posts[-1][0].endswith("\n" + decision["message"])
+    assert {
+        post_id
+        for post_id, post in bot.posts.items()
+        if post.get("root_id") == SOURCE_ROOT and post.get("user_id") == BOT
+    } == source_relay_ids_before
 
 
 def test_resume_owner_decision_reuses_post_after_resolve_failure(rig, monkeypatch):
@@ -759,7 +874,7 @@ def test_resume_owner_decision_reuses_post_after_resolve_failure(rig, monkeypatc
         source_post_id=SOURCE_POST,
         dedupe_key="source:decision-retry",
     )
-    service.open_gate(task.task_id, gate_id="gate-retry", prompt="Pode aprovar?")
+    service.open_gate(task.task_id, gate_id="gate-retry", prompt=GATE_PROMPT)
     decision = {
         "id": DECISION_POST,
         "channel_id": MAIN,
@@ -823,14 +938,20 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
     closed = service.close(
         task.task_id,
         outcome=Lifecycle.SUCCEEDED,
-        summary="done",
-        evidence={"tests": "5 passed"},
+        summary="Conversão aplicada na NF 000119.",
+        evidence={
+            "tests": "5 passed",
+            "validation": "PDF gerado e conferido no pedido correto.",
+        },
     )
     assert closed.lifecycle is Lifecycle.SUCCEEDED
     assert owner.following_calls[-1] is False
     assert units.stopped == [task.task_id]
     assert events.index("follow:False") < events.index("unit:stop")
-    assert store.get_task(task.task_id).evidence == {"tests": "5 passed"}
+    assert store.get_task(task.task_id).evidence == {
+        "tests": "5 passed",
+        "validation": "PDF gerado e conferido no pedido correto.",
+    }
     source_final = next(
         p
         for p in bot.posts.values()
@@ -842,10 +963,57 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
         if "[cockpit-evidence:task-close:" in p["message"]
     )
     assert source_final["channel_id"] == MAIN
+    assert source_final["message"].startswith(
+        "**Concluído**\nConversão aplicada na NF 000119."
+    )
+    assert (
+        "**Validado**\nPDF gerado e conferido no pedido correto."
+        in source_final["message"]
+    )
+    assert "[cockpit-final:" not in source_final["message"]
     assert "5 passed" not in source_final["message"]
     assert execution_evidence["channel_id"] == EXEC
     assert execution_evidence["root_id"] == task.execution_root_id
     assert "5 passed" in execution_evidence["message"]
+
+
+@pytest.mark.parametrize("outcome", [Lifecycle.FAILED, Lifecycle.CANCELLED])
+def test_close_interrupted_outcomes_hide_raw_last_error(rig, outcome):
+    service, _, bot, owner, _, units, events = rig
+    task = service.create(
+        task_id=f"task-{outcome.value.lower()}",
+        title="Interrupted close",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=f"source:{outcome.value}",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    owner.following = True
+
+    closed = service.close(
+        task.task_id,
+        outcome=outcome,
+        summary="Execução encerrada com segurança.",
+        evidence={"reason": "technical details retained"},
+        last_error="RAW INTERNAL ERROR 503 secret detail",
+    )
+
+    final_post = next(
+        post
+        for post in bot.posts.values()
+        if post.get("props", {}).get("cockpit_relay_marker")
+        == f"[cockpit-final:{task.task_id}]"
+    )
+    assert closed.lifecycle is outcome
+    assert final_post["message"].startswith(
+        "**Interrompido**\nExecução encerrada com segurança."
+    )
+    assert "RAW INTERNAL ERROR" not in final_post["message"]
+    assert "[cockpit-final:" not in final_post["message"]
+    assert events.index("follow:False") < events.index("unit:stop")
+    assert units.stopped == [task.task_id]
 
 
 def test_close_resumes_after_unfollow_already_completed(rig):
@@ -926,7 +1094,7 @@ def test_watch_once_operates_while_owner_does_not_follow_execution_thread(rig):
     service, store, bot, owner, bridge, _, _ = rig
     task = service.create(
         task_id="task-watcher-unfollowed",
-        title="Watcher unfollowed",
+        title="Owner thread unfollowed",
         handoff="handoff",
         source_channel_id=MAIN,
         source_root_id=SOURCE_ROOT,
