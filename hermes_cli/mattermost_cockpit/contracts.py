@@ -20,13 +20,21 @@ class Lifecycle(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class GateDecision(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+    CLARIFY = "clarify"
+
+
+CLEANUP_PENDING_STATE = "cleanup_pending"
+
 TERMINAL_LIFECYCLES = frozenset({Lifecycle.SUCCEEDED, Lifecycle.FAILED, Lifecycle.CANCELLED})
 NONTERMINAL_LIFECYCLES = frozenset({Lifecycle.OPEN, Lifecycle.RUNNING, Lifecycle.WAITING_OWNER, Lifecycle.BLOCKED})
 LEGAL_TRANSITIONS: dict[Lifecycle, frozenset[Lifecycle]] = {
-    Lifecycle.OPEN: frozenset({Lifecycle.RUNNING, Lifecycle.FAILED, Lifecycle.CANCELLED}),
+    Lifecycle.OPEN: frozenset({Lifecycle.RUNNING, Lifecycle.BLOCKED, Lifecycle.FAILED, Lifecycle.CANCELLED}),
     Lifecycle.RUNNING: frozenset({Lifecycle.WAITING_OWNER, Lifecycle.BLOCKED, Lifecycle.SUCCEEDED, Lifecycle.FAILED, Lifecycle.CANCELLED}),
     Lifecycle.WAITING_OWNER: frozenset({Lifecycle.RUNNING, Lifecycle.BLOCKED, Lifecycle.FAILED, Lifecycle.CANCELLED}),
-    Lifecycle.BLOCKED: frozenset({Lifecycle.RUNNING, Lifecycle.FAILED, Lifecycle.CANCELLED}),
+    Lifecycle.BLOCKED: frozenset({Lifecycle.BLOCKED, Lifecycle.RUNNING, Lifecycle.FAILED, Lifecycle.CANCELLED}),
     Lifecycle.SUCCEEDED: frozenset(),
     Lifecycle.FAILED: frozenset(),
     Lifecycle.CANCELLED: frozenset(),

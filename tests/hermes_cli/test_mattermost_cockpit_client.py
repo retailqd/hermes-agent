@@ -216,7 +216,7 @@ class TestMattermostClient:
 
         assert captured["method"] == expected_method
         assert str(captured["url"]).endswith(
-            "/api/v4/users/user-1/teams/team-1/threads/root-1/following"
+            "/api/v4/users/me/teams/team-1/threads/root-1/following"
         )
         assert captured["body"] is None
 

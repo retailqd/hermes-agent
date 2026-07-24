@@ -5,7 +5,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
-from .contracts import Lifecycle, TERMINAL_LIFECYCLES, validate_mattermost_id, validate_task_id
+from .contracts import (
+    CLEANUP_PENDING_STATE,
+    GateDecision,
+    Lifecycle,
+    TERMINAL_LIFECYCLES,
+    validate_mattermost_id,
+    validate_task_id,
+)
 
 
 def utc_now() -> datetime:
@@ -66,6 +73,8 @@ class MattermostCockpitTask:
     result_summary: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
     last_error: str | None = None
+    cleanup_state: str | None = None
+    pending_outcome: Lifecycle | None = None
     dedupe_key: str | None = None
     version: int = 1
 
@@ -95,6 +104,18 @@ class MattermostCockpitTask:
             object.__setattr__(self, "result_summary", _require_text(self.result_summary, "result_summary"))
         if self.last_error is not None:
             object.__setattr__(self, "last_error", _require_text(self.last_error, "last_error"))
+        if self.cleanup_state is not None:
+            cleanup_state = _require_text(self.cleanup_state, "cleanup_state")
+            if cleanup_state != CLEANUP_PENDING_STATE:
+                raise ValueError(f"cleanup_state must be {CLEANUP_PENDING_STATE!r}")
+            object.__setattr__(self, "cleanup_state", cleanup_state)
+        if self.pending_outcome is not None:
+            if not isinstance(self.pending_outcome, Lifecycle):
+                object.__setattr__(self, "pending_outcome", Lifecycle(str(self.pending_outcome)))
+            if self.pending_outcome not in TERMINAL_LIFECYCLES:
+                raise ValueError("pending_outcome must be terminal")
+        if (self.cleanup_state is None) != (self.pending_outcome is None):
+            raise ValueError("cleanup_state and pending_outcome must be set together")
         object.__setattr__(self, "evidence", dict(self.evidence or {}))
         object.__setattr__(self, "source_cursor_ms", _require_non_negative_int(self.source_cursor_ms, "source_cursor_ms"))
         object.__setattr__(self, "execution_cursor_ms", _require_non_negative_int(self.execution_cursor_ms, "execution_cursor_ms"))
@@ -148,6 +169,8 @@ class MattermostCockpitTask:
             "result_summary": self.result_summary,
             "evidence_json": json.dumps(self.evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
             "last_error": self.last_error,
+            "cleanup_state": self.cleanup_state,
+            "pending_outcome": self.pending_outcome.value if self.pending_outcome is not None else None,
             "dedupe_key": self.dedupe_key,
             "version": self.version,
         }
@@ -186,6 +209,14 @@ class MattermostCockpitTask:
             result_summary=row["result_summary"],
             evidence=evidence,
             last_error=row["last_error"],
+            cleanup_state=row.get("cleanup_state") if hasattr(row, "get") else row["cleanup_state"],
+            pending_outcome=(
+                Lifecycle(row.get("pending_outcome"))
+                if hasattr(row, "get") and row.get("pending_outcome")
+                else Lifecycle(row["pending_outcome"])
+                if not hasattr(row, "get") and row["pending_outcome"]
+                else None
+            ),
             dedupe_key=row["dedupe_key"],
             version=row["version"],
         )
@@ -232,4 +263,85 @@ class MattermostCockpitAuditEvent:
             created_at=created_at,
             payload=json.loads(payload_json) if payload_json else {},
             dedupe_key=row["dedupe_key"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MattermostCockpitGateRelay:
+    gate_id: str
+    task_id: str
+    prompt_post_id: str
+    prompt_body: str
+    decision: GateDecision | None = None
+    source_owner_post_id: str | None = None
+    source_body: str | None = None
+    destination_post_id: str | None = None
+    destination_body: str | None = None
+    active: bool = True
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+    last_error: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "gate_id", validate_task_id(self.gate_id))
+        object.__setattr__(self, "task_id", validate_task_id(self.task_id))
+        object.__setattr__(self, "prompt_post_id", validate_mattermost_id(self.prompt_post_id, "prompt_post_id"))
+        object.__setattr__(self, "prompt_body", _require_text(self.prompt_body, "prompt_body"))
+        if self.decision is not None and not isinstance(self.decision, GateDecision):
+            object.__setattr__(self, "decision", GateDecision(str(self.decision)))
+        if self.source_owner_post_id is not None:
+            object.__setattr__(self, "source_owner_post_id", validate_mattermost_id(self.source_owner_post_id, "source_owner_post_id"))
+        if self.source_body is not None:
+            object.__setattr__(self, "source_body", _require_text(self.source_body, "source_body"))
+        if self.destination_post_id is not None:
+            object.__setattr__(self, "destination_post_id", validate_mattermost_id(self.destination_post_id, "destination_post_id"))
+        if self.destination_body is not None:
+            object.__setattr__(self, "destination_body", _require_text(self.destination_body, "destination_body"))
+        object.__setattr__(self, "active", bool(self.active))
+        object.__setattr__(self, "created_at", _require_utc(self.created_at, "created_at"))
+        object.__setattr__(self, "updated_at", _require_utc(self.updated_at, "updated_at"))
+        if self.last_error is not None:
+            object.__setattr__(self, "last_error", _require_text(self.last_error, "last_error"))
+        if self.active and any((self.decision, self.source_owner_post_id, self.destination_post_id)):
+            raise ValueError("active gate must not carry a resolved decision")
+        if not self.active and not all((self.decision, self.source_owner_post_id, self.source_body, self.destination_post_id, self.destination_body)):
+            raise ValueError("resolved gate requires decision and both source/destination bindings")
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "gate_id": self.gate_id,
+            "task_id": self.task_id,
+            "prompt_post_id": self.prompt_post_id,
+            "prompt_body": self.prompt_body,
+            "decision": self.decision.value if self.decision is not None else None,
+            "source_owner_post_id": self.source_owner_post_id,
+            "source_body": self.source_body,
+            "destination_post_id": self.destination_post_id,
+            "destination_body": self.destination_body,
+            "active": 1 if self.active else 0,
+            "created_at": _format_utc(self.created_at),
+            "updated_at": _format_utc(self.updated_at),
+            "last_error": self.last_error,
+        }
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> "MattermostCockpitGateRelay":
+        created_at = _parse_utc(row["created_at"])
+        updated_at = _parse_utc(row["updated_at"])
+        if created_at is None or updated_at is None:
+            raise ValueError("gate relay row timestamps must be present")
+        return cls(
+            gate_id=row["gate_id"],
+            task_id=row["task_id"],
+            prompt_post_id=row["prompt_post_id"],
+            prompt_body=row["prompt_body"],
+            decision=GateDecision(row["decision"]) if row["decision"] else None,
+            source_owner_post_id=row["source_owner_post_id"],
+            source_body=row["source_body"],
+            destination_post_id=row["destination_post_id"],
+            destination_body=row["destination_body"],
+            active=bool(row["active"]),
+            created_at=created_at,
+            updated_at=updated_at,
+            last_error=row["last_error"],
         )

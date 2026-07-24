@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from hermes_cli.mattermost_cockpit.cli import main
-from hermes_cli.mattermost_cockpit.contracts import Lifecycle
+from hermes_cli.mattermost_cockpit.contracts import GateDecision, Lifecycle
 
 
 class FakeService:
@@ -19,6 +19,10 @@ class FakeService:
     def status(self, task_id=None):
         self.calls.append(("status", task_id))
         return {"task_id": task_id, "lifecycle": "RUNNING"}
+
+    def open_gate(self, task_id, **kwargs):
+        self.calls.append(("gate", task_id, kwargs))
+        return _Task(task_id, Lifecycle.WAITING_OWNER)
 
     def resume_owner_message(self, task_id, **kwargs):
         self.calls.append(("resume", task_id, kwargs))
@@ -77,6 +81,19 @@ def test_create_reads_handoff_from_stdin_and_returns_json():
     assert call["dedupe_key"] == "source:" + "3" * 26
 
 
+def test_open_gate_reads_prompt_from_stdin():
+    service = FakeService()
+    rc, payload, _ = _run(
+        ["gate", "--task", "task-one", "--gate-id", "gate-one", "--prompt-stdin"],
+        service,
+        "Pode aprovar?",
+    )
+    assert rc == 0 and payload is not None and payload["lifecycle"] == "WAITING_OWNER"
+    assert service.calls == [
+        ("gate", "task-one", {"gate_id": "gate-one", "prompt": "Pode aprovar?"})
+    ]
+
+
 def test_resume_owner_message_reads_stdin_and_binds_source_post():
     service = FakeService()
     rc, payload, _ = _run(
@@ -84,6 +101,10 @@ def test_resume_owner_message_reads_stdin_and_binds_source_post():
             "resume",
             "--task",
             "task-one",
+            "--gate-id",
+            "gate-one",
+            "--decision",
+            "approve",
             "--source-root-id",
             "2" * 26,
             "--source-post-id",
@@ -99,6 +120,8 @@ def test_resume_owner_message_reads_stdin_and_binds_source_post():
             "resume",
             "task-one",
             {
+                "gate_id": "gate-one",
+                "decision": GateDecision.APPROVE,
                 "source_root_id": "2" * 26,
                 "source_post_id": "4" * 26,
                 "message": "aprovado",

@@ -199,7 +199,7 @@ def test_store_connects_with_wal_foreign_keys_busy_timeout_and_quick_check(store
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] > 0
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
 
     with store.connect() as conn:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"

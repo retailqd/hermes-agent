@@ -10,6 +10,8 @@ from hermes_cli.sqlite_util import write_txn
 from hermes_constants import get_hermes_home
 
 from .contracts import (
+    CLEANUP_PENDING_STATE,
+    GateDecision,
     LEGAL_TRANSITIONS,
     Lifecycle,
     MattermostCockpitContracts,
@@ -17,27 +19,39 @@ from .contracts import (
     TERMINAL_LIFECYCLES,
     validate_mattermost_id,
 )
-from .models import MattermostCockpitAuditEvent, MattermostCockpitTask, _require_text, _require_utc, utc_now
+from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, _require_text, _require_utc, utc_now
 
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 TASK_COLUMNS = (
     "task_id, team_id, source_channel_id, source_root_id, source_post_id, owner_author_id, "
     "executions_channel_id, execution_root_id, execution_permalink, watcher_user_id, title, lifecycle, "
     "created_at, updated_at, closed_at, source_cursor_ms, execution_cursor_ms, watcher_owner, "
-    "watcher_heartbeat_at, result_summary, evidence_json, last_error, dedupe_key, version"
+    "watcher_heartbeat_at, result_summary, evidence_json, last_error, cleanup_state, pending_outcome, dedupe_key, version"
 )
 TASK_SELECT_SQL = f"SELECT {TASK_COLUMNS} FROM cockpit_tasks WHERE task_id = ?"
-TASK_INSERT_SQL = f"INSERT INTO cockpit_tasks ({TASK_COLUMNS}) VALUES ({', '.join(['?'] * 24)})"
+TASK_INSERT_SQL = f"INSERT INTO cockpit_tasks ({TASK_COLUMNS}) VALUES ({', '.join(['?'] * 26)})"
 TASK_UPDATE_SQL = (
     "UPDATE cockpit_tasks SET "
     "team_id = ?, source_channel_id = ?, source_root_id = ?, source_post_id = ?, owner_author_id = ?, "
     "executions_channel_id = ?, execution_root_id = ?, execution_permalink = ?, watcher_user_id = ?, title = ?, "
     "lifecycle = ?, created_at = ?, updated_at = ?, closed_at = ?, source_cursor_ms = ?, execution_cursor_ms = ?, "
     "watcher_owner = ?, watcher_heartbeat_at = ?, result_summary = ?, evidence_json = ?, last_error = ?, "
-    "dedupe_key = ?, version = ? "
+    "cleanup_state = ?, pending_outcome = ?, dedupe_key = ?, version = ? "
     "WHERE task_id = ? AND version = ?"
+)
+
+GATE_COLUMNS = (
+    "gate_id, task_id, prompt_post_id, prompt_body, decision, source_owner_post_id, source_body, "
+    "destination_post_id, destination_body, active, created_at, updated_at, last_error"
+)
+GATE_SELECT_SQL = f"SELECT {GATE_COLUMNS} FROM cockpit_gate_relays WHERE gate_id = ?"
+GATE_INSERT_SQL = f"INSERT INTO cockpit_gate_relays ({GATE_COLUMNS}) VALUES ({', '.join(['?'] * 13)})"
+GATE_UPDATE_SQL = (
+    "UPDATE cockpit_gate_relays SET decision = ?, source_owner_post_id = ?, source_body = ?, "
+    "destination_post_id = ?, destination_body = ?, active = ?, updated_at = ?, last_error = ? "
+    "WHERE gate_id = ? AND active = 1"
 )
 
 SCHEMA_SQL = """
@@ -64,13 +78,17 @@ CREATE TABLE IF NOT EXISTS cockpit_tasks (
     result_summary       TEXT,
     evidence_json        TEXT NOT NULL DEFAULT '{}',
     last_error           TEXT,
+    cleanup_state        TEXT,
+    pending_outcome      TEXT,
     dedupe_key           TEXT UNIQUE,
     version              INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
     CHECK (
         (lifecycle IN ('SUCCEEDED', 'FAILED', 'CANCELLED') AND closed_at IS NOT NULL)
         OR
         (lifecycle IN ('OPEN', 'RUNNING', 'WAITING_OWNER', 'BLOCKED') AND closed_at IS NULL)
-    )
+    ),
+    CHECK (cleanup_state IS NULL OR cleanup_state = 'cleanup_pending'),
+    CHECK ((cleanup_state IS NULL AND pending_outcome IS NULL) OR (cleanup_state = 'cleanup_pending' AND pending_outcome IN ('SUCCEEDED', 'FAILED', 'CANCELLED')))
 );
 
 CREATE TABLE IF NOT EXISTS cockpit_audit_events (
@@ -82,6 +100,27 @@ CREATE TABLE IF NOT EXISTS cockpit_audit_events (
     payload_json    TEXT NOT NULL DEFAULT '{}',
     dedupe_key      TEXT,
     UNIQUE(task_id, dedupe_key)
+);
+
+CREATE TABLE IF NOT EXISTS cockpit_gate_relays (
+    gate_id              TEXT PRIMARY KEY,
+    task_id              TEXT NOT NULL REFERENCES cockpit_tasks(task_id) ON DELETE CASCADE,
+    prompt_post_id       TEXT NOT NULL UNIQUE,
+    prompt_body          TEXT NOT NULL,
+    decision             TEXT CHECK (decision IN ('approve', 'reject', 'clarify')),
+    source_owner_post_id TEXT UNIQUE,
+    source_body          TEXT,
+    destination_post_id  TEXT UNIQUE,
+    destination_body     TEXT,
+    active               INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    last_error           TEXT,
+    CHECK (
+        (active = 1 AND decision IS NULL AND source_owner_post_id IS NULL AND destination_post_id IS NULL)
+        OR
+        (active = 0 AND decision IS NOT NULL AND source_owner_post_id IS NOT NULL AND source_body IS NOT NULL AND destination_post_id IS NOT NULL AND destination_body IS NOT NULL)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_cockpit_tasks_open
@@ -120,7 +159,19 @@ class MattermostCockpitStore:
 
     def _initialize(self, conn: sqlite3.Connection) -> None:
         conn.executescript(SCHEMA_SQL)
+        self._ensure_column(conn, "cockpit_tasks", "cleanup_state TEXT")
+        self._ensure_column(conn, "cockpit_tasks", "pending_outcome TEXT")
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_def: str) -> None:
+        column_name = column_def.split()[0]
+        if column_name not in self._table_columns(conn, table_name):
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
 
     @contextlib.contextmanager
     def connect(self):
@@ -178,6 +229,8 @@ class MattermostCockpitStore:
                 record["result_summary"],
                 record["evidence_json"],
                 record["last_error"],
+                record["cleanup_state"],
+                record["pending_outcome"],
                 record["dedupe_key"],
                 record["version"],
                 previous.task_id,
@@ -201,33 +254,36 @@ class MattermostCockpitStore:
                     if existing.creation_binding() != task.creation_binding():
                         raise ValueError("dedupe collision: immutable binding differs")
                     return existing
+            record = task.to_record()
             conn.execute(
                 TASK_INSERT_SQL,
                 (
-                    task.task_id,
-                    task.team_id,
-                    task.source_channel_id,
-                    task.source_root_id,
-                    task.source_post_id,
-                    task.owner_author_id,
-                    task.executions_channel_id,
-                    task.execution_root_id,
-                    task.execution_permalink,
-                    task.watcher_user_id,
-                    task.title,
-                    task.lifecycle.value,
-                    task.to_record()["created_at"],
-                    task.to_record()["updated_at"],
-                    task.to_record()["closed_at"],
-                    task.source_cursor_ms,
-                    task.execution_cursor_ms,
-                    task.watcher_owner,
-                    task.to_record()["watcher_heartbeat_at"],
-                    task.result_summary,
-                    task.to_record()["evidence_json"],
-                    task.last_error,
-                    task.dedupe_key,
-                    task.version,
+                    record["task_id"],
+                    record["team_id"],
+                    record["source_channel_id"],
+                    record["source_root_id"],
+                    record["source_post_id"],
+                    record["owner_author_id"],
+                    record["executions_channel_id"],
+                    record["execution_root_id"],
+                    record["execution_permalink"],
+                    record["watcher_user_id"],
+                    record["title"],
+                    record["lifecycle"],
+                    record["created_at"],
+                    record["updated_at"],
+                    record["closed_at"],
+                    record["source_cursor_ms"],
+                    record["execution_cursor_ms"],
+                    record["watcher_owner"],
+                    record["watcher_heartbeat_at"],
+                    record["result_summary"],
+                    record["evidence_json"],
+                    record["last_error"],
+                    record["cleanup_state"],
+                    record["pending_outcome"],
+                    record["dedupe_key"],
+                    record["version"],
                 ),
             )
             return self.get_task(task.task_id, conn=conn)  # type: ignore[return-value]
@@ -252,6 +308,37 @@ class MattermostCockpitStore:
             ).fetchall()
             return [MattermostCockpitTask.from_row(row) for row in rows]
 
+    def attach_execution(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        execution_root_id: str,
+        execution_permalink: str,
+    ) -> MattermostCockpitTask:
+        with self.connect() as conn, write_txn(conn):
+            current = self._fetch_task(conn, task_id)
+            if current is None:
+                raise ValueError(f"task {task_id!r} does not exist")
+            if current.version != expected_version:
+                raise ValueError("version mismatch")
+            if current.lifecycle in TERMINAL_LIFECYCLES:
+                raise ValueError("terminal task cannot be bound")
+            if current.execution_root_id is not None or current.execution_permalink is not None:
+                if current.execution_root_id != validate_mattermost_id(execution_root_id, "execution_root_id"):
+                    raise ValueError("execution is already bound")
+                if current.execution_permalink != _require_text(execution_permalink, "execution_permalink"):
+                    raise ValueError("execution is already bound")
+                return current
+            updated = replace(
+                current,
+                execution_root_id=validate_mattermost_id(execution_root_id, "execution_root_id"),
+                execution_permalink=_require_text(execution_permalink, "execution_permalink"),
+                updated_at=utc_now(),
+                version=current.version + 1,
+            )
+            return self._persist_task_update(conn, current, updated)
+
     def bind_execution(self, task_id: str, *, execution_root_id: str, execution_permalink: str) -> MattermostCockpitTask:
         with self.connect() as conn, write_txn(conn):
             current = self._fetch_task(conn, task_id)
@@ -272,6 +359,127 @@ class MattermostCockpitStore:
             )
             return self._persist_task_update(conn, current, updated)
 
+    def mark_running(self, task_id: str, *, expected_version: int) -> MattermostCockpitTask:
+        with self.connect() as conn, write_txn(conn):
+            current = self._fetch_task(conn, task_id)
+            if current is None:
+                raise ValueError(f"task {task_id!r} does not exist")
+            if current.version != expected_version:
+                raise ValueError("version mismatch")
+            if current.lifecycle in TERMINAL_LIFECYCLES:
+                raise ValueError("terminal task cannot run")
+            if not current.execution_root_id or not current.execution_permalink:
+                raise ValueError("execution root is not bound")
+            updated = replace(
+                current,
+                lifecycle=Lifecycle.RUNNING,
+                last_error=None,
+                cleanup_state=None,
+                pending_outcome=None,
+                updated_at=utc_now(),
+                version=current.version + 1,
+            )
+            return self._persist_task_update(conn, current, updated)
+
+    def record_blocked(self, task_id: str, *, expected_version: int, last_error: str) -> MattermostCockpitTask:
+        with self.connect() as conn, write_txn(conn):
+            current = self._fetch_task(conn, task_id)
+            if current is None:
+                raise ValueError(f"task {task_id!r} does not exist")
+            if current.version != expected_version:
+                raise ValueError("version mismatch")
+            if current.lifecycle in TERMINAL_LIFECYCLES:
+                raise ValueError("terminal task cannot be blocked")
+            updated = replace(
+                current,
+                lifecycle=Lifecycle.BLOCKED,
+                last_error=_require_text(last_error, "last_error")[:1000],
+                updated_at=utc_now(),
+                version=current.version + 1,
+            )
+            return self._persist_task_update(conn, current, updated)
+
+    def prepare_close(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        outcome: Lifecycle,
+        result_summary: str,
+        evidence: dict,
+        last_error: str | None,
+    ) -> MattermostCockpitTask:
+        if outcome not in TERMINAL_LIFECYCLES:
+            raise ValueError("pending outcome must be terminal")
+        with self.connect() as conn, write_txn(conn):
+            current = self._fetch_task(conn, task_id)
+            if current is None:
+                raise ValueError(f"task {task_id!r} does not exist")
+            if current.version != expected_version:
+                raise ValueError("version mismatch")
+            if current.lifecycle in TERMINAL_LIFECYCLES:
+                raise ValueError("terminal task cannot prepare close")
+            summary = _require_text(result_summary, "result_summary")
+            new_evidence = dict(evidence or {})
+            if outcome is Lifecycle.SUCCEEDED and not new_evidence:
+                raise ValueError("evidence is required for succeeded tasks")
+            updated = replace(
+                current,
+                lifecycle=Lifecycle.BLOCKED,
+                result_summary=summary,
+                evidence=new_evidence,
+                last_error=_require_text(last_error, "last_error") if last_error is not None else None,
+                cleanup_state=CLEANUP_PENDING_STATE,
+                pending_outcome=outcome,
+                updated_at=utc_now(),
+                version=current.version + 1,
+            )
+            return self._persist_task_update(conn, current, updated)
+
+    def record_cleanup_error(self, task_id: str, *, expected_version: int, last_error: str) -> MattermostCockpitTask:
+        with self.connect() as conn, write_txn(conn):
+            current = self._fetch_task(conn, task_id)
+            if current is None:
+                raise ValueError(f"task {task_id!r} does not exist")
+            if current.version != expected_version:
+                raise ValueError("version mismatch")
+            if current.cleanup_state != CLEANUP_PENDING_STATE or current.pending_outcome is None:
+                raise ValueError("task is not cleanup pending")
+            updated = replace(
+                current,
+                last_error=_require_text(last_error, "last_error")[:1000],
+                updated_at=utc_now(),
+                version=current.version + 1,
+            )
+            return self._persist_task_update(conn, current, updated)
+
+    def complete_close(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        final_last_error: str | None,
+    ) -> MattermostCockpitTask:
+        with self.connect() as conn, write_txn(conn):
+            current = self._fetch_task(conn, task_id)
+            if current is None:
+                raise ValueError(f"task {task_id!r} does not exist")
+            if current.version != expected_version:
+                raise ValueError("version mismatch")
+            if current.cleanup_state != CLEANUP_PENDING_STATE or current.pending_outcome is None:
+                raise ValueError("task is not cleanup pending")
+            updated = replace(
+                current,
+                lifecycle=current.pending_outcome,
+                cleanup_state=None,
+                pending_outcome=None,
+                last_error=_require_text(final_last_error, "last_error") if final_last_error is not None else None,
+                closed_at=utc_now(),
+                updated_at=utc_now(),
+                version=current.version + 1,
+            )
+            return self._persist_task_update(conn, current, updated)
+
     def transition(
         self,
         task_id: str,
@@ -282,6 +490,7 @@ class MattermostCockpitStore:
         evidence: dict | None = None,
         last_error: str | None = None,
         closed_at: datetime | None = None,
+        cleanup_state: str | None = None,
     ) -> MattermostCockpitTask:
         with self.connect() as conn, write_txn(conn):
             current = self._fetch_task(conn, task_id)
@@ -312,6 +521,12 @@ class MattermostCockpitStore:
                 new_evidence = dict(current.evidence if evidence is None else evidence)
                 new_last_error = last_error if last_error is not None else current.last_error
 
+            new_cleanup_state = cleanup_state if cleanup_state is not None else current.cleanup_state
+            if new_cleanup_state is not None and new_cleanup_state != CLEANUP_PENDING_STATE:
+                raise ValueError(f"cleanup_state must be {CLEANUP_PENDING_STATE!r}")
+            if lifecycle in TERMINAL_LIFECYCLES and new_cleanup_state is not None:
+                raise ValueError("terminal lifecycle must not carry cleanup_state")
+
             updated = replace(
                 current,
                 lifecycle=lifecycle,
@@ -319,6 +534,7 @@ class MattermostCockpitStore:
                 result_summary=summary,
                 evidence=new_evidence,
                 last_error=new_last_error,
+                cleanup_state=new_cleanup_state,
                 updated_at=utc_now(),
                 version=current.version + 1,
             )
@@ -419,6 +635,117 @@ class MattermostCockpitStore:
                 version=current.version + 1,
             )
             return self._persist_task_update(conn, current, updated)
+
+    def create_gate(self, gate: MattermostCockpitGateRelay) -> MattermostCockpitGateRelay:
+        record = gate.to_record()
+        with self.connect() as conn, write_txn(conn):
+            existing = conn.execute(GATE_SELECT_SQL, (gate.gate_id,)).fetchone()
+            if existing is not None:
+                current = MattermostCockpitGateRelay.from_row(existing)
+                if (
+                    current.task_id != gate.task_id
+                    or current.prompt_post_id != gate.prompt_post_id
+                    or current.prompt_body != gate.prompt_body
+                ):
+                    raise ValueError("gate id collision")
+                return current
+            active = conn.execute(
+                "SELECT " + GATE_COLUMNS + " FROM cockpit_gate_relays WHERE task_id = ? AND active = 1",
+                (gate.task_id,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError("task already has an active gate")
+            conn.execute(
+                GATE_INSERT_SQL,
+                (
+                    record["gate_id"],
+                    record["task_id"],
+                    record["prompt_post_id"],
+                    record["prompt_body"],
+                    record["decision"],
+                    record["source_owner_post_id"],
+                    record["source_body"],
+                    record["destination_post_id"],
+                    record["destination_body"],
+                    record["active"],
+                    record["created_at"],
+                    record["updated_at"],
+                    record["last_error"],
+                ),
+            )
+            row = conn.execute(GATE_SELECT_SQL, (gate.gate_id,)).fetchone()
+            return MattermostCockpitGateRelay.from_row(row)  # type: ignore[arg-type]
+
+    def get_gate(self, gate_id: str) -> MattermostCockpitGateRelay | None:
+        with self.connect() as conn:
+            row = conn.execute(GATE_SELECT_SQL, (gate_id,)).fetchone()
+            return MattermostCockpitGateRelay.from_row(row) if row is not None else None
+
+    def get_active_gate(self, task_id: str) -> MattermostCockpitGateRelay | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT " + GATE_COLUMNS + " FROM cockpit_gate_relays WHERE task_id = ? AND active = 1",
+                (task_id,),
+            ).fetchone()
+            return MattermostCockpitGateRelay.from_row(row) if row is not None else None
+
+    def resolve_gate(
+        self,
+        gate_id: str,
+        *,
+        task_id: str,
+        decision: GateDecision,
+        source_owner_post_id: str,
+        source_body: str,
+        destination_post_id: str,
+        destination_body: str,
+    ) -> MattermostCockpitGateRelay:
+        with self.connect() as conn, write_txn(conn):
+            row = conn.execute(GATE_SELECT_SQL, (gate_id,)).fetchone()
+            if row is None:
+                raise ValueError("gate does not exist")
+            current = MattermostCockpitGateRelay.from_row(row)
+            expected = (
+                task_id,
+                decision,
+                validate_mattermost_id(source_owner_post_id, "source_owner_post_id"),
+                _require_text(source_body, "source_body"),
+                validate_mattermost_id(destination_post_id, "destination_post_id"),
+                _require_text(destination_body, "destination_body"),
+            )
+            if not current.active:
+                actual = (
+                    current.task_id,
+                    current.decision,
+                    current.source_owner_post_id,
+                    current.source_body,
+                    current.destination_post_id,
+                    current.destination_body,
+                )
+                if actual != expected:
+                    raise ValueError("resolved gate replay mismatch")
+                return current
+            if current.task_id != task_id:
+                raise ValueError("gate task mismatch")
+            now = utc_now()
+            cursor = conn.execute(
+                GATE_UPDATE_SQL,
+                (
+                    decision.value,
+                    expected[2],
+                    expected[3],
+                    expected[4],
+                    expected[5],
+                    0,
+                    now.isoformat().replace("+00:00", "Z"),
+                    None,
+                    gate_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("gate resolution race")
+            updated = conn.execute(GATE_SELECT_SQL, (gate_id,)).fetchone()
+            return MattermostCockpitGateRelay.from_row(updated)  # type: ignore[arg-type]
 
     def append_audit_event(self, event: MattermostCockpitAuditEvent) -> MattermostCockpitAuditEvent:
         record = event.to_record()

@@ -12,7 +12,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import get_hermes_home
 
 from .client import MattermostClient
-from .contracts import Lifecycle, MattermostCockpitContracts
+from .contracts import GateDecision, Lifecycle, MattermostCockpitContracts
 from .helpers import HelperBridge
 from .service import CockpitService, UnitController
 from .store import MattermostCockpitStore
@@ -33,8 +33,15 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status")
     status.add_argument("--task")
 
+    gate = commands.add_parser("gate")
+    gate.add_argument("--task", required=True)
+    gate.add_argument("--gate-id", required=True)
+    gate.add_argument("--prompt-stdin", action="store_true", required=True)
+
     resume = commands.add_parser("resume")
     resume.add_argument("--task", required=True)
+    resume.add_argument("--gate-id")
+    resume.add_argument("--decision", choices=[item.value for item in GateDecision])
     mode = resume.add_mutually_exclusive_group(required=True)
     mode.add_argument("--watch", action="store_true")
     mode.add_argument("--owner-message-stdin", action="store_true")
@@ -132,14 +139,21 @@ def main(
             payload = _task_payload(task)
         elif args.command == "status":
             payload = {"ok": True, "result": service.status(args.task)}
+        elif args.command == "gate":
+            task = service.open_gate(args.task, gate_id=args.gate_id, prompt=stdin.read())
+            payload = _task_payload(task)
         elif args.command == "resume" and args.watch:
             service.watch_forever(args.task)
             payload = {"ok": True, "task_id": args.task, "watcher": "stopped"}
         elif args.command == "resume":
-            if not args.source_root_id or not args.source_post_id:
-                raise ValueError("owner message requires --source-root-id and --source-post-id")
+            if not args.source_root_id or not args.source_post_id or not args.gate_id or not args.decision:
+                raise ValueError(
+                    "owner message requires --gate-id, --decision, --source-root-id and --source-post-id"
+                )
             task = service.resume_owner_message(
                 args.task,
+                gate_id=args.gate_id,
+                decision=GateDecision(args.decision),
                 source_root_id=args.source_root_id,
                 source_post_id=args.source_post_id,
                 message=stdin.read(),

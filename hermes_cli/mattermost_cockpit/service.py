@@ -11,9 +11,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .client import MattermostClient
-from .contracts import Lifecycle, MattermostCockpitContracts, TERMINAL_LIFECYCLES, validate_task_id
+from .contracts import (
+    CLEANUP_PENDING_STATE,
+    GateDecision,
+    Lifecycle,
+    MattermostCockpitContracts,
+    TERMINAL_LIFECYCLES,
+    validate_task_id,
+)
 from .helpers import HelperBridge
-from .models import MattermostCockpitAuditEvent, MattermostCockpitTask, utc_now
+from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, utc_now
 from .store import MattermostCockpitStore
 
 _MAX_RELAY_CHARS = 3500
@@ -37,6 +44,11 @@ class UnitController:
 
     def stop(self, task_id: str) -> None:
         self._call("stop", task_id)
+
+    def is_active(self, task_id: str) -> bool:
+        command = ["systemctl", "--user", "is-active", "--quiet", self.unit_name(task_id)]
+        completed = self._run(command, capture_output=True, text=True, timeout=30, check=False)
+        return completed.returncode == 0
 
     def _call(self, action: str, task_id: str) -> None:
         command = ["systemctl", "--user", action, self.unit_name(task_id)]
@@ -109,54 +121,119 @@ class CockpitService:
             dedupe_key=dedupe_key,
         )
         task = self.store.create_task(requested)
+        if task.lifecycle in TERMINAL_LIFECYCLES or task.cleanup_state == CLEANUP_PENDING_STATE:
+            raise ValueError("task cannot be reopened")
         kickoff = self._kickoff_message(task.task_id, task.title, handoff)
-        if task.execution_root_id is None:
-            execution_post = self._find_or_create_execution_root(task, kickoff)
-            permalink = f"{self.base_url}/{self.team_name}/pl/{execution_post['id']}"
-            task = self.store.bind_execution(
-                task.task_id,
-                execution_root_id=str(execution_post["id"]),
-                execution_permalink=permalink,
-            )
-        else:
-            execution_post = self._validate_execution_post(
-                self.owner_client.get_post(task.execution_root_id),
-                expected_message=kickoff,
-            )
+        try:
+            if task.execution_root_id is None:
+                execution_post = self._find_or_create_execution_root(task, kickoff)
+                permalink = f"{self.base_url}/{self.team_name}/pl/{execution_post['id']}"
+                task = self.store.attach_execution(
+                    task.task_id,
+                    expected_version=task.version,
+                    execution_root_id=str(execution_post["id"]),
+                    execution_permalink=permalink,
+                )
+            else:
+                execution_post = self._validate_execution_post(
+                    self.owner_client.get_post(task.execution_root_id),
+                    expected_message=kickoff,
+                )
 
-        self.owner_client.set_thread_following(
-            user_id=self.contracts.owner_author_id,
-            team_id=self.contracts.team_id,
-            thread_id=str(execution_post["id"]),
-            following=True,
+            if not self.owner_client.is_thread_following(
+                user_id=self.contracts.owner_author_id,
+                team_id=self.contracts.team_id,
+                thread_id=str(execution_post["id"]),
+            ):
+                self.owner_client.set_thread_following(
+                    user_id=self.contracts.owner_author_id,
+                    team_id=self.contracts.team_id,
+                    thread_id=str(execution_post["id"]),
+                    following=True,
+                )
+            if not self.owner_client.is_thread_following(
+                user_id=self.contracts.owner_author_id,
+                team_id=self.contracts.team_id,
+                thread_id=str(execution_post["id"]),
+            ):
+                raise ValueError("owner follow readback mismatch")
+            self._ensure_source_relay(
+                task,
+                marker=f"[cockpit-link:{task.task_id}]",
+                message=(
+                    f"[cockpit-link:{task.task_id}]\n"
+                    f"Execução iniciada: [{task.title}]({task.execution_permalink})"
+                ),
+            )
+            self.units.start(task.task_id)
+            is_active = getattr(self.units, "is_active", None)
+            if callable(is_active) and not is_active(task.task_id):
+                raise ValueError("watcher unit start readback mismatch")
+            current = self._require_task(task.task_id)
+            if current.lifecycle is not Lifecycle.RUNNING or current.last_error is not None:
+                task = self.store.mark_running(task.task_id, expected_version=current.version)
+            else:
+                task = current
+            self._audit(task, "execution_started", {"execution_root_id": task.execution_root_id}, f"start:{task.task_id}")
+            return self._require_task(task.task_id)
+        except Exception as exc:
+            current = self._require_task(task.task_id)
+            if current.lifecycle not in TERMINAL_LIFECYCLES and current.cleanup_state is None:
+                blocked = self.store.record_blocked(
+                    task.task_id,
+                    expected_version=current.version,
+                    last_error=f"{exc.__class__.__name__}: {str(exc)[:800]}",
+                )
+                try:
+                    self._audit(blocked, "execution_start_blocked", {"error_type": exc.__class__.__name__}, f"start-blocked:{blocked.version}")
+                except Exception:
+                    pass
+            raise
+
+    def open_gate(self, task_id: str, *, gate_id: str, prompt: str) -> MattermostCockpitTask:
+        task = self._require_open_bound_task(task_id)
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("gate prompt must not be empty")
+        marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
+        message = f"{marker}\n{prompt}"
+        post = self._ensure_source_relay(task, marker=marker, message=message)
+        gate = self.store.create_gate(
+            MattermostCockpitGateRelay(
+                gate_id=gate_id,
+                task_id=task.task_id,
+                prompt_post_id=str(post["id"]),
+                prompt_body=message,
+                created_at=self.now().astimezone(UTC),
+                updated_at=self.now().astimezone(UTC),
+            )
         )
-        if not self.owner_client.is_thread_following(
-            user_id=self.contracts.owner_author_id,
-            team_id=self.contracts.team_id,
-            thread_id=str(execution_post["id"]),
-        ):
-            raise ValueError("owner follow readback mismatch")
-        self._ensure_source_relay(
-            task,
-            marker=f"[cockpit-link:{task.task_id}]",
-            message=(
-                f"[cockpit-link:{task.task_id}]\n"
-                f"Execução iniciada: [{task.title}]({task.execution_permalink})"
-            ),
-        )
-        self.units.start(task.task_id)
-        self._audit(task, "execution_started", {"execution_root_id": task.execution_root_id}, f"start:{task.task_id}")
-        return self._require_task(task.task_id)
+        if not gate.active:
+            raise ValueError("gate is already resolved")
+        current = self._require_task(task.task_id)
+        if current.lifecycle is not Lifecycle.WAITING_OWNER:
+            current = self.store.transition(
+                task.task_id,
+                expected_version=current.version,
+                lifecycle=Lifecycle.WAITING_OWNER,
+            )
+        self._audit(current, "owner_gate_opened", {"gate_id": gate_id, "prompt_post_id": gate.prompt_post_id}, f"gate:{gate_id}")
+        return current
 
     def resume_owner_message(
         self,
         task_id: str,
         *,
+        gate_id: str,
+        decision: GateDecision,
         source_root_id: str,
         source_post_id: str,
         message: str,
     ) -> MattermostCockpitTask:
         task = self._require_open_bound_task(task_id)
+        gate = self.store.get_gate(gate_id)
+        if gate is None or gate.task_id != task.task_id:
+            raise ValueError("active gate mismatch")
         if source_root_id != task.source_root_id:
             raise ValueError("source root mismatch")
         source = self.bot_client.get_post(source_post_id)
@@ -167,14 +244,40 @@ class CockpitService:
             raise ValueError("source channel mismatch")
         if source.get("user_id") != task.owner_author_id:
             raise ValueError("source author mismatch")
-        if str(source.get("message") or "").strip() != message.strip():
+        source_body = message.strip()
+        if str(source.get("message") or "").strip() != source_body:
             raise ValueError("owner decision body mismatch")
+        prompt_post = self._validate_bot_reply(
+            self.bot_client.get_post(gate.prompt_post_id),
+            task,
+            expected_message=gate.prompt_body,
+        )
+        if int(source.get("create_at") or 0) < int(prompt_post.get("create_at") or 0):
+            raise ValueError("owner decision predates active gate")
 
-        dedupe = f"owner-decision:{source_post_id}"
-        if any(event.dedupe_key == dedupe for event in self.store.list_audit_events(task_id)):
-            return task
+        destination_body = f"[cockpit-decision:{gate_id}:{decision.value}]\n{source_body}"
+        if not gate.active:
+            if (
+                gate.decision is not decision
+                or gate.source_owner_post_id != source_post_id
+                or gate.source_body != source_body
+                or gate.destination_body != destination_body
+                or not gate.destination_post_id
+            ):
+                raise ValueError("resolved gate replay mismatch")
+            self._validate_owner_reply(
+                self.owner_client.get_post(gate.destination_post_id),
+                task,
+                expected_message=destination_body,
+            )
+            current = self._require_task(task_id)
+            if current.lifecycle is Lifecycle.WAITING_OWNER:
+                current = self.store.mark_running(task_id, expected_version=current.version)
+            return current
+        if task.lifecycle is not Lifecycle.WAITING_OWNER:
+            raise ValueError("task is not waiting on this gate")
         result = self.bridge.post_owner(
-            message,
+            destination_body,
             timeout=30,
             team=self.team_name,
             channel=self.executions_channel_name,
@@ -182,14 +285,35 @@ class CockpitService:
         )
         if not result.post_id:
             raise ValueError("owner helper returned no post id")
-        destination = self._validate_owner_reply(self.owner_client.get_post(result.post_id), task)
-        self._audit(
+        destination = self._validate_owner_reply(
+            self.owner_client.get_post(result.post_id),
             task,
-            "owner_decision_relayed",
-            {"source_post_id": source_post_id, "destination_post_id": destination["id"]},
-            dedupe,
+            expected_message=destination_body,
         )
-        return self._require_task(task_id)
+        resolved = self.store.resolve_gate(
+            gate_id,
+            task_id=task.task_id,
+            decision=decision,
+            source_owner_post_id=source_post_id,
+            source_body=source_body,
+            destination_post_id=str(destination["id"]),
+            destination_body=destination_body,
+        )
+        current = self._require_task(task_id)
+        if current.lifecycle is Lifecycle.WAITING_OWNER:
+            current = self.store.mark_running(task_id, expected_version=current.version)
+        self._audit(
+            current,
+            "owner_decision_relayed",
+            {
+                "gate_id": gate_id,
+                "decision": decision.value,
+                "source_post_id": source_post_id,
+                "destination_post_id": resolved.destination_post_id,
+            },
+            f"owner-decision:{gate_id}:{source_post_id}",
+        )
+        return current
 
     def close(
         self,
@@ -214,61 +338,91 @@ class CockpitService:
             raise ValueError("evidence is too large")
         task = self._require_task(task_id)
         if task.lifecycle in TERMINAL_LIFECYCLES:
-            if task.lifecycle is not outcome:
-                raise ValueError("terminal outcome mismatch")
+            if (
+                task.lifecycle is not outcome
+                or task.result_summary != summary
+                or task.evidence != evidence
+                or task.last_error != last_error
+            ):
+                raise ValueError("terminal close replay mismatch")
             return task
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
-
-        if self.owner_client.is_thread_following(
-            user_id=task.owner_author_id,
-            team_id=task.team_id,
-            thread_id=task.execution_root_id,
-        ):
-            self.owner_client.set_thread_following(
+        execution_root_id = task.execution_root_id
+        if task.cleanup_state == CLEANUP_PENDING_STATE:
+            if task.pending_outcome is not outcome or task.result_summary != summary or task.evidence != evidence:
+                raise ValueError("cleanup retry intent mismatch")
+        else:
+            task = self.store.prepare_close(
+                task_id,
+                expected_version=task.version,
+                outcome=outcome,
+                result_summary=summary,
+                evidence=evidence,
+                last_error=last_error,
+            )
+        try:
+            if self.owner_client.is_thread_following(
                 user_id=task.owner_author_id,
                 team_id=task.team_id,
-                thread_id=task.execution_root_id,
-                following=False,
-            )
-        if self.owner_client.is_thread_following(
-            user_id=task.owner_author_id,
-            team_id=task.team_id,
-            thread_id=task.execution_root_id,
-        ):
-            raise ValueError("owner unfollow readback mismatch")
-        self.units.stop(task.task_id)
+                thread_id=execution_root_id,
+            ):
+                self.owner_client.set_thread_following(
+                    user_id=task.owner_author_id,
+                    team_id=task.team_id,
+                    thread_id=execution_root_id,
+                    following=False,
+                )
+            if self.owner_client.is_thread_following(
+                user_id=task.owner_author_id,
+                team_id=task.team_id,
+                thread_id=execution_root_id,
+            ):
+                raise ValueError("owner unfollow readback mismatch")
+            self.units.stop(task.task_id)
+            is_active = getattr(self.units, "is_active", None)
+            if callable(is_active) and is_active(task.task_id):
+                raise ValueError("watcher unit stop readback mismatch")
 
-        evidence_digest = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()[:16]
-        evidence_marker = f"[cockpit-evidence:{task.task_id}:{evidence_digest}]"
-        self._ensure_execution_relay(
-            task,
-            marker=evidence_marker,
-            message=f"{evidence_marker}\n**Evidência final:** `{evidence_json}`",
-        )
-        marker = f"[cockpit-final:{task.task_id}]"
-        validation = evidence.get("validation")
-        validation_text = (
-            validation.strip()[:_MAX_VALIDATION_CHARS]
-            if isinstance(validation, str) and validation.strip()
-            else f"{len(evidence)} item(ns) de evidência registrado(s)"
-        )
-        message = (
-            f"{marker}\n"
-            f"**Resultado:** {summary}\n"
-            f"**Validação:** {validation_text}\n"
-            f"Detalhes: [execução]({task.execution_permalink})"
-        )
-        final_post = self._ensure_source_relay(task, marker=marker, message=message)
-        self._validate_bot_reply(final_post, task)
+            evidence_digest = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()[:16]
+            evidence_marker = f"[cockpit-evidence:{task.task_id}:{evidence_digest}]"
+            self._ensure_execution_relay(
+                task,
+                marker=evidence_marker,
+                message=f"{evidence_marker}\n**Evidência final:** `{evidence_json}`",
+            )
+            marker = f"[cockpit-final:{task.task_id}]"
+            validation = evidence.get("validation")
+            validation_text = (
+                validation.strip()[:_MAX_VALIDATION_CHARS]
+                if isinstance(validation, str) and validation.strip()
+                else f"{len(evidence)} item(ns) de evidência registrado(s)"
+            )
+            message = (
+                f"{marker}\n"
+                f"**Resultado:** {summary}\n"
+                f"**Validação:** {validation_text}\n"
+                f"Detalhes: [execução]({task.execution_permalink})"
+            )
+            self._ensure_source_relay(task, marker=marker, message=message)
+        except Exception as exc:
+            current = self._require_task(task_id)
+            if current.cleanup_state == CLEANUP_PENDING_STATE:
+                current = self.store.record_cleanup_error(
+                    task_id,
+                    expected_version=current.version,
+                    last_error=f"{exc.__class__.__name__}: {str(exc)[:800]}",
+                )
+                try:
+                    self._audit(current, "cleanup_failed", {"error_type": exc.__class__.__name__}, f"cleanup-failed:{current.version}")
+                except Exception:
+                    pass
+            raise
         current = self._require_task(task_id)
-        closed = self.store.transition(
+        closed = self.store.complete_close(
             task_id,
             expected_version=current.version,
-            lifecycle=outcome,
-            result_summary=summary,
-            evidence=evidence,
-            last_error=last_error,
+            final_last_error=last_error,
         )
         self._audit(closed, "task_closed", {"outcome": outcome.value}, f"close:{task_id}")
         return closed
@@ -383,13 +537,21 @@ class CockpitService:
             raise ValueError("execution kickoff mismatch")
         return post
 
-    def _validate_owner_reply(self, post: dict[str, Any], task: MattermostCockpitTask) -> dict[str, Any]:
+    def _validate_owner_reply(
+        self,
+        post: dict[str, Any],
+        task: MattermostCockpitTask,
+        *,
+        expected_message: str,
+    ) -> dict[str, Any]:
         if post.get("channel_id") != task.executions_channel_id:
             raise ValueError("execution channel mismatch")
         if post.get("user_id") != task.owner_author_id:
             raise ValueError("execution author mismatch")
         if post.get("root_id") != task.execution_root_id:
             raise ValueError("execution root mismatch")
+        if str(post.get("message") or "") != expected_message:
+            raise ValueError("execution owner relay body mismatch")
         return post
 
     def _ensure_source_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
@@ -399,10 +561,10 @@ class CockpitService:
         if len(existing) > 1:
             raise ValueError("multiple source relays found for marker")
         if existing:
-            return self._validate_bot_reply(existing[0], task)
+            return self._validate_bot_reply(existing[0], task, expected_message=message)
         created = self.bot_client.create_post(task.source_channel_id, message, root_id=task.source_root_id)
         readback = self.bot_client.get_post(str(created.get("id") or ""))
-        return self._validate_bot_reply(readback, task)
+        return self._validate_bot_reply(readback, task, expected_message=message)
 
     def _ensure_execution_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
         if not task.execution_root_id:
@@ -413,31 +575,47 @@ class CockpitService:
         if len(existing) > 1:
             raise ValueError("multiple execution relays found for marker")
         if existing:
-            return self._validate_execution_bot_reply(existing[0], task)
+            return self._validate_execution_bot_reply(existing[0], task, expected_message=message)
         created = self.bot_client.create_post(
             task.executions_channel_id,
             message,
             root_id=task.execution_root_id,
         )
         readback = self.bot_client.get_post(str(created.get("id") or ""))
-        return self._validate_execution_bot_reply(readback, task)
+        return self._validate_execution_bot_reply(readback, task, expected_message=message)
 
-    def _validate_execution_bot_reply(self, post: dict[str, Any], task: MattermostCockpitTask) -> dict[str, Any]:
+    def _validate_execution_bot_reply(
+        self,
+        post: dict[str, Any],
+        task: MattermostCockpitTask,
+        *,
+        expected_message: str,
+    ) -> dict[str, Any]:
         if post.get("channel_id") != task.executions_channel_id:
             raise ValueError("execution relay channel mismatch")
         if post.get("root_id") != task.execution_root_id:
             raise ValueError("execution relay root mismatch")
         if post.get("user_id") != task.watcher_user_id:
             raise ValueError("execution relay author mismatch")
+        if str(post.get("message") or "") != expected_message:
+            raise ValueError("execution relay body mismatch")
         return post
 
-    def _validate_bot_reply(self, post: dict[str, Any], task: MattermostCockpitTask) -> dict[str, Any]:
+    def _validate_bot_reply(
+        self,
+        post: dict[str, Any],
+        task: MattermostCockpitTask,
+        *,
+        expected_message: str,
+    ) -> dict[str, Any]:
         if post.get("channel_id") != task.source_channel_id:
             raise ValueError("relay channel mismatch")
         if post.get("root_id") != task.source_root_id:
             raise ValueError("relay root mismatch")
         if post.get("user_id") != task.watcher_user_id:
             raise ValueError("relay author mismatch")
+        if str(post.get("message") or "") != expected_message:
+            raise ValueError("relay body mismatch")
         return post
 
     def _kickoff_message(self, task_id: str, title: str, handoff: str) -> str:
@@ -476,6 +654,7 @@ class CockpitService:
     def _task_json(task: MattermostCockpitTask) -> dict[str, Any]:
         data = asdict(task)
         data["lifecycle"] = task.lifecycle.value
+        data["pending_outcome"] = task.pending_outcome.value if task.pending_outcome is not None else None
         for key in ("created_at", "updated_at", "closed_at", "watcher_heartbeat_at"):
             value = data[key]
             data[key] = value.isoformat() if value is not None else None

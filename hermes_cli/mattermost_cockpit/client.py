@@ -108,18 +108,18 @@ class MattermostClient:
         method = "PUT" if following else "DELETE"
         return self._request_json_object(
             method,
-            f"/api/v4/users/{user_id}/teams/{team_id}/threads/{thread_id}/following",
+            f"/api/v4/users/me/teams/{team_id}/threads/{thread_id}/following",
         )
 
-    def get_user_thread(self, *, user_id: str, team_id: str, thread_id: str) -> dict[str, Any]:
+    def get_thread_following(self, *, team_id: str, thread_id: str) -> dict[str, Any]:
         return self._request_json_object(
             "GET",
-            f"/api/v4/users/{user_id}/teams/{team_id}/threads/{thread_id}",
+            f"/api/v4/users/me/teams/{team_id}/threads/{thread_id}/following",
         )
 
     def is_thread_following(self, *, user_id: str, team_id: str, thread_id: str) -> bool:
         try:
-            self.get_user_thread(user_id=user_id, team_id=team_id, thread_id=thread_id)
+            self.get_thread_following(team_id=team_id, thread_id=thread_id)
         except MattermostAPIError as exc:
             if exc.status_code == 404:
                 return False

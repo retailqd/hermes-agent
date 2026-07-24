@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.mattermost_cockpit.contracts import Lifecycle, MattermostCockpitContracts
+from hermes_cli.mattermost_cockpit.contracts import GateDecision, Lifecycle, MattermostCockpitContracts
 from hermes_cli.mattermost_cockpit.service import CockpitService
 from hermes_cli.mattermost_cockpit.store import MattermostCockpitStore
 
@@ -242,6 +244,97 @@ def test_create_fails_closed_on_wrong_source_author(rig):
     assert bridge.posts == []
 
 
+def test_create_persists_recoverable_blocked_state_on_tampered_source_marker(rig):
+    service, store, bot, _, _, _, _ = rig
+    marker_post = bot.create_post(
+        MAIN,
+        "[cockpit-link:task-tampered]\nWRONG",
+        root_id=SOURCE_ROOT,
+    )
+    with pytest.raises(ValueError, match="relay body mismatch"):
+        service.create(
+            task_id="task-tampered",
+            title="Tampered",
+            handoff="handoff",
+            source_channel_id=MAIN,
+            source_root_id=SOURCE_ROOT,
+            source_post_id=SOURCE_POST,
+            dedupe_key="source:tampered",
+        )
+    blocked = store.get_task("task-tampered")
+    assert blocked.lifecycle is Lifecycle.BLOCKED
+    assert blocked.execution_root_id
+    assert "relay body mismatch" in (blocked.last_error or "")
+
+    marker_post["message"] = (
+        "[cockpit-link:task-tampered]\n"
+        f"Execução iniciada: [Tampered]({blocked.execution_permalink})"
+    )
+    resumed = service.create(
+        task_id="task-tampered",
+        title="Tampered",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:tampered",
+    )
+    assert resumed.lifecycle is Lifecycle.RUNNING
+    assert resumed.last_error is None
+
+
+def test_close_rejects_tampered_existing_evidence_marker(rig):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-evidence-tampered",
+        title="Evidence tampered",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:evidence-tampered",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    evidence = {"tests": "5 passed"}
+    encoded = json.dumps(evidence, sort_keys=True, ensure_ascii=False)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()[:16]
+    bot.create_post(
+        EXEC,
+        f"[cockpit-evidence:{task.task_id}:{digest}]\nWRONG",
+        root_id=task.execution_root_id,
+    )
+    with pytest.raises(ValueError, match="execution relay body mismatch"):
+        service.close(task.task_id, outcome=Lifecycle.SUCCEEDED, summary="done", evidence=evidence)
+    pending = store.get_task(task.task_id)
+    assert pending.lifecycle is Lifecycle.BLOCKED
+    assert pending.cleanup_state == "cleanup_pending"
+
+
+def test_close_rejects_tampered_existing_final_marker(rig):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-final-tampered",
+        title="Final tampered",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:final-tampered",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    bot.create_post(MAIN, f"[cockpit-final:{task.task_id}]\nWRONG", root_id=SOURCE_ROOT)
+    with pytest.raises(ValueError, match="relay body mismatch"):
+        service.close(
+            task.task_id,
+            outcome=Lifecycle.SUCCEEDED,
+            summary="done",
+            evidence={"validation": "passed"},
+        )
+    pending = store.get_task(task.task_id)
+    assert pending.lifecycle is Lifecycle.BLOCKED
+    assert pending.cleanup_state == "cleanup_pending"
+
+
 def test_resume_owner_decision_requires_exact_source_binding_and_dedupes(rig):
     service, _, bot, owner, bridge, _, _ = rig
     task = service.create(
@@ -253,19 +346,22 @@ def test_resume_owner_decision_requires_exact_source_binding_and_dedupes(rig):
         source_post_id=SOURCE_POST,
         dedupe_key="source:decision",
     )
+    service.open_gate(task.task_id, gate_id="gate-one", prompt="Pode aprovar?")
     decision = {
         "id": DECISION_POST,
         "channel_id": MAIN,
         "user_id": OWNER,
         "root_id": SOURCE_ROOT,
         "message": "aprovado",
-        "create_at": 40,
+        "create_at": 4000,
     }
     for client in (bot, owner):
         client.posts[DECISION_POST] = dict(decision)
     with pytest.raises(ValueError, match="source root mismatch"):
         service.resume_owner_message(
             task.task_id,
+            gate_id="gate-one",
+            decision=GateDecision.APPROVE,
             source_root_id="z" * 26,
             source_post_id=DECISION_POST,
             message="aprovado",
@@ -273,18 +369,23 @@ def test_resume_owner_decision_requires_exact_source_binding_and_dedupes(rig):
     before = len(bridge.posts)
     service.resume_owner_message(
         task.task_id,
+        gate_id="gate-one",
+        decision=GateDecision.APPROVE,
         source_root_id=SOURCE_ROOT,
         source_post_id=DECISION_POST,
         message="aprovado",
     )
     service.resume_owner_message(
         task.task_id,
+        gate_id="gate-one",
+        decision=GateDecision.APPROVE,
         source_root_id=SOURCE_ROOT,
         source_post_id=DECISION_POST,
         message="aprovado",
     )
     assert len(bridge.posts) == before + 1
     assert bridge.posts[-1][1] == task.execution_root_id
+    assert bridge.posts[-1][0].startswith("[cockpit-decision:gate-one:approve]")
 
 
 def test_close_success_requires_evidence_then_relays_unfollows_stops_and_terminalizes(rig):
@@ -374,11 +475,26 @@ def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
             evidence={"tests": "5 passed"},
         )
 
-    assert store.get_task(task.task_id).lifecycle is Lifecycle.RUNNING
+    pending = store.get_task(task.task_id)
+    assert pending.lifecycle is Lifecycle.BLOCKED
+    assert pending.cleanup_state == "cleanup_pending"
+    assert pending.pending_outcome is Lifecycle.SUCCEEDED
+    assert "unfollow failed" in (pending.last_error or "")
     assert not any(
         "[cockpit-final:task-close-cleanup-fail]" in post["message"]
         for post in bot.posts.values()
     )
+
+    owner.fail_unfollow = False
+    closed = service.close(
+        task.task_id,
+        outcome=Lifecycle.SUCCEEDED,
+        summary="done",
+        evidence={"tests": "5 passed"},
+    )
+    assert closed.lifecycle is Lifecycle.SUCCEEDED
+    assert closed.cleanup_state is None
+    assert closed.pending_outcome is None
 
 
 def test_watch_once_exits_without_helper_call_for_terminal_task(rig):
