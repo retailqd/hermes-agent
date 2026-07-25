@@ -10,8 +10,8 @@ Activate the reviewed Mattermost Cockpit readability change without losing unrel
 
 ## Immutable release inputs
 
-- Feature candidate: `df45752d36b7ad9f2b853fab26f07a5b4108fdac`
-- Candidate integrated over the currently active checkout: `1f20a92d7c06342bb924bca263a7cbf4a6c6f61d`
+- Feature candidate: `da830ab52b78447bc3d7ddf6eca0e5d6083aa869`
+- Candidate integrated over the currently active checkout: `b5992f6ce05e7e7ab09c1131d3d2e85b987eaf9d`
 - Required active checkout before activation: `5db8c397c6de6274d1b92ce4f184ebbe2002fe7f`
 - Code rollback target: `5db8c397c6de6274d1b92ce4f184ebbe2002fe7f`
 - Protected policy patch: `/home/pht2/mc-semantic-local-safe/docs/superpowers/activation/2026-07-24-cockpit-main-readability-policy.patch`
@@ -57,7 +57,7 @@ Run read-only checks:
 ```bash
 set -euo pipefail
 LIVE=/home/pht2/.hermes/hermes-agent
-CANDIDATE=1f20a92d7c06342bb924bca263a7cbf4a6c6f61d
+CANDIDATE=b5992f6ce05e7e7ab09c1131d3d2e85b987eaf9d
 ROLLBACK=5db8c397c6de6274d1b92ce4f184ebbe2002fe7f
 PATCH=/home/pht2/mc-semantic-local-safe/docs/superpowers/activation/2026-07-24-cockpit-main-readability-policy.patch
 
@@ -82,7 +82,7 @@ uvx pyright hermes_cli/mattermost_cockpit
 
 Expected baseline for the pinned candidate:
 
-- `152 passed`
+- `154 passed`
 - compile exit code `0`
 - pyright `0 errors, 0 warnings, 0 informations`
 
@@ -175,7 +175,7 @@ The approved `activate.sh` must:
 
    ```bash
    git -C /home/pht2/.hermes/hermes-agent merge --ff-only \
-     1f20a92d7c06342bb924bca263a7cbf4a6c6f61d
+     b5992f6ce05e7e7ab09c1131d3d2e85b987eaf9d
    ```
 
 8. verify the resulting exact SHA and clean checkout;
