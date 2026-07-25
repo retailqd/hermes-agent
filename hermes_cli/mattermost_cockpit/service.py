@@ -881,8 +881,28 @@ class CockpitService:
             root_id=task.source_root_id,
             props=self._source_relay_props(marker),
         )
-        readback = self.bot_client.get_post(str(created.get("id") or ""))
-        return self._validate_source_relay_post(readback, task, marker=marker, message=message)
+        created_id = str(created.get("id") or "")
+        readback = self.bot_client.get_post(created_id)
+        validated = self._validate_source_relay_post(
+            readback,
+            task,
+            marker=marker,
+            message=message,
+        )
+        if expected_version is not None:
+            current = self._require_task(task.task_id)
+            if (
+                current.lifecycle in TERMINAL_LIFECYCLES
+                or current.cleanup_state == CLEANUP_PENDING_STATE
+                or current.version != expected_version
+            ):
+                self.bot_client.delete_post(created_id)
+                posts = self.bot_client.get_thread(task.source_root_id).get("posts") or {}
+                lingering = posts.get(created_id)
+                if lingering is not None and not int(lingering.get("delete_at") or 0):
+                    raise ValueError("late source relay deletion readback failed")
+                return None
+        return validated
 
     def _validate_source_relay_post(
         self,

@@ -95,6 +95,9 @@ class MattermostClient:
             payload["props"] = dict(props)
         return self._request_json_object("POST", "/api/v4/posts", payload)
 
+    def delete_post(self, post_id: str) -> dict[str, Any]:
+        return self._request_json_object("DELETE", f"/api/v4/posts/{post_id}")
+
     def update_post(self, post_id: str, message: str) -> dict[str, Any]:
         return self._request_json_object(
             "PUT",
