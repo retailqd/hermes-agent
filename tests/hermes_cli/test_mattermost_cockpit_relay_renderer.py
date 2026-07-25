@@ -82,16 +82,17 @@ Autorizar B.
         render_gate(prompt, PERMALINK)
 
 
-def test_render_closed_preserves_terminal_result_and_validation() -> None:
+def test_render_closed_preserves_terminal_result_without_technical_validation() -> None:
     relay = render_closed(
         outcome="SUCCEEDED",
+        requested="Converter a nota fiscal para o formato solicitado.",
         summary="Conversão aplicada na NF 000119.",
-        validation="PDF gerado e conferido no pedido correto.",
         permalink=PERMALINK,
     )
     assert relay.kind is RelayKind.SUCCEEDED
-    assert relay.body.startswith("**Concluído**\nConversão aplicada")
-    assert "**Validado**\nPDF gerado e conferido" in relay.body
+    assert relay.body.startswith("**Concluído**")
+    assert "O que foi feito e o resultado atual: Conversão aplicada" in relay.body
+    assert "**Validado**" not in relay.body
     assert_owner_contract(relay.body)
 
 
@@ -105,8 +106,8 @@ def test_render_closed_preserves_terminal_result_and_validation() -> None:
 def test_render_closed_failure_variants_are_pt_br(outcome, heading, kind) -> None:
     relay = render_closed(
         outcome=outcome,
+        requested="Alterar o documento conforme solicitado.",
         summary="A execução terminou sem aplicar a alteração.",
-        validation=None,
         permalink=PERMALINK,
     )
     assert relay.kind is kind
@@ -114,6 +115,69 @@ def test_render_closed_failure_variants_are_pt_br(outcome, heading, kind) -> Non
     assert "Failed" not in relay.body
     assert "Cancelled" not in relay.body
     assert_owner_contract(relay.body)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "heading", "pending"),
+    [
+        ("SUCCEEDED", "**Concluído**", "Nenhuma pendência"),
+        (
+            "FAILED",
+            "**Interrompido**",
+            "O pedido não foi concluído: A conversão não foi aplicada porque o documento estava incompleto.",
+        ),
+        (
+            "CANCELLED",
+            "**Interrompido**",
+            "O pedido não foi concluído: A execução foi cancelada antes de alterar o documento.",
+        ),
+    ],
+)
+def test_render_human_close_has_required_order_and_single_permalink(outcome, heading, pending) -> None:
+    summary = {
+        "SUCCEEDED": "A conversão foi aplicada e o documento está pronto para uso.",
+        "FAILED": "A conversão não foi aplicada porque o documento estava incompleto.",
+        "CANCELLED": "A execução foi cancelada antes de alterar o documento.",
+    }[outcome]
+    relay = render_closed(
+        outcome=outcome,
+        requested="Converter a nota fiscal para o formato solicitado.",
+        summary=summary,
+        permalink=PERMALINK,
+    )
+
+    assert relay.body.startswith(heading)
+    assert "**Linguagem leiga**" in relay.body
+    assert "Você pediu: Converter a nota fiscal" in relay.body
+    assert "O que foi feito e o resultado atual:" in relay.body
+    assert "**Pendências**" in relay.body
+    assert pending in relay.body
+    assert "Esta execução foi encerrada." in relay.body
+    assert relay.body.count(PERMALINK) == 1
+    assert relay.body.endswith(f"[Abrir detalhes técnicos]({PERMALINK})")
+    assert relay.body.index("**Linguagem leiga**") < relay.body.index("**Pendências**")
+    assert relay.body.index("**Pendências**") < relay.body.index("Esta execução foi encerrada.")
+    assert relay.body.index("Esta execução foi encerrada.") < relay.body.index("[Abrir detalhes técnicos]")
+
+
+@pytest.mark.parametrize(
+    "unsafe_summary",
+    [
+        "Aplicado no commit abcdef1234567.",
+        "Gateway reiniciado após o deploy.",
+        "task_id task-human-succeeded concluído.",
+        "gate-release aprovado.",
+        "$ docker compose up",
+    ],
+)
+def test_render_human_close_rejects_internal_or_technical_summary(unsafe_summary: str) -> None:
+    with pytest.raises(ValueError):
+        render_closed(
+            outcome="SUCCEEDED",
+            requested="Converter a nota fiscal para o formato solicitado.",
+            summary=unsafe_summary,
+            permalink=PERMALINK,
+        )
 
 
 def test_semantic_update_accepts_clean_business_state_update() -> None:
@@ -148,11 +212,12 @@ def test_semantic_update_rejects_extra_metadata_links_and_headings(unsafe: str) 
 def test_long_body_is_bounded_without_breaking_the_link() -> None:
     relay = render_closed(
         outcome="SUCCEEDED",
+        requested="Converter o documento solicitado. " * 300,
         summary="Resultado validado. " * 300,
-        validation="Fluxo conferido. " * 300,
         permalink=PERMALINK,
     )
     assert len(relay.body) <= MAX_RELAY_CHARS
+    assert "Esta execução foi encerrada." in relay.body
     assert relay.body.endswith(f"[Abrir detalhes técnicos]({PERMALINK})")
 
 
@@ -195,31 +260,34 @@ def test_render_gate_handles_no_whitespace_sections_without_falling_back() -> No
     assert relay.body.count("**") % 2 == 0
 
 
-def test_render_closed_keeps_validation_section_when_summary_is_long() -> None:
+def test_render_closed_keeps_mandatory_sections_when_summary_is_long() -> None:
     relay = render_closed(
         outcome="SUCCEEDED",
+        requested="Converter o documento para o formato solicitado.",
         summary="Resultado validado. " * 120,
-        validation="PDF gerado e conferido no pedido correto. " * 40,
         permalink=PERMALINK,
     )
     assert relay.body.startswith("**Concluído**")
-    assert "**Validado**" in relay.body
-    assert "PDF gerado e conferido" in relay.body
+    assert "**Linguagem leiga**" in relay.body
+    assert "**Pendências**" in relay.body
+    assert "Esta execução foi encerrada." in relay.body
     assert len(relay.body) <= MAX_RELAY_CHARS
 
 
-def test_render_closed_handles_no_whitespace_validation_without_falling_back() -> None:
+def test_render_closed_handles_no_whitespace_human_fields_without_falling_back() -> None:
     relay = render_closed(
         outcome="SUCCEEDED",
+        requested="C" * 2500,
         summary="C" * 2500,
-        validation="D" * 2500,
         permalink=PERMALINK,
     )
     assert relay.kind is RelayKind.SUCCEEDED
     assert len(relay.body) <= MAX_RELAY_CHARS
     assert relay.body.count("[Abrir detalhes técnicos]") == 1
     assert "**Concluído**" in relay.body
-    assert "**Validado**" in relay.body
+    assert "**Linguagem leiga**" in relay.body
+    assert "**Pendências**" in relay.body
+    assert "Esta execução foi encerrada." in relay.body
     assert relay.body.count("**") % 2 == 0
 
 

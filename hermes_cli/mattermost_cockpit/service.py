@@ -454,16 +454,10 @@ class CockpitService:
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
         execution_root_id = task.execution_root_id
-        validation_value = evidence.get("validation")
-        validation = (
-            validation_value.strip()
-            if isinstance(validation_value, str) and validation_value.strip()
-            else None
-        )
         relay = render_closed(
             outcome=outcome.value,
+            requested=task.title,
             summary=summary,
-            validation=validation,
             permalink=self._permalink(execution_root_id),
         )
         if task.cleanup_state == CLEANUP_PENDING_STATE:
@@ -497,17 +491,10 @@ class CockpitService:
                 message=f"{evidence_marker}\n**Evidência final:** `{evidence_json}`",
             )
             marker = f"[cockpit-final:{task.task_id}]"
-            legacy_validation_text = validation or f"{len(evidence)} item(ns) de evidência registrado(s)"
-            legacy_message = (
-                f"**Resultado:** {summary}\n"
-                f"**Validação:** {legacy_validation_text}\n"
-                f"Detalhes: [execução]({task.execution_permalink})"
-            )
             self._ensure_source_relay(
                 task,
                 marker=marker,
                 message=relay.body,
-                legacy_relays=((marker, legacy_message),),
             )
         except Exception as exc:
             current = self._require_task(task_id)

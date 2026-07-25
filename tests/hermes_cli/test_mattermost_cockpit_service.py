@@ -152,6 +152,11 @@ class FakeUnits:
         self.stopped.append(task_id)
         self.events.append("unit:stop")
 
+    def is_active(self, task_id: str) -> bool:
+        active = task_id in self.started and task_id not in self.stopped
+        self.events.append(f"unit:is-active:{str(active).lower()}")
+        return active
+
 
 def source_posts(client: FakeClient) -> list[dict]:
     return [
@@ -952,7 +957,7 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
     service, store, bot, owner, _, units, events = rig
     task = service.create(
         task_id="task-close",
-        title="Close",
+        title="Converter a nota fiscal para o formato solicitado.",
         handoff="handoff",
         source_channel_id=MAIN,
         source_root_id=SOURCE_ROOT,
@@ -990,13 +995,12 @@ def test_close_success_requires_evidence_then_relays_unfollows_stops_and_termina
         if "[cockpit-evidence:task-close:" in p["message"]
     )
     assert source_final["channel_id"] == MAIN
-    assert source_final["message"].startswith(
-        "**Concluído**\nConversão aplicada na NF 000119."
-    )
-    assert (
-        "**Validado**\nPDF gerado e conferido no pedido correto."
-        in source_final["message"]
-    )
+    assert source_final["message"].startswith("**Concluído**")
+    assert "**Linguagem leiga**" in source_final["message"]
+    assert "O que foi feito e o resultado atual: Conversão aplicada" in source_final["message"]
+    assert "**Pendências**\nNenhuma pendência" in source_final["message"]
+    assert "Esta execução foi encerrada." in source_final["message"]
+    assert "**Validado**" not in source_final["message"]
     assert "[cockpit-final:" not in source_final["message"]
     assert "5 passed" not in source_final["message"]
     assert execution_evidence["channel_id"] == EXEC
@@ -1009,7 +1013,7 @@ def test_close_interrupted_outcomes_hide_raw_last_error(rig, outcome):
     service, _, bot, owner, _, units, events = rig
     task = service.create(
         task_id=f"task-{outcome.value.lower()}",
-        title="Interrupted close",
+        title="Alterar o documento conforme solicitado.",
         handoff="handoff",
         source_channel_id=MAIN,
         source_root_id=SOURCE_ROOT,
@@ -1034,13 +1038,150 @@ def test_close_interrupted_outcomes_hide_raw_last_error(rig, outcome):
         == f"[cockpit-final:{task.task_id}]"
     )
     assert closed.lifecycle is outcome
-    assert final_post["message"].startswith(
-        "**Interrompido**\nExecução encerrada com segurança."
-    )
+    assert final_post["message"].startswith("**Interrompido**")
+    assert "**Linguagem leiga**" in final_post["message"]
+    assert "O que foi feito e o resultado atual: Execução encerrada com segurança." in final_post["message"]
+    assert "**Pendências**\nO pedido não foi concluído:" in final_post["message"]
+    assert "Esta execução foi encerrada." in final_post["message"]
     assert "RAW INTERNAL ERROR" not in final_post["message"]
     assert "[cockpit-final:" not in final_post["message"]
     assert events.index("follow:False") < events.index("unit:stop")
     assert units.stopped == [task.task_id]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "summary", "expected_pending"),
+    [
+        (
+            Lifecycle.SUCCEEDED,
+            "A conversão foi aplicada e o documento está pronto para uso.",
+            "Nenhuma pendência",
+        ),
+        (
+            Lifecycle.FAILED,
+            "A conversão não foi aplicada porque o documento estava incompleto.",
+            "O pedido não foi concluído: A conversão não foi aplicada porque o documento estava incompleto.",
+        ),
+        (
+            Lifecycle.CANCELLED,
+            "A execução foi cancelada antes de alterar o documento.",
+            "O pedido não foi concluído: A execução foi cancelada antes de alterar o documento.",
+        ),
+    ],
+)
+def test_close_publishes_one_human_terminal_post_after_cleanup_and_retry(
+    rig, outcome, summary, expected_pending
+):
+    service, _, bot, owner, _, units, events = rig
+    task = service.create(
+        task_id=f"task-human-{outcome.value.lower()}",
+        title="Converter a nota fiscal para o formato solicitado.",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=f"source:human-{outcome.value.lower()}",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    owner.following = True
+    evidence = {
+        "validation": "pytest 135 passed",
+        "technical": "HTTP 200 commit abcdef1234567",
+    }
+    last_error = "RAW INTERNAL ERROR 503 secret detail" if outcome is not Lifecycle.SUCCEEDED else None
+
+    first = service.close(
+        task.task_id,
+        outcome=outcome,
+        summary=summary,
+        evidence=evidence,
+        last_error=last_error,
+    )
+    second = service.close(
+        task.task_id,
+        outcome=outcome,
+        summary=summary,
+        evidence=evidence,
+        last_error=last_error,
+    )
+
+    assert first.lifecycle is second.lifecycle is outcome
+    final_posts = [
+        post
+        for post in source_posts(bot)
+        if post.get("props", {}).get("cockpit_relay_marker") == f"[cockpit-final:{task.task_id}]"
+    ]
+    assert len(final_posts) == 1
+    final_post = final_posts[0]
+    last_public = max(source_posts(bot), key=lambda post: int(post["create_at"]))
+    assert last_public["id"] == final_post["id"]
+    body = final_post["message"]
+    heading = "**Concluído**" if outcome is Lifecycle.SUCCEEDED else "**Interrompido**"
+    assert body.startswith(heading)
+    assert "**Linguagem leiga**" in body
+    assert "Você pediu: Converter a nota fiscal para o formato solicitado." in body
+    assert "O que foi feito e o resultado atual:" in body
+    assert "**Pendências**" in body
+    assert expected_pending in body
+    assert ("Nenhuma pendência" in body) is (outcome is Lifecycle.SUCCEEDED)
+    assert "Esta execução foi encerrada." in body
+    permalink = service._permalink(task.execution_root_id)
+    assert body.count(permalink) == 1
+    assert body.endswith(f"[Abrir detalhes técnicos]({permalink})")
+    assert body.index("**Linguagem leiga**") < body.index("**Pendências**")
+    assert body.index("**Pendências**") < body.index("Esta execução foi encerrada.")
+    assert body.index("Esta execução foi encerrada.") < body.index("[Abrir detalhes técnicos]")
+    for forbidden in ("pytest", "HTTP", "commit", "abcdef1234567", "RAW INTERNAL", "[cockpit"):
+        assert forbidden not in body
+
+    assert units.stopped == [task.task_id]
+    stop_index = events.index("unit:stop")
+    readback_index = events.index("unit:is-active:false")
+    final_post_index = max(index for index, event in enumerate(events) if event == f"post:{BOT}:{MAIN}")
+    assert stop_index < readback_index < final_post_index
+
+
+def test_close_retry_after_public_post_does_not_duplicate_human_close(rig, monkeypatch):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-human-retry",
+        title="Converter a nota fiscal para o formato solicitado.",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:human-retry",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    owner.following = True
+    original_complete_close = store.complete_close
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated persistence interruption")
+        return original_complete_close(*args, **kwargs)
+
+    monkeypatch.setattr(store, "complete_close", fail_once)
+    close_kwargs = {
+        "outcome": Lifecycle.SUCCEEDED,
+        "summary": "A conversão foi aplicada e o documento está pronto para uso.",
+        "evidence": {"validation": "technical evidence retained"},
+    }
+    with pytest.raises(RuntimeError, match="persistence interruption"):
+        service.close(task.task_id, **close_kwargs)
+    closed = service.close(task.task_id, **close_kwargs)
+
+    assert closed.lifecycle is Lifecycle.SUCCEEDED
+    final_posts = [
+        post
+        for post in source_posts(bot)
+        if post.get("props", {}).get("cockpit_relay_marker") == f"[cockpit-final:{task.task_id}]"
+    ]
+    assert len(final_posts) == 1
+    assert "Esta execução foi encerrada." in final_posts[0]["message"]
 
 
 def test_close_resumes_after_unfollow_already_completed(rig):
@@ -1303,13 +1444,18 @@ def test_watch_once_exits_without_helper_call_for_terminal_task(rig):
     service, _, _, _, bridge, _, _ = rig
     task = service.create(
         task_id="task-terminal",
-        title="Terminal",
+        title="Alterar o documento solicitado.",
         handoff="handoff",
         source_channel_id=MAIN,
         source_root_id=SOURCE_ROOT,
         source_post_id=SOURCE_POST,
         dedupe_key="source:terminal",
     )
-    service.close(task.task_id, outcome=Lifecycle.FAILED, summary="failed", evidence={"error": "x"})
+    service.close(
+        task.task_id,
+        outcome=Lifecycle.FAILED,
+        summary="A tarefa foi interrompida antes de terminar.",
+        evidence={"error": "x"},
+    )
     assert service.watch_once(task.task_id) is False
     assert bridge.watch_calls == 0

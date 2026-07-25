@@ -49,6 +49,14 @@ _VISIBLE_URL = re.compile(r"(?i)(?:https?://|\[[^\]]+\]\([^\)]+\))")
 _BOLD_HEADING = re.compile(r"(?m)^\*\*[^*\n]+\*\*\s*$")
 _ATX_HEADING = re.compile(r"(?m)^\s{0,3}#{1,6}\s+\S")
 _SECTION = re.compile(r"(?m)^\*\*(Bloqueado|Preciso de você)\*\*\s*$")
+_HUMAN_TECHNICAL = re.compile(
+    r"(?i)\b(?:commit|sha(?:-\d+)?|hash|pytest|ruff|watcher|systemd|gateway|"
+    r"stack trace|exit code|deploy|rollback|succeeded|failed|cancelled|task[_-]?id|"
+    r"post[_-]?id|root[_-]?id|thread[_-]?id)\b"
+)
+_HEX_HASH = re.compile(
+    r"(?i)\b(?=[a-f0-9]{7,64}\b)(?=[a-f0-9]*[a-f])(?=[a-f0-9]*\d)[a-f0-9]+\b"
+)
 
 
 class RelayKind(str, Enum):
@@ -106,6 +114,13 @@ def _plain(value: str, *, field: str) -> str:
     for pattern, reason in checks:
         if pattern.search(value):
             raise ValueError(f"{field} contains {reason}")
+    return value
+
+
+def _human_plain(value: str, *, field: str) -> str:
+    value = _plain(value, field=field)
+    if _HUMAN_TECHNICAL.search(value) or _HEX_HASH.search(value):
+        raise ValueError(f"{field} contains technical jargon")
     return value
 
 
@@ -173,6 +188,45 @@ def _bounded(sections: list[str], permalink: str) -> str:
     return body
 
 
+def _bounded_human_close(*, heading: str, lay_summary: str, pending: str, permalink: str) -> str:
+    link = f"[{_LINK_LABEL}]({_permalink(permalink)})"
+    closure = "Esta execução foi encerrada."
+    template = (
+        f"**{heading}**\n\n"
+        f"**Linguagem leiga**\n{lay_summary}\n\n"
+        f"**Pendências**\n{pending}\n\n"
+        f"{closure}\n\n{link}"
+    )
+    if len(template) <= MAX_RELAY_CHARS:
+        return template
+
+    fixed = len(template) - len(lay_summary) - len(pending)
+    budget = MAX_RELAY_CHARS - fixed
+    if budget < 2:
+        raise ValueError("execution permalink is too long for the owner relay contract")
+    if len(lay_summary) + len(pending) <= budget:
+        lay_budget = len(lay_summary)
+        pending_budget = len(pending)
+    elif len(pending) <= budget // 3:
+        pending_budget = len(pending)
+        lay_budget = budget - pending_budget
+    elif len(lay_summary) <= (budget * 2) // 3:
+        lay_budget = len(lay_summary)
+        pending_budget = budget - lay_budget
+    else:
+        lay_budget = (budget * 2) // 3
+        pending_budget = budget - lay_budget
+    bounded = (
+        f"**{heading}**\n\n"
+        f"**Linguagem leiga**\n{_truncate_text(lay_summary, lay_budget)}\n\n"
+        f"**Pendências**\n{_truncate_text(pending, pending_budget)}\n\n"
+        f"{closure}\n\n{link}"
+    )
+    if len(bounded) > MAX_RELAY_CHARS:
+        raise AssertionError("human close relay length invariant failed")
+    return bounded
+
+
 def _semantic_update(message: str) -> tuple[str, str] | None:
     lines = message.replace("\r", "\n").split("\n")
     for index, line in enumerate(lines):
@@ -234,9 +288,7 @@ def render_gate(prompt: str, permalink: str) -> RenderedRelay:
     return RenderedRelay(RelayKind.BLOCKED, body, requires_decision=True)
 
 
-def render_closed(
-    *, outcome: str, summary: str, validation: str | None, permalink: str
-) -> RenderedRelay:
+def render_closed(*, outcome: str, requested: str, summary: str, permalink: str) -> RenderedRelay:
     normalized = outcome.strip().upper()
     kind = {
         "SUCCEEDED": RelayKind.SUCCEEDED,
@@ -246,10 +298,24 @@ def render_closed(
     if kind is None:
         raise ValueError("unsupported close outcome")
     heading = "Concluído" if kind is RelayKind.SUCCEEDED else "Interrompido"
-    sections = [f"**{heading}**\n{_plain(summary, field='summary')}"]
-    if validation:
-        sections.append(f"**Validado**\n{_plain(validation, field='validation')}")
-    return RenderedRelay(kind, _bounded(sections, permalink))
+    request_text = _human_plain(requested, field="requested work")
+    summary_text = _human_plain(summary, field="result summary")
+    lay_summary = (
+        f"Você pediu: {request_text}\n"
+        f"O que foi feito e o resultado atual: {summary_text}"
+    )
+    pending = (
+        "Nenhuma pendência"
+        if kind is RelayKind.SUCCEEDED
+        else f"O pedido não foi concluído: {summary_text}"
+    )
+    body = _bounded_human_close(
+        heading=heading,
+        lay_summary=lay_summary,
+        pending=pending,
+        permalink=permalink,
+    )
+    return RenderedRelay(kind, body)
 
 
 def render_execution_update(message: str, permalink: str) -> RenderedRelay | None:
