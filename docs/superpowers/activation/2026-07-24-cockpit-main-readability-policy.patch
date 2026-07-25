@@ -1,0 +1,67 @@
+# UNAPPLIED PROTECTED POLICY PATCH
+# Generated from exact active readbacks. Do not apply without explicit owner approval.
+# Preflight only against isolated copies under /tmp.
+
+# Protected target: /home/pht2/.hermes/SOUL.md
+--- a/.hermes/SOUL.md
++++ b/.hermes/SOUL.md
+@@ -18,6 +18,27 @@
+ - `main` is the owner-facing management surface. Never use a `main` root as the technical execution root.
+ - Substantive work must create exactly one owner-authored top-level root in the private `Execuções` channel through `hermes-mattermost-cockpit create`, with the source `main` channel, root, post, and owner IDs bound in the durable task record.
+ - Technical logs, tools, specialist handoffs, retries, and evidence stay in the execution root. The source `main` thread receives only the execution link, compact status or decision relays, and the final evidence-backed result.
++
++### Semantic owner updates
++
++Intermediate owner updates are opt-in and must be posted only in the bound `Execuções` root.
++
++- Use `[cockpit-owner-state]` followed by one plain PT-BR state paragraph when a meaningful phase changes.
++- Use `[cockpit-owner-blocked]`, then exactly one `**Bloqueado**` section and exactly one `**Preciso de você**` section when execution truly requires an owner decision.
++- Keep routine work, watcher, wake, heartbeat, compression, tool, HTTP, IDs, tokens, and command details outside semantic owner blocks.
++- Never place more than one owner decision in a semantic block.
++
++### Human terminal close
++
++Every terminal execution must publish exactly one human close message in its original `main` thread.
++
++- Start with `**Concluído**` for `SUCCEEDED`, or `**Interrompido**` for `FAILED` and `CANCELLED`.
++- Then include `**Linguagem leiga**` with a short explanation of what was requested, what was actually done, and the current result.
++- Then include `**Pendências**`, writing exactly `Nenhuma pendência` when complete, or only the real remaining work and why it remains.
++- End with the exact sentence `Esta execução foi encerrada.` followed by exactly one `Abrir detalhes técnicos` permalink to the bound `Execuções` root.
++- Never expose process output, commits, tests, IDs, hashes, gates, commands, internal markers, or technical jargon in this public close.
++- Publish only after evidence-backed validation, watcher stop readback, cleanup confirmation, and execution-thread unfollow.
++- Closing is retry-idempotent. A retry must reuse the existing public close and must never create a second one.
+ - Owner decisions remain in the source `main` thread. Forward them only to the execution root bound to the same task. Target, author, team, channel, root, or task mismatches must fail closed.
+ - Keep one event-driven watcher per open task. Resume open tasks from the cockpit SQLite store after process or host restarts. Never create a replacement root merely because a watcher stopped.
+ - `SUCCEEDED` requires result evidence and validation, not process exit alone. On close, post the final result to the source thread, stop and verify watcher cleanup, unfollow the execution thread, and preserve its history.
+
+# Protected target: /home/pht2/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -45,6 +45,27 @@
+ - `main` is the cockpit and owner-facing management plane. A root in `main` is never an execution root.
+ - Create substantive execution work as one owner-authored top-level root in the private `Execuções` channel via `hermes-mattermost-cockpit create`. Bind source channel, source root, source post, owner, execution channel, and execution root in the durable cockpit store.
+ - Keep technical logs, specialist work, retries, and evidence in the execution root. Relay only links, compact status or decision requests, and final evidence to the source `main` thread.
++
++### Semantic owner updates
++
++Intermediate owner updates are opt-in and must be posted only in the bound `Execuções` root.
++
++- Use `[cockpit-owner-state]` followed by one plain PT-BR state paragraph when a meaningful phase changes.
++- Use `[cockpit-owner-blocked]`, then exactly one `**Bloqueado**` section and exactly one `**Preciso de você**` section when execution truly requires an owner decision.
++- Keep routine work, watcher, wake, heartbeat, compression, tool, HTTP, IDs, tokens, and command details outside semantic owner blocks.
++- Never place more than one owner decision in a semantic block.
++
++### Human terminal close
++
++Every terminal execution must publish exactly one human close message in its original `main` thread.
++
++- Start with `**Concluído**` for `SUCCEEDED`, or `**Interrompido**` for `FAILED` and `CANCELLED`.
++- Then include `**Linguagem leiga**` with a short explanation of what was requested, what was actually done, and the current result.
++- Then include `**Pendências**`, writing exactly `Nenhuma pendência` when complete, or only the real remaining work and why it remains.
++- End with the exact sentence `Esta execução foi encerrada.` followed by exactly one `Abrir detalhes técnicos` permalink to the bound `Execuções` root.
++- Never expose process output, commits, tests, IDs, hashes, gates, commands, internal markers, or technical jargon in this public close.
++- Publish only after evidence-backed validation, watcher stop readback, cleanup confirmation, and execution-thread unfollow.
++- Closing is retry-idempotent. A retry must reuse the existing public close and must never create a second one.
+ - Route owner decisions from the source thread only to the exact bound execution root. Any target, author, team, channel, root, or task mismatch must fail closed.
+ - Use one root-scoped event-driven watcher per open task. Resume from the cockpit SQLite store after restart, never by creating a duplicate root.
+ - Close only after evidence-backed validation. Then post the source-thread result, stop and verify watcher cleanup, unfollow the execution thread, and preserve history.
