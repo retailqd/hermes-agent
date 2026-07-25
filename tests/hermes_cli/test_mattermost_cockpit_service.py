@@ -1357,6 +1357,52 @@ def test_watch_once_relays_only_latest_semantic_execution_update(rig):
     assert store.get_task(task.task_id).execution_cursor_ms == old_cursor + 3
 
 
+def test_watch_once_aborts_if_task_closes_while_reading_execution_thread(rig, monkeypatch):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-watch-close-race",
+        title="Close race",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-close-race",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["semantic-race"] = execution_post(
+        task,
+        post_id="semantic-race",
+        create_at=old_cursor + 1,
+        message="[cockpit-owner-state]\nA conversão ainda estava em andamento.",
+    )
+    original_get_thread = bot.get_thread
+    close_started = False
+
+    def close_during_execution_read(root_id):
+        nonlocal close_started
+        if root_id == task.execution_root_id and not close_started:
+            close_started = True
+            service.close(
+                task.task_id,
+                outcome=Lifecycle.FAILED,
+                summary="A execução foi interrompida antes de concluir a conversão.",
+                evidence={"error": "interrupted"},
+            )
+        return original_get_thread(root_id)
+
+    monkeypatch.setattr(bot, "get_thread", close_during_execution_read)
+
+    assert service.watch_once(task.task_id) is False
+
+    closed = store.get_task(task.task_id)
+    assert closed.lifecycle is Lifecycle.FAILED
+    assert closed.execution_cursor_ms == old_cursor
+    relays = source_posts(bot)
+    assert relays[-1]["props"]["cockpit_relay_marker"] == f"[cockpit-final:{task.task_id}]"
+    assert not any("semantic-race" in str(post.get("props") or {}) for post in relays)
+
+
 def test_watch_once_renders_semantic_blocker(rig):
     service, store, bot, owner, _, _, _ = rig
     task = service.create(

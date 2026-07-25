@@ -533,8 +533,12 @@ class CockpitService:
         )
         self.bridge.watch_main([task.execution_root_id], timeout=None)
         current = self._require_task(task_id)
-        if current.lifecycle in TERMINAL_LIFECYCLES:
+        if (
+            current.lifecycle in TERMINAL_LIFECYCLES
+            or current.cleanup_state == CLEANUP_PENDING_STATE
+        ):
             return False
+        poll_version = current.version
         state_path = self.state_dir / f"{task_id}.json"
         state_path.parent.mkdir(parents=True, exist_ok=True)
         self.bridge.poll_main(
@@ -545,6 +549,14 @@ class CockpitService:
             max_pages=20,
         )
         thread = self.bot_client.get_thread(task.execution_root_id)
+        post_poll_task = self._require_task(task_id)
+        if (
+            post_poll_task.lifecycle in TERMINAL_LIFECYCLES
+            or post_poll_task.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        if post_poll_task.version != poll_version:
+            return True
         posts = thread.get("posts") or {}
         new_posts: list[dict[str, Any]] = []
         for post in posts.values():
@@ -579,11 +591,10 @@ class CockpitService:
             (int(post.get("create_at") or 0) for post in new_posts),
             default=task.execution_cursor_ms,
         )
-        current = self._require_task(task_id)
-        if max_cursor > current.execution_cursor_ms:
+        if max_cursor > post_poll_task.execution_cursor_ms:
             self.store.update_cursors(
                 task_id,
-                expected_version=current.version,
+                expected_version=poll_version,
                 execution_cursor_ms=max_cursor,
             )
         self.store.heartbeat_watcher(task_id, owner=self.watcher_owner, heartbeat_at=self.now().astimezone(UTC))
