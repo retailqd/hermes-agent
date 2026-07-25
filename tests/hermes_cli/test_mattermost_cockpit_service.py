@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_cli.mattermost_cockpit import service as service_module
 from hermes_cli.mattermost_cockpit.contracts import GateDecision, Lifecycle, MattermostCockpitContracts
 from hermes_cli.mattermost_cockpit.models import MattermostCockpitGateRelay
 from hermes_cli.mattermost_cockpit.service import CockpitService
@@ -1451,6 +1452,104 @@ def test_watch_once_aborts_if_task_closes_while_reading_execution_thread(rig, mo
     relays = source_posts(bot)
     assert relays[-1]["props"]["cockpit_relay_marker"] == f"[cockpit-final:{task.task_id}]"
     assert not any("semantic-race" in str(post.get("props") or {}) for post in relays)
+
+
+def test_watch_once_aborts_if_task_closes_while_rendering_execution_update(rig, monkeypatch):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-watch-render-close-race",
+        title="Close during update rendering",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-render-close-race",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["semantic-render-race"] = execution_post(
+        task,
+        post_id="semantic-render-race",
+        create_at=old_cursor + 1,
+        message="[cockpit-owner-state]\nA conversão ainda estava em andamento.",
+    )
+    original_render = service_module.render_execution_update
+    close_started = False
+
+    def close_during_render(message, permalink):
+        nonlocal close_started
+        rendered = original_render(message, permalink)
+        if not close_started:
+            close_started = True
+            service.close(
+                task.task_id,
+                outcome=Lifecycle.FAILED,
+                summary="A execução foi interrompida antes de concluir a conversão.",
+                evidence={"error": "interrupted"},
+            )
+        return rendered
+
+    monkeypatch.setattr(
+        "hermes_cli.mattermost_cockpit.service.render_execution_update",
+        close_during_render,
+    )
+
+    assert service.watch_once(task.task_id) is False
+
+    closed = store.get_task(task.task_id)
+    assert closed.lifecycle is Lifecycle.FAILED
+    assert closed.execution_cursor_ms == old_cursor
+    relays = source_posts(bot)
+    assert relays[-1]["props"]["cockpit_relay_marker"] == f"[cockpit-final:{task.task_id}]"
+    assert not any("semantic-render-race" in str(post.get("props") or {}) for post in relays)
+
+
+def test_watch_once_aborts_cursor_update_if_close_starts_after_semantic_relay(rig, monkeypatch):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-watch-cursor-close-race",
+        title="Close before cursor update",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-cursor-close-race",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["semantic-cursor-race"] = execution_post(
+        task,
+        post_id="semantic-cursor-race",
+        create_at=old_cursor + 1,
+        message="[cockpit-owner-state]\nA conversão ainda estava em andamento.",
+    )
+    original_ensure_source_relay = service._ensure_source_relay
+    close_started = False
+
+    def close_after_semantic_relay(*args, **kwargs):
+        nonlocal close_started
+        relay = original_ensure_source_relay(*args, **kwargs)
+        marker = str(kwargs.get("marker") or "")
+        if ":update:" in marker and not close_started:
+            close_started = True
+            service.close(
+                task.task_id,
+                outcome=Lifecycle.FAILED,
+                summary="A execução foi interrompida antes de concluir a conversão.",
+                evidence={"error": "interrupted"},
+            )
+        return relay
+
+    monkeypatch.setattr(service, "_ensure_source_relay", close_after_semantic_relay)
+
+    assert service.watch_once(task.task_id) is False
+
+    closed = store.get_task(task.task_id)
+    assert closed.lifecycle is Lifecycle.FAILED
+    assert closed.execution_cursor_ms == old_cursor
+    relays = source_posts(bot)
+    assert relays[-2]["props"]["cockpit_relay_marker"].endswith(":update:semantic-cursor-race]")
+    assert relays[-1]["props"]["cockpit_relay_marker"] == f"[cockpit-final:{task.task_id}]"
 
 
 def test_watch_once_renders_semantic_blocker(rig):

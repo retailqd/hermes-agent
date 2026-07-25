@@ -630,6 +630,14 @@ class CockpitService:
             candidate = render_execution_update(str(post.get("message") or ""), permalink)
             if candidate is not None:
                 latest = (post, candidate)
+        pre_relay_task = self._require_task(task_id)
+        if (
+            pre_relay_task.lifecycle in TERMINAL_LIFECYCLES
+            or pre_relay_task.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        if pre_relay_task.version != poll_version:
+            return True
         if latest is not None:
             post, candidate = latest
             marker = f"[cockpit-relay:{task_id}:update:{post['id']}]"
@@ -639,7 +647,15 @@ class CockpitService:
             (int(post.get("create_at") or 0) for post in new_posts),
             default=task.execution_cursor_ms,
         )
-        if max_cursor > post_poll_task.execution_cursor_ms:
+        pre_cursor_task = self._require_task(task_id)
+        if (
+            pre_cursor_task.lifecycle in TERMINAL_LIFECYCLES
+            or pre_cursor_task.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        if pre_cursor_task.version != poll_version:
+            return True
+        if max_cursor > pre_cursor_task.execution_cursor_ms:
             self.store.update_cursors(
                 task_id,
                 expected_version=poll_version,
