@@ -1504,6 +1504,53 @@ def test_watch_once_aborts_if_task_closes_while_rendering_execution_update(rig, 
     assert not any("semantic-render-race" in str(post.get("props") or {}) for post in relays)
 
 
+def test_watch_once_aborts_relay_if_close_starts_before_source_helper(rig, monkeypatch):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-watch-helper-close-race",
+        title="Close before semantic relay helper",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-helper-close-race",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["semantic-helper-race"] = execution_post(
+        task,
+        post_id="semantic-helper-race",
+        create_at=old_cursor + 1,
+        message="[cockpit-owner-state]\nA conversão ainda estava em andamento.",
+    )
+    original_ensure_source_relay = service._ensure_source_relay
+    close_started = False
+
+    def close_before_source_helper(*args, **kwargs):
+        nonlocal close_started
+        marker = str(kwargs.get("marker") or "")
+        if ":update:" in marker and not close_started:
+            close_started = True
+            service.close(
+                task.task_id,
+                outcome=Lifecycle.FAILED,
+                summary="A execução foi interrompida antes de concluir a conversão.",
+                evidence={"error": "interrupted"},
+            )
+        return original_ensure_source_relay(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_ensure_source_relay", close_before_source_helper)
+
+    assert service.watch_once(task.task_id) is False
+
+    closed = store.get_task(task.task_id)
+    assert closed.lifecycle is Lifecycle.FAILED
+    assert closed.execution_cursor_ms == old_cursor
+    relays = source_posts(bot)
+    assert relays[-1]["props"]["cockpit_relay_marker"] == f"[cockpit-final:{task.task_id}]"
+    assert not any("semantic-helper-race" in str(post.get("props") or {}) for post in relays)
+
+
 def test_watch_once_aborts_cursor_update_if_close_starts_after_semantic_relay(rig, monkeypatch):
     service, store, bot, owner, _, _, _ = rig
     task = service.create(
@@ -1549,6 +1596,51 @@ def test_watch_once_aborts_cursor_update_if_close_starts_after_semantic_relay(ri
     assert closed.execution_cursor_ms == old_cursor
     relays = source_posts(bot)
     assert relays[-2]["props"]["cockpit_relay_marker"].endswith(":update:semantic-cursor-race]")
+    assert relays[-1]["props"]["cockpit_relay_marker"] == f"[cockpit-final:{task.task_id}]"
+
+
+def test_watch_once_handles_close_winning_inside_cursor_cas(rig, monkeypatch):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-watch-cas-close-race",
+        title="Close during cursor comparison",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-cas-close-race",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["semantic-cas-race"] = execution_post(
+        task,
+        post_id="semantic-cas-race",
+        create_at=old_cursor + 1,
+        message="Rotina interna sem marcador semântico.",
+    )
+    original_update_cursors = store.update_cursors
+    close_started = False
+
+    def close_inside_cursor_cas(*args, **kwargs):
+        nonlocal close_started
+        if not close_started:
+            close_started = True
+            service.close(
+                task.task_id,
+                outcome=Lifecycle.FAILED,
+                summary="A execução foi interrompida antes de concluir a conversão.",
+                evidence={"error": "interrupted"},
+            )
+        return original_update_cursors(*args, **kwargs)
+
+    monkeypatch.setattr(store, "update_cursors", close_inside_cursor_cas)
+
+    assert service.watch_once(task.task_id) is False
+
+    closed = store.get_task(task.task_id)
+    assert closed.lifecycle is Lifecycle.FAILED
+    assert closed.execution_cursor_ms == old_cursor
+    relays = source_posts(bot)
     assert relays[-1]["props"]["cockpit_relay_marker"] == f"[cockpit-final:{task.task_id}]"
 
 
