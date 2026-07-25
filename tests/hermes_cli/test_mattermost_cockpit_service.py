@@ -34,6 +34,14 @@ A segunda etapa depende de autorização.
 **Preciso de você**
 Autorizar a segunda etapa controlada.
 """
+RAW_WATCH_DIAGNOSTIC = """## 5 new posts
+2026-07-24 18:14:03 retailqd post_id=abc123
+[cockpit-relay:task:deadbeef]
+Interrupting current task... HTTP 503 Service Unavailable
+watcher: HEARTBEAT gate-auth
+$ hermes-mattermost-cockpit status task-one
+owner: pode seguir
+"""
 
 
 class FakeClient:
@@ -143,6 +151,25 @@ class FakeUnits:
     def stop(self, task_id: str) -> None:
         self.stopped.append(task_id)
         self.events.append("unit:stop")
+
+
+def source_posts(client: FakeClient) -> list[dict]:
+    return [
+        post
+        for post in client.posts.values()
+        if post.get("root_id") == SOURCE_ROOT and post.get("user_id") == BOT
+    ]
+
+
+def execution_post(task, *, post_id: str, create_at: int, message: str) -> dict:
+    return {
+        "id": post_id,
+        "channel_id": EXEC,
+        "user_id": OWNER,
+        "root_id": task.execution_root_id,
+        "message": message,
+        "create_at": create_at,
+    }
 
 
 @pytest.fixture
@@ -1088,6 +1115,165 @@ def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
     assert closed.lifecycle is Lifecycle.SUCCEEDED
     assert closed.cleanup_state is None
     assert closed.pending_outcome is None
+
+
+def test_watch_once_ignores_raw_helper_diagnostic_and_advances_cursor(rig):
+    service, store, bot, owner, bridge, _, _ = rig
+    task = service.create(
+        task_id="task-watch-raw",
+        title="Semantic updates",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-raw",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["routine"] = execution_post(
+        task,
+        post_id="routine",
+        create_at=old_cursor + 1,
+        message="Interrupting current task... HTTP 503",
+    )
+    semantic_message = "[cockpit-owner-state]\nA conversão terminou."
+    bot.posts["wrong-author"] = execution_post(
+        task,
+        post_id="wrong-author",
+        create_at=old_cursor + 2,
+        message=semantic_message,
+    )
+    bot.posts["wrong-author"]["user_id"] = BOT
+    bot.posts["wrong-channel"] = execution_post(
+        task,
+        post_id="wrong-channel",
+        create_at=old_cursor + 3,
+        message=semantic_message,
+    )
+    bot.posts["wrong-channel"]["channel_id"] = MAIN
+    bot.posts["wrong-root"] = execution_post(
+        task,
+        post_id="wrong-root",
+        create_at=old_cursor + 4,
+        message=semantic_message,
+    )
+    bot.posts["wrong-root"]["root_id"] = SOURCE_ROOT
+    bridge.poll_output = RAW_WATCH_DIAGNOSTIC
+    source_count = len(source_posts(bot))
+
+    assert service.watch_once(task.task_id) is True
+    assert len(source_posts(bot)) == source_count
+    assert store.get_task(task.task_id).execution_cursor_ms == old_cursor + 1
+
+
+def test_watch_once_relays_only_latest_semantic_execution_update(rig):
+    service, store, bot, owner, bridge, _, _ = rig
+    task = service.create(
+        task_id="task-watch-latest",
+        title="Semantic latest",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-latest",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["routine"] = execution_post(
+        task,
+        post_id="routine",
+        create_at=old_cursor + 1,
+        message="Interrupting current task... HTTP 503",
+    )
+    bot.posts["semantic-old"] = execution_post(
+        task,
+        post_id="semantic-old",
+        create_at=old_cursor + 2,
+        message="[cockpit-owner-state]\nA autenticação foi validada e a conversão começou.",
+    )
+    bot.posts["semantic-latest"] = execution_post(
+        task,
+        post_id="semantic-latest",
+        create_at=old_cursor + 3,
+        message="[cockpit-owner-state]\nA conversão terminou e o PDF está em validação.",
+    )
+    bridge.poll_output = RAW_WATCH_DIAGNOSTIC
+    prior_ids = {post["id"] for post in source_posts(bot)}
+
+    assert service.watch_once(task.task_id) is True
+
+    new_posts = [post for post in source_posts(bot) if post["id"] not in prior_ids]
+    assert len(new_posts) == 1
+    relay = new_posts[0]
+    assert "A conversão terminou e o PDF está em validação." in relay["message"]
+    assert "A autenticação foi validada" not in relay["message"]
+    assert relay["message"].count("Abrir detalhes técnicos") == 1
+    for forbidden in ("HTTP 503", "gate-auth", "post_id", "Interrupting", "cockpit"):
+        assert forbidden not in relay["message"]
+    assert relay["props"]["cockpit_relay_marker"] == (
+        f"[cockpit-relay:{task.task_id}:update:semantic-latest]"
+    )
+    assert store.get_task(task.task_id).execution_cursor_ms == old_cursor + 3
+
+
+def test_watch_once_renders_semantic_blocker(rig):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-watch-blocked",
+        title="Semantic blocker",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-blocked",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["semantic-blocker"] = execution_post(
+        task,
+        post_id="semantic-blocker",
+        create_at=old_cursor + 1,
+        message=(
+            "[cockpit-owner-blocked]\n**Bloqueado**\n"
+            "A conversão depende de uma credencial.\n\n"
+            "**Preciso de você**\nAutorizar a credencial compartilhada."
+        ),
+    )
+    source_count = len(source_posts(bot))
+
+    assert service.watch_once(task.task_id) is True
+
+    relay = source_posts(bot)[source_count]
+    assert relay["message"].startswith("**Bloqueado**")
+    assert relay["message"].count("**Preciso de você**") == 1
+    assert relay["message"].count("Abrir detalhes técnicos") == 1
+    assert store.get_task(task.task_id).execution_cursor_ms == old_cursor + 1
+
+
+def test_watch_once_ignores_malformed_semantic_update_but_advances_cursor(rig):
+    service, store, bot, owner, _, _, _ = rig
+    task = service.create(
+        task_id="task-watch-malformed",
+        title="Malformed semantic update",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:watch-malformed",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    old_cursor = task.execution_cursor_ms
+    bot.posts["semantic-malformed"] = execution_post(
+        task,
+        post_id="semantic-malformed",
+        create_at=old_cursor + 1,
+        message="[cockpit-owner-state]\nA chamada retornou 401 Unauthorized.",
+    )
+    source_count = len(source_posts(bot))
+
+    assert service.watch_once(task.task_id) is True
+    assert len(source_posts(bot)) == source_count
+    assert store.get_task(task.task_id).execution_cursor_ms == old_cursor + 1
 
 
 def test_watch_once_operates_while_owner_does_not_follow_execution_thread(rig):

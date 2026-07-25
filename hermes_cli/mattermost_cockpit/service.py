@@ -23,10 +23,9 @@ from .contracts import (
 )
 from .helpers import HelperBridge
 from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, utc_now
-from .relay_renderer import render_closed, render_gate, render_started
+from .relay_renderer import RenderedRelay, render_closed, render_execution_update, render_gate, render_started
 from .store import MattermostCockpitStore
 
-_MAX_RELAY_CHARS = 3500
 _MAX_SUMMARY_CHARS = 2000
 _MAX_EVIDENCE_CHARS = 8000
 _UNFOLLOW_READBACK_ATTEMPTS = 10
@@ -551,22 +550,48 @@ class CockpitService:
             return False
         state_path = self.state_dir / f"{task_id}.json"
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        poll = self.bridge.poll_main(
+        self.bridge.poll_main(
             timeout=30,
             thread_id=task.execution_root_id,
             channel=self.executions_channel_name,
             state=str(state_path),
             max_pages=20,
         )
-        output = poll.stdout.strip()
-        if output and output not in {"NENHUM", "BASELINE"}:
-            bounded = output[:_MAX_RELAY_CHARS]
-            digest = hashlib.sha256(bounded.encode("utf-8")).hexdigest()[:16]
-            marker = f"[cockpit-relay:{task_id}:{digest}]"
-            self._ensure_source_relay(task, marker=marker, message=bounded)
         thread = self.bot_client.get_thread(task.execution_root_id)
         posts = thread.get("posts") or {}
-        max_cursor = max((int(post.get("create_at") or 0) for post in posts.values()), default=task.execution_cursor_ms)
+        new_posts: list[dict[str, Any]] = []
+        for post in posts.values():
+            if not isinstance(post, dict):
+                continue
+            if post.get("channel_id") != task.executions_channel_id:
+                continue
+            if post.get("user_id") != task.owner_author_id:
+                continue
+            if post.get("root_id") != task.execution_root_id:
+                continue
+            try:
+                create_at = int(post.get("create_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if create_at > task.execution_cursor_ms:
+                new_posts.append(post)
+        new_posts.sort(key=lambda post: (int(post.get("create_at") or 0), str(post.get("id") or "")))
+
+        latest: tuple[dict[str, Any], RenderedRelay] | None = None
+        permalink = self._permalink(task.execution_root_id)
+        for post in new_posts:
+            candidate = render_execution_update(str(post.get("message") or ""), permalink)
+            if candidate is not None:
+                latest = (post, candidate)
+        if latest is not None:
+            post, candidate = latest
+            marker = f"[cockpit-relay:{task_id}:update:{post['id']}]"
+            self._ensure_source_relay(task, marker=marker, message=candidate.body)
+
+        max_cursor = max(
+            (int(post.get("create_at") or 0) for post in new_posts),
+            default=task.execution_cursor_ms,
+        )
         current = self._require_task(task_id)
         if max_cursor > current.execution_cursor_ms:
             self.store.update_cursors(
