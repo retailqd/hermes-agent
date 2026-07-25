@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, overload
 
 from .client import MattermostClient
 from .contracts import (
@@ -641,7 +641,18 @@ class CockpitService:
         if latest is not None:
             post, candidate = latest
             marker = f"[cockpit-relay:{task_id}:update:{post['id']}]"
-            self._ensure_source_relay(task, marker=marker, message=candidate.body)
+            relay = self._ensure_source_relay(
+                task,
+                marker=marker,
+                message=candidate.body,
+                expected_version=poll_version,
+            )
+            if relay is None:
+                current = self._require_task(task_id)
+                return not (
+                    current.lifecycle in TERMINAL_LIFECYCLES
+                    or current.cleanup_state == CLEANUP_PENDING_STATE
+                )
 
         max_cursor = max(
             (int(post.get("create_at") or 0) for post in new_posts),
@@ -656,12 +667,31 @@ class CockpitService:
         if pre_cursor_task.version != poll_version:
             return True
         if max_cursor > pre_cursor_task.execution_cursor_ms:
-            self.store.update_cursors(
-                task_id,
-                expected_version=poll_version,
-                execution_cursor_ms=max_cursor,
-            )
-        self.store.heartbeat_watcher(task_id, owner=self.watcher_owner, heartbeat_at=self.now().astimezone(UTC))
+            try:
+                self.store.update_cursors(
+                    task_id,
+                    expected_version=poll_version,
+                    execution_cursor_ms=max_cursor,
+                )
+            except ValueError:
+                current = self._require_task(task_id)
+                if current.version == poll_version:
+                    raise
+                return not (
+                    current.lifecycle in TERMINAL_LIFECYCLES
+                    or current.cleanup_state == CLEANUP_PENDING_STATE
+                )
+        current = self._require_task(task_id)
+        if (
+            current.lifecycle in TERMINAL_LIFECYCLES
+            or current.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        self.store.heartbeat_watcher(
+            task_id,
+            owner=self.watcher_owner,
+            heartbeat_at=self.now().astimezone(UTC),
+        )
         return True
 
     def watch_forever(self, task_id: str) -> None:
@@ -784,14 +814,37 @@ class CockpitService:
         first_line = message.splitlines()[0]
         return first_line if first_line.startswith("[cockpit-") else None
 
+    @overload
     def _ensure_source_relay(
         self,
         task: MattermostCockpitTask,
         *,
         marker: str,
         message: str,
+        expected_version: None = None,
         legacy_relays: tuple[tuple[str, str], ...] = (),
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any]: ...
+
+    @overload
+    def _ensure_source_relay(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+        expected_version: int,
+        legacy_relays: tuple[tuple[str, str], ...] = (),
+    ) -> dict[str, Any] | None: ...
+
+    def _ensure_source_relay(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+        expected_version: int | None = None,
+        legacy_relays: tuple[tuple[str, str], ...] = (),
+    ) -> dict[str, Any] | None:
         thread = self.bot_client.get_thread(task.source_root_id)
         posts = thread.get("posts") or {}
         relay_contracts = ((marker, message), *legacy_relays)
@@ -814,6 +867,14 @@ class CockpitService:
             if last_error is not None:
                 raise last_error
             raise ValueError("relay marker mismatch")
+        if expected_version is not None:
+            current = self._require_task(task.task_id)
+            if (
+                current.lifecycle in TERMINAL_LIFECYCLES
+                or current.cleanup_state == CLEANUP_PENDING_STATE
+                or current.version != expected_version
+            ):
+                return None
         created = self.bot_client.create_post(
             task.source_channel_id,
             message,
