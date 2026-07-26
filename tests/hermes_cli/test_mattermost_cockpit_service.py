@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -995,3 +997,51 @@ def test_watch_once_exits_without_helper_call_for_terminal_task(rig):
     service.close(task.task_id, outcome=Lifecycle.FAILED, summary="failed", evidence={"error": "x"})
     assert service.watch_once(task.task_id) is False
     assert bridge.watch_calls == 0
+
+
+def test_watch_forever_treats_live_competing_lease_as_already_running_without_side_effects(rig):
+    service, store, bot, owner, bridge, _, _ = rig
+    task = service.create(
+        task_id="task-live-watcher",
+        title="Live watcher",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:live-watcher",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    heartbeat_at = datetime.now(UTC)
+    store.claim_watcher(
+        task.task_id,
+        owner="other-host:123",
+        heartbeat_at=heartbeat_at,
+        stale_before=heartbeat_at - timedelta(minutes=3),
+    )
+    owner.following_calls.clear()
+
+    assert service.watch_forever(task.task_id) == "already_running"
+    assert bridge.watch_calls == 0
+    assert owner.following_calls == []
+    assert store.get_task(task.task_id).watcher_owner == "other-host:123"
+
+
+def test_local_watcher_owner_liveness_requires_matching_cockpit_task(monkeypatch):
+    host = socket.gethostname()
+    monkeypatch.setattr(os, "kill", lambda pid, signal: None)
+    command = b"python\0-m\0hermes_cli.mattermost_cockpit\0resume\0--task\0task-one\0--watch\0"
+    monkeypatch.setattr(Path, "read_bytes", lambda path: command)
+
+    assert CockpitService._local_watcher_owner_liveness(f"{host}:123", "task-one") is True
+    assert CockpitService._local_watcher_owner_liveness(f"{host}:123", "task-two") is False
+    assert CockpitService._local_watcher_owner_liveness(f"{host}:123", "task-on") is False
+    assert CockpitService._local_watcher_owner_liveness("remote-host:123", "task-one") is None
+
+
+def test_local_watcher_owner_liveness_detects_dead_pid(monkeypatch):
+    def process_missing(pid, signal):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", process_missing)
+
+    assert CockpitService._local_watcher_owner_liveness(f"{socket.gethostname()}:123", "task-one") is False

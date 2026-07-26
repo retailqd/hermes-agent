@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 
 from hermes_cli.sqlite_util import write_txn
 from hermes_constants import get_hermes_home
@@ -23,6 +24,10 @@ from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, Mat
 
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_VERSION = 2
+
+
+class WatcherLeaseConflictError(ValueError):
+    """A different live watcher already owns the task lease."""
 
 TASK_COLUMNS = (
     "task_id, team_id, source_channel_id, source_root_id, source_post_id, owner_author_id, "
@@ -578,6 +583,7 @@ class MattermostCockpitStore:
         owner: str,
         heartbeat_at: datetime,
         stale_before: datetime,
+        owner_liveness: Callable[[str], bool | None] | None = None,
     ) -> MattermostCockpitTask:
         heartbeat_at = _require_utc(heartbeat_at, "heartbeat_at")
         stale_before = _require_utc(stale_before, "stale_before")
@@ -589,8 +595,10 @@ class MattermostCockpitStore:
             if current is None:
                 raise ValueError(f"task {task_id!r} does not exist")
             lease_is_stale = current.watcher_heartbeat_at is None or current.watcher_heartbeat_at < stale_before
-            if current.watcher_owner not in (None, owner) and not lease_is_stale:
-                raise ValueError("fresh competing lease")
+            if current.watcher_owner not in (None, owner):
+                live = owner_liveness(current.watcher_owner) if owner_liveness is not None else None
+                if live is True or (live is not False and not lease_is_stale):
+                    raise WatcherLeaseConflictError("fresh competing lease")
             updated = replace(
                 current,
                 watcher_owner=owner,

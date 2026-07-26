@@ -23,7 +23,7 @@ from .contracts import (
 )
 from .helpers import HelperBridge
 from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, utc_now
-from .store import MattermostCockpitStore
+from .store import MattermostCockpitStore, WatcherLeaseConflictError
 
 _MAX_RELAY_CHARS = 3500
 _MAX_SUMMARY_CHARS = 2000
@@ -516,6 +516,14 @@ class CockpitService:
             return False
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
+        now = self.now().astimezone(UTC)
+        self.store.claim_watcher(
+            task_id,
+            owner=self.watcher_owner,
+            heartbeat_at=now,
+            stale_before=now - timedelta(minutes=3),
+            owner_liveness=lambda owner: self._local_watcher_owner_liveness(owner, task_id),
+        )
         if task.task_id not in self._watcher_unfollow_initialized:
             self._ensure_owner_unfollowed(
                 user_id=task.owner_author_id,
@@ -523,13 +531,6 @@ class CockpitService:
                 thread_id=task.execution_root_id,
             )
             self._watcher_unfollow_initialized.add(task.task_id)
-        now = self.now().astimezone(UTC)
-        self.store.claim_watcher(
-            task_id,
-            owner=self.watcher_owner,
-            heartbeat_at=now,
-            stale_before=now - timedelta(minutes=3),
-        )
         self.bridge.watch_main([task.execution_root_id], timeout=None)
         current = self._require_task(task_id)
         if current.lifecycle in TERMINAL_LIFECYCLES:
@@ -567,14 +568,62 @@ class CockpitService:
         self.store.heartbeat_watcher(task_id, owner=self.watcher_owner, heartbeat_at=self.now().astimezone(UTC))
         return True
 
-    def watch_forever(self, task_id: str) -> None:
+    def watch_forever(self, task_id: str) -> str:
         try:
-            while self.watch_once(task_id):
-                pass
+            try:
+                while self.watch_once(task_id):
+                    pass
+            except WatcherLeaseConflictError:
+                return "already_running"
+            return "stopped"
         finally:
             task = self.store.get_task(task_id)
             if task is not None and task.watcher_owner == self.watcher_owner:
                 self.store.release_watcher(task_id, owner=self.watcher_owner)
+
+    @staticmethod
+    def _local_watcher_owner_liveness(owner: str, task_id: str) -> bool | None:
+        host, separator, pid_text = owner.rpartition(":")
+        if not separator or host != socket.gethostname():
+            return None
+        try:
+            pid = int(pid_text)
+            if pid <= 0:
+                return None
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except (TypeError, ValueError):
+            return None
+        try:
+            command = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        argv = [part.decode(errors="replace") for part in command.split(b"\x00") if part]
+        module_matches = any(
+            argument == "-m"
+            and index + 1 < len(argv)
+            and argv[index + 1] == "hermes_cli.mattermost_cockpit"
+            for index, argument in enumerate(argv)
+        )
+        executable_matches = bool(argv) and Path(argv[0]).name == "hermes-mattermost-cockpit"
+        task_values: list[str] = []
+        for index, argument in enumerate(argv):
+            if argument == "--task" and index + 1 < len(argv):
+                task_values.append(argv[index + 1])
+            elif argument.startswith("--task="):
+                task_values.append(argument.removeprefix("--task="))
+        return (
+            (module_matches or executable_matches)
+            and "resume" in argv
+            and bool(task_values)
+            and task_values[-1] == task_id
+            and "--watch" in argv
+        )
 
     def status(self, task_id: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
         if task_id is not None:

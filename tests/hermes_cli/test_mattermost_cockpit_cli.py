@@ -11,6 +11,7 @@ from hermes_cli.mattermost_cockpit.contracts import GateDecision, Lifecycle
 class FakeService:
     def __init__(self):
         self.calls: list[tuple] = []
+        self.watcher_state = "stopped"
 
     def create(self, **kwargs):
         self.calls.append(("create", kwargs))
@@ -30,6 +31,7 @@ class FakeService:
 
     def watch_forever(self, task_id):
         self.calls.append(("watch", task_id))
+        return self.watcher_state
 
     def close(self, task_id, **kwargs):
         self.calls.append(("close", task_id, kwargs))
@@ -128,6 +130,17 @@ def test_resume_owner_message_reads_stdin_and_binds_source_post():
             },
         )
     ]
+
+
+def test_duplicate_watch_reports_already_running_as_success():
+    service = FakeService()
+    service.watcher_state = "already_running"
+
+    rc, payload, stderr = _run(["resume", "--task", "task-one", "--watch"], service)
+
+    assert rc == 0 and stderr == ""
+    assert payload == {"ok": True, "task_id": "task-one", "watcher": "already_running"}
+    assert service.calls == [("watch", "task-one")]
 
 
 def test_close_parses_evidence_file(tmp_path: Path):

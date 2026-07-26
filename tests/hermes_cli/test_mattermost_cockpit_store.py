@@ -8,7 +8,7 @@ import pytest
 
 from hermes_cli.mattermost_cockpit.contracts import Lifecycle, MattermostCockpitContracts
 from hermes_cli.mattermost_cockpit.models import MattermostCockpitAuditEvent, MattermostCockpitTask
-from hermes_cli.mattermost_cockpit.store import MattermostCockpitStore
+from hermes_cli.mattermost_cockpit.store import MattermostCockpitStore, WatcherLeaseConflictError
 
 TEAM_ID = "a" * 26
 MAIN_CHANNEL_ID = "b" * 26
@@ -423,7 +423,7 @@ def test_claim_heartbeat_release_respects_staleness_and_owner(store: MattermostC
     assert refreshed.watcher_owner == LEASE_OWNER_1
     assert refreshed.watcher_heartbeat_at == utc_now + timedelta(minutes=1)
 
-    with pytest.raises(ValueError, match="fresh competing lease"):
+    with pytest.raises(WatcherLeaseConflictError, match="fresh competing lease"):
         store.claim_watcher(task.task_id, owner=LEASE_OWNER_2, heartbeat_at=utc_now + timedelta(minutes=2), stale_before=utc_now)
 
     taken_over = store.claim_watcher(task.task_id, owner=LEASE_OWNER_2, heartbeat_at=utc_now + timedelta(minutes=3), stale_before=utc_now + timedelta(minutes=2))
@@ -441,6 +441,37 @@ def test_claim_heartbeat_release_respects_staleness_and_owner(store: MattermostC
 
     with pytest.raises(ValueError, match="owner"):
         store.release_watcher(task.task_id, owner=LEASE_OWNER_1)
+
+
+def test_claim_watcher_uses_owner_liveness_to_resolve_stale_and_fresh_leases(
+    store: MattermostCockpitStore,
+    utc_now: datetime,
+) -> None:
+    task = store.create_task(_task(created_at=utc_now, updated_at=utc_now))
+    store.claim_watcher(
+        task.task_id,
+        owner=LEASE_OWNER_1,
+        heartbeat_at=utc_now,
+        stale_before=utc_now - timedelta(minutes=5),
+    )
+
+    with pytest.raises(WatcherLeaseConflictError, match="fresh competing lease"):
+        store.claim_watcher(
+            task.task_id,
+            owner=LEASE_OWNER_2,
+            heartbeat_at=utc_now + timedelta(minutes=10),
+            stale_before=utc_now + timedelta(minutes=5),
+            owner_liveness=lambda owner: True,
+        )
+
+    taken_over = store.claim_watcher(
+        task.task_id,
+        owner=LEASE_OWNER_2,
+        heartbeat_at=utc_now + timedelta(seconds=1),
+        stale_before=utc_now - timedelta(minutes=5),
+        owner_liveness=lambda owner: False,
+    )
+    assert taken_over.watcher_owner == LEASE_OWNER_2
 
 
 def test_audit_events_require_fk_dedupe_restart_persistence_and_quick_check(store: MattermostCockpitStore, utc_now: datetime, tmp_path: Path) -> None:

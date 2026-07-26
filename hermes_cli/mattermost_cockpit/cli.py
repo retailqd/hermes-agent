@@ -143,8 +143,8 @@ def main(
             task = service.open_gate(args.task, gate_id=args.gate_id, prompt=stdin.read())
             payload = _task_payload(task)
         elif args.command == "resume" and args.watch:
-            service.watch_forever(args.task)
-            payload = {"ok": True, "task_id": args.task, "watcher": "stopped"}
+            watcher_state = service.watch_forever(args.task)
+            payload = {"ok": True, "task_id": args.task, "watcher": watcher_state}
         elif args.command == "resume":
             if not args.source_root_id or not args.source_post_id or not args.gate_id or not args.decision:
                 raise ValueError(
