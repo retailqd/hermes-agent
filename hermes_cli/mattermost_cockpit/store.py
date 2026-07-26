@@ -473,6 +473,8 @@ class MattermostCockpitStore:
                 lifecycle=current.pending_outcome,
                 cleanup_state=None,
                 pending_outcome=None,
+                watcher_owner=None,
+                watcher_heartbeat_at=None,
                 last_error=_require_text(final_last_error, "last_error") if final_last_error is not None else None,
                 closed_at=utc_now(),
                 updated_at=utc_now(),

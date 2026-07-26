@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,14 +114,20 @@ class FakeUnits:
         self.events = events
         self.started: list[str] = []
         self.stopped: list[str] = []
+        self.active: set[str] = set()
 
     def start(self, task_id: str) -> None:
         self.started.append(task_id)
+        self.active.add(task_id)
         self.events.append("unit:start")
 
     def stop(self, task_id: str) -> None:
         self.stopped.append(task_id)
+        self.active.discard(task_id)
         self.events.append("unit:stop")
+
+    def is_active(self, task_id: str) -> bool:
+        return task_id in self.active
 
 
 @pytest.fixture
@@ -771,6 +777,81 @@ def test_close_resumes_after_unfollow_already_completed(rig):
     assert owner.following_calls == [False, False]
     assert units.stopped == [task.task_id]
     assert any("[cockpit-final:task-close-retry]" in p["message"] for p in bot.posts.values())
+
+
+@pytest.mark.parametrize(
+    ("outcome", "summary", "evidence", "last_error"),
+    [
+        (Lifecycle.SUCCEEDED, "completed", {"validation": "5 passed"}, None),
+        (Lifecycle.FAILED, "failed", {"error": "worker failed"}, "worker failed"),
+    ],
+)
+def test_close_clears_persisted_watcher_lease_without_watcher_finally(
+    rig,
+    outcome,
+    summary,
+    evidence,
+    last_error,
+):
+    service, store, bot, owner, _, units, events = rig
+    task = service.create(
+        task_id=f"task-close-lease-{outcome.value.lower()}",
+        title="Close persisted watcher lease",
+        handoff="Watcher process is stopped before its finally runs",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=f"source:close-lease:{outcome.value}",
+    )
+    heartbeat_at = datetime.now(UTC)
+    leased = store.claim_watcher(
+        task.task_id,
+        owner="test-watcher",
+        heartbeat_at=heartbeat_at,
+        stale_before=heartbeat_at - timedelta(minutes=3),
+    )
+    assert leased.watcher_owner == "test-watcher"
+    assert leased.watcher_heartbeat_at == heartbeat_at
+    assert units.is_active(task.task_id) is True
+    owner.following = True
+    close_events_start = len(events)
+
+    closed = service.close(
+        task.task_id,
+        outcome=outcome,
+        summary=summary,
+        evidence=evidence,
+        last_error=last_error,
+    )
+
+    close_events = events[close_events_start:]
+    assert close_events.index("follow:False") < close_events.index("unit:stop")
+    assert owner.following is False
+    assert units.is_active(task.task_id) is False
+    assert closed.lifecycle is outcome
+    assert closed.watcher_owner is None
+    assert closed.watcher_heartbeat_at is None
+    persisted = store.get_task(task.task_id)
+    assert persisted is not None
+    assert persisted.watcher_owner is None
+    assert persisted.watcher_heartbeat_at is None
+    evidence_marker = f"[cockpit-evidence:{task.task_id}:"
+    final_marker = f"[cockpit-final:{task.task_id}]"
+    assert sum(evidence_marker in post["message"] for post in bot.posts.values()) == 1
+    assert sum(final_marker in post["message"] for post in bot.posts.values()) == 1
+
+    replay = service.close(
+        task.task_id,
+        outcome=outcome,
+        summary=summary,
+        evidence=evidence,
+        last_error=last_error,
+    )
+
+    assert replay == closed
+    assert units.stopped == [task.task_id]
+    assert sum(evidence_marker in post["message"] for post in bot.posts.values()) == 1
+    assert sum(final_marker in post["message"] for post in bot.posts.values()) == 1
 
 
 def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
