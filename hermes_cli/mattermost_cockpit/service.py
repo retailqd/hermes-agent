@@ -161,8 +161,9 @@ class CockpitService:
                     f"Execução iniciada: [{task.title}]({task.execution_permalink})"
                 ),
             )
-            self.units.start(task.task_id)
             is_active = getattr(self.units, "is_active", None)
+            if not callable(is_active) or not is_active(task.task_id):
+                self.units.start(task.task_id)
             if callable(is_active) and not is_active(task.task_id):
                 raise ValueError("watcher unit start readback mismatch")
             current = self._require_task(task.task_id)

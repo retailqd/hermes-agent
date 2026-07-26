@@ -205,10 +205,39 @@ def test_create_is_idempotent_and_posts_exactly_one_execution_root(rig):
             if p.get("root_id") == SOURCE_ROOT and "[cockpit-link:task-one]" in p.get("message", "")
         ]
     ) == 1
-    assert units.started == ["task-one", "task-one"]
+    assert units.started == ["task-one"]
     assert store.get_task("task-one").execution_root_id == first.execution_root_id
     assert owner.following is False
     assert True not in owner.following_calls
+
+
+def test_create_retry_restarts_a_dead_watcher_without_duplicate_root(rig):
+    service, _, _, owner, _, units, _ = rig
+    first = service.create(
+        task_id="task-restart-dead-watcher",
+        title="Restart dead watcher",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:restart-dead-watcher",
+    )
+    units.active.clear()
+
+    second = service.create(
+        task_id="retry-id",
+        title="Restart dead watcher",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:restart-dead-watcher",
+    )
+
+    assert second.task_id == first.task_id
+    assert units.started == [first.task_id, first.task_id]
+    assert units.is_active(first.task_id)
+    assert len([p for p in owner.posts.values() if p["channel_id"] == EXEC and not p["root_id"]]) == 1
 
 
 def test_create_explicitly_unfollows_execution_root_before_starting_watcher(rig):
