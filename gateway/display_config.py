@@ -52,6 +52,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Disable when the platform should steer silently (the text still lands in
     # the active run; only the confirmation echo is suppressed).
     "busy_steer_ack_enabled": True,
+    # When true, send background review notifications as visible owner-facing
+    # updates. Global default is on, but some platforms prefer compact progress
+    # and disable them by default.
+    "background_review_notifications": True,
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -131,7 +135,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
     # "new"/"all" spam permanent lines in channels (hermes-agent#14663).
     "slack":           {**_TIER_MEDIUM, "tool_progress": "off"},
-    "mattermost":      _TIER_MEDIUM,
+    "mattermost":      {**_TIER_MEDIUM, "tool_progress_grouping": "latest", "cleanup_progress": True, "background_review_notifications": False},
     "matrix":          _TIER_MEDIUM,
     "feishu":          _TIER_MEDIUM,
 
@@ -251,12 +255,13 @@ def _normalise(setting: str, value: Any) -> Any:
         "long_running_notifications",
         "busy_ack_detail",
         "busy_steer_ack_enabled",
+        "background_review_notifications",
         "thinking_progress",
     }:
+        if setting == "long_running_notifications" and isinstance(value, str) and value.strip().lower() == "generic":
+            return "generic"
         if isinstance(value, str):
             val = value.strip().lower()
-            if val == "generic" and setting == "long_running_notifications":
-                return "generic"
             return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
     if setting == "cleanup_progress":

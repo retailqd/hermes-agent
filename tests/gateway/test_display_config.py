@@ -258,6 +258,32 @@ class TestPlatformDefaults:
         for plat in ("mattermost", "matrix", "feishu", "whatsapp"):
             assert resolve_display_setting({}, plat, "tool_progress") == "new", plat
 
+    def test_mattermost_defaults_to_ephemeral_latest_progress(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "mattermost", "tool_progress_grouping") == "latest"
+        assert resolve_display_setting({}, "mattermost", "cleanup_progress") is True
+        assert resolve_display_setting({}, "mattermost", "background_review_notifications") is False
+
+    def test_mattermost_can_reenable_review_and_disable_cleanup(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "background_review_notifications": "false",
+                "cleanup_progress": "true",
+                "platforms": {
+                    "mattermost": {
+                        "background_review_notifications": "true",
+                        "cleanup_progress": "false",
+                    }
+                },
+            }
+        }
+
+        assert resolve_display_setting(config, "mattermost", "background_review_notifications") is True
+        assert resolve_display_setting(config, "mattermost", "cleanup_progress") is False
+
     def test_slack_defaults_tool_progress_off(self):
         """Slack defaults to quiet tool progress (permanent chat noise otherwise)."""
         from gateway.display_config import resolve_display_setting
