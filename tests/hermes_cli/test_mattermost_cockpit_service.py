@@ -334,7 +334,8 @@ def test_create_replays_exact_legacy_visible_marker_without_duplicate(rig):
     )
     marker = source_relay["props"].pop("cockpit_relay_marker")
     source_relay["props"].pop("cockpit_relay_schema")
-    source_relay["message"] = f"{marker}\n{source_relay['message']}"
+    expected_message = source_relay["message"]
+    source_relay["message"] = f"{marker}\n{expected_message}"
     post_ids_before = set(bot.posts)
 
     replayed = service.create(
@@ -349,6 +350,15 @@ def test_create_replays_exact_legacy_visible_marker_without_duplicate(rig):
 
     assert replayed.task_id == task.task_id
     assert set(bot.posts) == post_ids_before
+    assert source_relay["message"] == expected_message
+    assert marker not in source_relay["message"]
+    assert source_relay["props"]["cockpit_relay_marker"] == marker
+    assert source_relay["props"]["cockpit_relay_schema"] == 1
+    assert bot.update_calls[-1] == {
+        "post_id": source_relay["id"],
+        "message": source_relay["message"],
+        "props": source_relay["props"],
+    }
 
 
 def test_create_explicitly_unfollows_execution_root_before_starting_watcher(rig):

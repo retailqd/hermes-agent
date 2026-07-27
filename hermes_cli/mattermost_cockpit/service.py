@@ -994,9 +994,30 @@ class CockpitService:
                 if relay_marker != existing_marker:
                     continue
                 try:
-                    return self._validate_source_relay_post(
+                    validated = self._validate_source_relay_post(
                         existing[0], task, marker=relay_marker, message=relay_message
                     )
+                    props = validated.get("props")
+                    props_marker = (
+                        props.get("cockpit_relay_marker")
+                        if isinstance(props, Mapping)
+                        else None
+                    )
+                    if props_marker != relay_marker:
+                        relay_id = str(validated.get("id") or "")
+                        self.bot_client.update_post(
+                            relay_id,
+                            relay_message,
+                            props=self._source_relay_props(relay_marker),
+                        )
+                        readback = self.bot_client.get_post(relay_id)
+                        return self._validate_source_relay_post(
+                            readback,
+                            task,
+                            marker=relay_marker,
+                            message=relay_message,
+                        )
+                    return validated
                 except ValueError as exc:
                     last_error = exc
             if last_error is not None:
