@@ -18074,6 +18074,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
             _bg_review_pending_lock = threading.Lock()
+            _show_bg_review = bool(
+                resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "background_review_notifications",
+                    True,
+                )
+            )
 
             def _deliver_bg_review_message(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
@@ -18108,10 +18116,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send
+            agent.background_review_callback = _bg_review_send if _show_bg_review else None
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
-            if _status_adapter and session_key:
+            if _show_bg_review and _status_adapter and session_key:
                 if getattr(type(_status_adapter), "register_post_delivery_callback", None) is not None:
                     _status_adapter.register_post_delivery_callback(
                         session_key,
