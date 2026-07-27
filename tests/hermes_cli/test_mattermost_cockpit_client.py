@@ -165,7 +165,12 @@ class TestMattermostClient:
             )
 
         client = make_client(urlopen)
-        payload = client.create_post("channel-7", "hello", root_id="root-9")
+        payload = client.create_post(
+            "channel-7",
+            "hello",
+            root_id="root-9",
+            props={"cockpit_relay_marker": "relay-1", "cockpit_relay_schema": 1},
+        )
 
         assert payload == {"id": "post-77"}
         assert captured["authorization"] == "Bearer explicit-token"
@@ -173,6 +178,29 @@ class TestMattermostClient:
             "channel_id": "channel-7",
             "message": "hello",
             "root_id": "root-9",
+            "props": {"cockpit_relay_marker": "relay-1", "cockpit_relay_schema": 1},
+        }
+
+    def test_delete_post_uses_exact_endpoint_and_no_body(self):
+        captured: dict[str, object] = {}
+
+        def urlopen(request, timeout):
+            captured["method"] = request.method
+            captured["url"] = request.full_url
+            captured["body"] = request.data
+            return FakeResponse(
+                200,
+                json.dumps({"status": "OK"}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+
+        assert client.delete_post("post-77") == {"status": "OK"}
+        assert captured == {
+            "method": "DELETE",
+            "url": "https://mattermost.example.com/api/v4/posts/post-77",
+            "body": None,
         }
 
     def test_update_post_includes_required_post_id(self):

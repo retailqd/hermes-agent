@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, overload
 
 from .client import MattermostClient
 from .contracts import (
@@ -23,15 +23,15 @@ from .contracts import (
 )
 from .helpers import HelperBridge
 from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, utc_now
+from .relay_renderer import RenderedRelay, render_closed, render_execution_update, render_gate, render_started
 from .store import MattermostCockpitStore, WatcherLeaseConflictError
 
-_MAX_RELAY_CHARS = 3500
 _MAX_SUMMARY_CHARS = 2000
 _MAX_EVIDENCE_CHARS = 8000
-_MAX_VALIDATION_CHARS = 1000
 _UNFOLLOW_READBACK_ATTEMPTS = 10
 _UNFOLLOW_READBACK_INTERVAL_SECONDS = 0.5
 _UNFOLLOW_STABLE_READS = 5
+_RELAY_SCHEMA = 1
 
 
 class UnitController:
@@ -135,7 +135,7 @@ class CockpitService:
         try:
             if task.execution_root_id is None:
                 execution_post = self._find_or_create_execution_root(task, kickoff)
-                permalink = f"{self.base_url}/{self.team_name}/pl/{execution_post['id']}"
+                permalink = self._permalink(str(execution_post["id"]))
                 task = self.store.attach_execution(
                     task.task_id,
                     expected_version=task.version,
@@ -153,12 +153,16 @@ class CockpitService:
                 team_id=self.contracts.team_id,
                 thread_id=str(execution_post["id"]),
             )
+            relay = render_started(task.title, self._permalink(task.execution_root_id))
             self._ensure_source_relay(
                 task,
-                marker=f"[cockpit-link:{task.task_id}]",
-                message=(
-                    f"[cockpit-link:{task.task_id}]\n"
-                    f"Execução iniciada: [{task.title}]({task.execution_permalink})"
+                marker=f"[cockpit-relay:{task.task_id}:started]",
+                message=relay.body,
+                legacy_relays=(
+                    (
+                        f"[cockpit-link:{task.task_id}]",
+                        f"Execução iniciada: [{task.title}]({task.execution_permalink})",
+                    ),
                 ),
             )
             is_active = getattr(self.units, "is_active", None)
@@ -235,12 +239,29 @@ class CockpitService:
         if not prompt:
             raise ValueError("gate prompt must not be empty")
         marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
-        message = f"{marker}\n{prompt}"
+        legacy_prompt_body = f"{marker}\n{prompt}"
+        existing_gate = self.store.get_gate(gate_id)
+        if (
+            existing_gate is not None
+            and existing_gate.task_id == task.task_id
+            and existing_gate.prompt_body == legacy_prompt_body
+        ):
+            prompt_body = legacy_prompt_body
+            source_message = prompt
+        else:
+            relay = render_gate(prompt, self._permalink(task.execution_root_id))
+            prompt_body = relay.body
+            source_message = relay.body
         pending_prompt_post_id = self._pending_gate_prompt_id(task.task_id, gate_id)
         with self._gate_lock(task.task_id):
             gate = self.store.get_gate(gate_id)
             if gate is not None:
-                if gate.task_id != task.task_id or gate.prompt_body != message:
+                if gate.task_id != task.task_id:
+                    raise ValueError("gate id collision")
+                if gate.prompt_body == legacy_prompt_body:
+                    prompt_body = legacy_prompt_body
+                    source_message = prompt
+                elif gate.prompt_body != prompt_body:
                     raise ValueError("gate id collision")
                 if not gate.active:
                     raise ValueError("gate is already resolved")
@@ -250,25 +271,30 @@ class CockpitService:
                         gate_id=gate_id,
                         task_id=task.task_id,
                         prompt_post_id=pending_prompt_post_id,
-                        prompt_body=message,
+                        prompt_body=prompt_body,
                         created_at=self.now().astimezone(UTC),
                         updated_at=self.now().astimezone(UTC),
                     )
                 )
             if gate.prompt_post_id == pending_prompt_post_id:
-                post = self._ensure_source_relay(task, marker=marker, message=message)
+                post = self._ensure_source_relay(
+                    task,
+                    marker=marker,
+                    message=source_message,
+                )
                 gate = self.store.bind_gate_prompt(
                     gate_id,
                     task_id=task.task_id,
                     expected_prompt_post_id=pending_prompt_post_id,
                     prompt_post_id=str(post["id"]),
-                    prompt_body=message,
+                    prompt_body=prompt_body,
                 )
             else:
-                self._validate_bot_reply(
+                self._validate_source_relay_post(
                     self.bot_client.get_post(gate.prompt_post_id),
                     task,
-                    expected_message=message,
+                    marker=marker,
+                    message=source_message,
                 )
         if not gate.active:
             raise ValueError("gate is already resolved")
@@ -332,68 +358,83 @@ class CockpitService:
         source_body = message.strip()
         if str(source.get("message") or "").strip() != source_body:
             raise ValueError("owner decision body mismatch")
-        prompt_post = self._validate_bot_reply(
+        expected_prompt_marker = f"[cockpit-gate:{task.task_id}:{gate_id}]"
+        legacy_prefix = f"{expected_prompt_marker}\n"
+        prompt_message = (
+            gate.prompt_body[len(legacy_prefix) :]
+            if gate.prompt_body.startswith(legacy_prefix)
+            else gate.prompt_body
+        )
+        prompt_post = self._validate_source_relay_post(
             self.bot_client.get_post(gate.prompt_post_id),
             task,
-            expected_message=gate.prompt_body,
+            marker=expected_prompt_marker,
+            message=prompt_message,
         )
         if int(source.get("create_at") or 0) < int(prompt_post.get("create_at") or 0):
             raise ValueError("owner decision predates active gate")
 
         destination_body = f"[cockpit-decision:{gate_id}:{decision.value}]\n{source_body}"
-        if not gate.active:
-            if (
-                gate.decision is not decision
-                or gate.source_owner_post_id != source_post_id
-                or gate.source_body != source_body
-                or gate.destination_body != destination_body
-                or not gate.destination_post_id
-            ):
-                raise ValueError("resolved gate replay mismatch")
-            self._validate_owner_reply(
-                self.owner_client.get_post(gate.destination_post_id),
-                task,
-                expected_message=destination_body,
+        with self._gate_lock(task.task_id):
+            gate = self.store.get_gate(gate_id)
+            if gate is None or gate.task_id != task.task_id:
+                raise ValueError("active gate mismatch")
+            if not gate.active:
+                if (
+                    gate.decision is not decision
+                    or gate.source_owner_post_id != source_post_id
+                    or gate.source_body != source_body
+                    or gate.destination_body != destination_body
+                    or not gate.destination_post_id
+                ):
+                    raise ValueError("resolved gate replay mismatch")
+                self._validate_owner_reply(
+                    self.owner_client.get_post(gate.destination_post_id),
+                    task,
+                    expected_message=destination_body,
+                )
+                self._ensure_owner_unfollowed(
+                    user_id=task.owner_author_id,
+                    team_id=task.team_id,
+                    thread_id=execution_root_id,
+                )
+                current = self._require_task(task_id)
+                if current.lifecycle is Lifecycle.WAITING_OWNER:
+                    current = self.store.mark_running(task_id, expected_version=current.version)
+                return current
+            current = self._require_open_bound_task(task_id)
+            if current.lifecycle is not Lifecycle.WAITING_OWNER:
+                raise ValueError("task is not waiting on this gate")
+            destination = self._find_owner_reply(task, expected_message=destination_body)
+            if destination is None:
+                result = self.bridge.post_owner(
+                    destination_body,
+                    timeout=30,
+                    team=self.team_name,
+                    channel=self.executions_channel_name,
+                    root_id=task.execution_root_id,
+                )
+                if not result.post_id:
+                    raise ValueError("owner helper returned no post id")
+                destination = self._validate_owner_reply(
+                    self.owner_client.get_post(result.post_id),
+                    task,
+                    expected_message=destination_body,
+                )
+            resolved = self.store.resolve_gate(
+                gate_id,
+                task_id=task.task_id,
+                decision=decision,
+                source_owner_post_id=source_post_id,
+                source_body=source_body,
+                destination_post_id=str(destination["id"]),
+                destination_body=destination_body,
             )
             self._ensure_owner_unfollowed(
                 user_id=task.owner_author_id,
                 team_id=task.team_id,
                 thread_id=execution_root_id,
             )
-            current = self._require_task(task_id)
-            if current.lifecycle is Lifecycle.WAITING_OWNER:
-                current = self.store.mark_running(task_id, expected_version=current.version)
-            return current
-        if task.lifecycle is not Lifecycle.WAITING_OWNER:
-            raise ValueError("task is not waiting on this gate")
-        result = self.bridge.post_owner(
-            destination_body,
-            timeout=30,
-            team=self.team_name,
-            channel=self.executions_channel_name,
-            root_id=task.execution_root_id,
-        )
-        if not result.post_id:
-            raise ValueError("owner helper returned no post id")
-        destination = self._validate_owner_reply(
-            self.owner_client.get_post(result.post_id),
-            task,
-            expected_message=destination_body,
-        )
-        resolved = self.store.resolve_gate(
-            gate_id,
-            task_id=task.task_id,
-            decision=decision,
-            source_owner_post_id=source_post_id,
-            source_body=source_body,
-            destination_post_id=str(destination["id"]),
-            destination_body=destination_body,
-        )
-        self._ensure_owner_unfollowed(
-            user_id=task.owner_author_id,
-            team_id=task.team_id,
-            thread_id=execution_root_id,
-        )
         current = self._require_task(task_id)
         if current.lifecycle is Lifecycle.WAITING_OWNER:
             current = self.store.mark_running(task_id, expected_version=current.version)
@@ -444,6 +485,12 @@ class CockpitService:
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
         execution_root_id = task.execution_root_id
+        relay = render_closed(
+            outcome=outcome.value,
+            requested=task.title,
+            summary=summary,
+            permalink=self._permalink(execution_root_id),
+        )
         if task.cleanup_state == CLEANUP_PENDING_STATE:
             if task.pending_outcome is not outcome or task.result_summary != summary or task.evidence != evidence:
                 raise ValueError("cleanup retry intent mismatch")
@@ -475,19 +522,11 @@ class CockpitService:
                 message=f"{evidence_marker}\n**Evidência final:** `{evidence_json}`",
             )
             marker = f"[cockpit-final:{task.task_id}]"
-            validation = evidence.get("validation")
-            validation_text = (
-                validation.strip()[:_MAX_VALIDATION_CHARS]
-                if isinstance(validation, str) and validation.strip()
-                else f"{len(evidence)} item(ns) de evidência registrado(s)"
+            self._ensure_source_relay(
+                task,
+                marker=marker,
+                message=relay.body,
             )
-            message = (
-                f"{marker}\n"
-                f"**Resultado:** {summary}\n"
-                f"**Validação:** {validation_text}\n"
-                f"Detalhes: [execução]({task.execution_permalink})"
-            )
-            self._ensure_source_relay(task, marker=marker, message=message)
         except Exception as exc:
             current = self._require_task(task_id)
             if current.cleanup_state == CLEANUP_PENDING_STATE:
@@ -533,39 +572,128 @@ class CockpitService:
             self._watcher_unfollow_initialized.add(task.task_id)
         self.bridge.watch_main([task.execution_root_id], timeout=None)
         current = self._require_task(task_id)
-        if current.lifecycle in TERMINAL_LIFECYCLES:
+        if (
+            current.lifecycle in TERMINAL_LIFECYCLES
+            or current.cleanup_state == CLEANUP_PENDING_STATE
+        ):
             return False
         self._ensure_owner_unfollowed(
             user_id=current.owner_author_id,
             team_id=current.team_id,
             thread_id=task.execution_root_id,
         )
+        current = self._require_task(task_id)
+        if (
+            current.lifecycle in TERMINAL_LIFECYCLES
+            or current.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        poll_version = current.version
         state_path = self.state_dir / f"{task_id}.json"
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        poll = self.bridge.poll_main(
+        self.bridge.poll_main(
             timeout=30,
             thread_id=task.execution_root_id,
             channel=self.executions_channel_name,
             state=str(state_path),
             max_pages=20,
         )
-        output = poll.stdout.strip()
-        if output and output not in {"NENHUM", "BASELINE"}:
-            bounded = output[:_MAX_RELAY_CHARS]
-            digest = hashlib.sha256(bounded.encode("utf-8")).hexdigest()[:16]
-            marker = f"[cockpit-relay:{task_id}:{digest}]"
-            self._ensure_source_relay(task, marker=marker, message=f"{marker}\n{bounded}")
         thread = self.bot_client.get_thread(task.execution_root_id)
+        post_poll_task = self._require_task(task_id)
+        if (
+            post_poll_task.lifecycle in TERMINAL_LIFECYCLES
+            or post_poll_task.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        if post_poll_task.version != poll_version:
+            return True
         posts = thread.get("posts") or {}
-        max_cursor = max((int(post.get("create_at") or 0) for post in posts.values()), default=task.execution_cursor_ms)
-        current = self._require_task(task_id)
-        if max_cursor > current.execution_cursor_ms:
-            self.store.update_cursors(
-                task_id,
-                expected_version=current.version,
-                execution_cursor_ms=max_cursor,
+        new_posts: list[dict[str, Any]] = []
+        for post in posts.values():
+            if not isinstance(post, dict):
+                continue
+            if post.get("channel_id") != task.executions_channel_id:
+                continue
+            if post.get("user_id") != task.owner_author_id:
+                continue
+            if post.get("root_id") != task.execution_root_id:
+                continue
+            try:
+                create_at = int(post.get("create_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if create_at > task.execution_cursor_ms:
+                new_posts.append(post)
+        new_posts.sort(key=lambda post: (int(post.get("create_at") or 0), str(post.get("id") or "")))
+
+        latest: tuple[dict[str, Any], RenderedRelay] | None = None
+        permalink = self._permalink(task.execution_root_id)
+        for post in new_posts:
+            candidate = render_execution_update(str(post.get("message") or ""), permalink)
+            if candidate is not None:
+                latest = (post, candidate)
+        pre_relay_task = self._require_task(task_id)
+        if (
+            pre_relay_task.lifecycle in TERMINAL_LIFECYCLES
+            or pre_relay_task.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        if pre_relay_task.version != poll_version:
+            return True
+        if latest is not None:
+            post, candidate = latest
+            marker = f"[cockpit-relay:{task_id}:update:{post['id']}]"
+            relay = self._ensure_source_relay(
+                task,
+                marker=marker,
+                message=candidate.body,
+                expected_version=poll_version,
             )
-        self.store.heartbeat_watcher(task_id, owner=self.watcher_owner, heartbeat_at=self.now().astimezone(UTC))
+            if relay is None:
+                current = self._require_task(task_id)
+                return not (
+                    current.lifecycle in TERMINAL_LIFECYCLES
+                    or current.cleanup_state == CLEANUP_PENDING_STATE
+                )
+
+        max_cursor = max(
+            (int(post.get("create_at") or 0) for post in new_posts),
+            default=task.execution_cursor_ms,
+        )
+        pre_cursor_task = self._require_task(task_id)
+        if (
+            pre_cursor_task.lifecycle in TERMINAL_LIFECYCLES
+            or pre_cursor_task.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        if pre_cursor_task.version != poll_version:
+            return True
+        if max_cursor > pre_cursor_task.execution_cursor_ms:
+            try:
+                self.store.update_cursors(
+                    task_id,
+                    expected_version=poll_version,
+                    execution_cursor_ms=max_cursor,
+                )
+            except ValueError:
+                current = self._require_task(task_id)
+                if current.version == poll_version:
+                    raise
+                return not (
+                    current.lifecycle in TERMINAL_LIFECYCLES
+                    or current.cleanup_state == CLEANUP_PENDING_STATE
+                )
+        current = self._require_task(task_id)
+        if (
+            current.lifecycle in TERMINAL_LIFECYCLES
+            or current.cleanup_state == CLEANUP_PENDING_STATE
+        ):
+            return False
+        self.store.heartbeat_watcher(
+            task_id,
+            owner=self.watcher_owner,
+            heartbeat_at=self.now().astimezone(UTC),
+        )
         return True
 
     def watch_forever(self, task_id: str) -> str:
@@ -681,6 +809,27 @@ class CockpitService:
             raise ValueError("execution kickoff mismatch")
         return post
 
+    def _find_owner_reply(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        expected_message: str,
+    ) -> dict[str, Any] | None:
+        if not task.execution_root_id:
+            raise ValueError("execution root is not bound")
+        thread = self.owner_client.get_thread(task.execution_root_id)
+        posts = thread.get("posts") or {}
+        matching = [
+            post
+            for post in posts.values()
+            if str(post.get("message") or "") == expected_message
+        ]
+        if len(matching) > 1:
+            raise ValueError("multiple execution owner relays found")
+        if not matching:
+            return None
+        return self._validate_owner_reply(matching[0], task, expected_message=expected_message)
+
     def _validate_owner_reply(
         self,
         post: dict[str, Any],
@@ -698,17 +847,145 @@ class CockpitService:
             raise ValueError("execution owner relay body mismatch")
         return post
 
-    def _ensure_source_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
+    @staticmethod
+    def _source_relay_props(marker: str) -> dict[str, object]:
+        return {"cockpit_relay_marker": marker, "cockpit_relay_schema": _RELAY_SCHEMA}
+
+    @staticmethod
+    def _post_relay_marker(post: Mapping[str, Any]) -> str | None:
+        props = post.get("props")
+        if isinstance(props, Mapping):
+            value = props.get("cockpit_relay_marker")
+            if isinstance(value, str) and value:
+                return value
+        message = str(post.get("message") or "")
+        if not message:
+            return None
+        first_line = message.splitlines()[0]
+        return first_line if first_line.startswith("[cockpit-") else None
+
+    @overload
+    def _ensure_source_relay(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+        expected_version: None = None,
+        legacy_relays: tuple[tuple[str, str], ...] = (),
+    ) -> dict[str, Any]: ...
+
+    @overload
+    def _ensure_source_relay(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+        expected_version: int,
+        legacy_relays: tuple[tuple[str, str], ...] = (),
+    ) -> dict[str, Any] | None: ...
+
+    def _ensure_source_relay(
+        self,
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+        expected_version: int | None = None,
+        legacy_relays: tuple[tuple[str, str], ...] = (),
+    ) -> dict[str, Any] | None:
         thread = self.bot_client.get_thread(task.source_root_id)
         posts = thread.get("posts") or {}
-        existing = [post for post in posts.values() if marker in str(post.get("message") or "")]
+        relay_contracts = ((marker, message), *legacy_relays)
+        markers = {relay_marker for relay_marker, _ in relay_contracts}
+        existing = [post for post in posts.values() if self._post_relay_marker(post) in markers]
         if len(existing) > 1:
             raise ValueError("multiple source relays found for marker")
         if existing:
-            return self._validate_bot_reply(existing[0], task, expected_message=message)
-        created = self.bot_client.create_post(task.source_channel_id, message, root_id=task.source_root_id)
-        readback = self.bot_client.get_post(str(created.get("id") or ""))
-        return self._validate_bot_reply(readback, task, expected_message=message)
+            existing_marker = self._post_relay_marker(existing[0])
+            last_error: ValueError | None = None
+            for relay_marker, relay_message in relay_contracts:
+                if relay_marker != existing_marker:
+                    continue
+                try:
+                    return self._validate_source_relay_post(
+                        existing[0], task, marker=relay_marker, message=relay_message
+                    )
+                except ValueError as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
+            raise ValueError("relay marker mismatch")
+        if expected_version is not None:
+            current = self._require_task(task.task_id)
+            if (
+                current.lifecycle in TERMINAL_LIFECYCLES
+                or current.cleanup_state == CLEANUP_PENDING_STATE
+                or current.version != expected_version
+            ):
+                return None
+        created = self.bot_client.create_post(
+            task.source_channel_id,
+            message,
+            root_id=task.source_root_id,
+            props=self._source_relay_props(marker),
+        )
+        created_id = str(created.get("id") or "")
+        readback = self.bot_client.get_post(created_id)
+        validated = self._validate_source_relay_post(
+            readback,
+            task,
+            marker=marker,
+            message=message,
+        )
+        if expected_version is not None:
+            current = self._require_task(task.task_id)
+            if (
+                current.lifecycle in TERMINAL_LIFECYCLES
+                or current.cleanup_state == CLEANUP_PENDING_STATE
+                or current.version != expected_version
+            ):
+                self.bot_client.delete_post(created_id)
+                posts = self.bot_client.get_thread(task.source_root_id).get("posts") or {}
+                lingering = posts.get(created_id)
+                if lingering is not None and not int(lingering.get("delete_at") or 0):
+                    raise ValueError("late source relay deletion readback failed")
+                return None
+        return validated
+
+    def _validate_source_relay_post(
+        self,
+        post: dict[str, Any],
+        task: MattermostCockpitTask,
+        *,
+        marker: str,
+        message: str,
+    ) -> dict[str, Any]:
+        if post.get("channel_id") != task.source_channel_id:
+            raise ValueError("relay channel mismatch")
+        if post.get("root_id") != task.source_root_id:
+            raise ValueError("relay root mismatch")
+        if post.get("user_id") != task.watcher_user_id:
+            raise ValueError("relay author mismatch")
+        body = str(post.get("message") or "")
+        props = post.get("props")
+        if props is None or (isinstance(props, Mapping) and not props):
+            if body != f"{marker}\n{message}":
+                raise ValueError("relay body mismatch")
+            return post
+        if not isinstance(props, Mapping):
+            raise ValueError("relay props mismatch")
+        schema = props.get("cockpit_relay_schema")
+        if (
+            props.get("cockpit_relay_marker") != marker
+            or type(schema) is not int
+            or schema != _RELAY_SCHEMA
+        ):
+            raise ValueError("relay props mismatch")
+        if body != message:
+            raise ValueError("relay body mismatch")
+        return post
 
     def _ensure_execution_relay(self, task: MattermostCockpitTask, *, marker: str, message: str) -> dict[str, Any]:
         if not task.execution_root_id:
@@ -767,6 +1044,11 @@ class CockpitService:
         if not text:
             raise ValueError("handoff must not be empty")
         return f"[cockpit-task:{task_id}]\n# {title.strip()}\n\n{text}"
+
+    def _permalink(self, execution_root_id: str | None) -> str:
+        if not execution_root_id:
+            raise ValueError("execution root is not bound")
+        return f"{self.base_url}/{self.team_name}/pl/{execution_root_id}"
 
     def _require_task(self, task_id: str) -> MattermostCockpitTask:
         task = self.store.get_task(task_id)
