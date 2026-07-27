@@ -791,6 +791,78 @@ class CockpitService:
             if task is not None and task.watcher_owner == self.watcher_owner:
                 self.store.release_watcher(task_id, owner=self.watcher_owner)
 
+    def reap_stale(self, *, ttl: timedelta = timedelta(hours=24)) -> dict[str, Any]:
+        if ttl.total_seconds() <= 0:
+            raise ValueError("reaper ttl must be positive")
+        cutoff_ms = int((self.now().astimezone(UTC) - ttl).timestamp() * 1000)
+        ttl_hours = ttl.total_seconds() / 3600
+        ttl_label = str(int(ttl_hours)) if ttl_hours.is_integer() else f"{ttl_hours:g}"
+        result: dict[str, Any] = {
+            "closed": [],
+            "asked": [],
+            "waiting": [],
+            "active": [],
+            "errors": {},
+        }
+        for task in self.store.list_open():
+            try:
+                if task.execution_root_id:
+                    posts = (self.bot_client.get_thread(task.execution_root_id).get("posts") or {}).values()
+                    activity_ms = max(
+                        (
+                            max(int(post.get("update_at") or 0), int(post.get("create_at") or 0))
+                            for post in posts
+                            if isinstance(post, dict)
+                            and post.get("channel_id") == task.executions_channel_id
+                            and (
+                                post.get("id") == task.execution_root_id
+                                or post.get("root_id") == task.execution_root_id
+                            )
+                        ),
+                        default=0,
+                    )
+                else:
+                    activity_ms = int(task.updated_at.timestamp() * 1000)
+                if activity_ms > cutoff_ms:
+                    result["active"].append(task.task_id)
+                    continue
+                if task.cleanup_state == CLEANUP_PENDING_STATE and task.pending_outcome is not None:
+                    self.close(
+                        task.task_id,
+                        outcome=task.pending_outcome,
+                        summary=task.result_summary or "Execução encerrada após concluir a limpeza pendente",
+                        evidence=task.evidence,
+                        last_error=task.last_error,
+                    )
+                    result["closed"].append(task.task_id)
+                    continue
+                if self.store.get_active_gate(task.task_id) is not None:
+                    result["waiting"].append(task.task_id)
+                    continue
+                gate_key = hashlib.sha256(
+                    f"{task.task_id}:{cutoff_ms // 86_400_000}".encode()
+                ).hexdigest()[:16]
+                self.open_gate(
+                    task.task_id,
+                    gate_id=f"reaper-{gate_key}",
+                    decision=OwnerDecisionPrompt(
+                        decision="Decidir se a execução parada deve continuar",
+                        plain_language=(
+                            f"Esta execução está há mais de {ttl_label} horas sem atualização. "
+                            "Preciso saber se devo continuar ou encerrar"
+                        ),
+                        risk=(
+                            "Sem resposta, ela permanece pausada e não será "
+                            "encerrada automaticamente"
+                        ),
+                        reply_instruction="responda continuar ou encerrar",
+                    ),
+                )
+                result["asked"].append(task.task_id)
+            except Exception as exc:
+                result["errors"][task.task_id] = f"{type(exc).__name__}: {exc}"
+        return result
+
     @staticmethod
     def _local_watcher_owner_liveness(owner: str, task_id: str) -> bool | None:
         host, separator, pid_text = owner.rpartition(":")

@@ -418,6 +418,101 @@ def _isolate_hermes_home(_hermetic_environment):
 # 12/15 CI runs because ``tools.approval._session_approved`` carried
 # approvals from one test's session into another's.
 
+_REAL_SYS_PLATFORM = sys.platform
+_RUNTIME_MODULE_PREFIXES = ("hermes_cli", "hermes_state")
+
+
+def _is_runtime_module(name: str) -> bool:
+    return (
+        name == "hermes_constants"
+        or any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in _RUNTIME_MODULE_PREFIXES
+        )
+    )
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_platform(request):
+    """Prevent process-global platform, module, keepalive, and ContextVar leaks."""
+    cli_test = "tests/hermes_cli" in request.node.path.as_posix()
+    reset_session_context = None
+    if cli_test:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_context = reset_session_vars
+        reset_session_context()
+    original_modules = (
+        {
+            name: module
+            for name, module in sys.modules.items()
+            if _is_runtime_module(name)
+        }
+        if cli_test
+        else {}
+    )
+    sys.platform = _REAL_SYS_PLATFORM
+    try:
+        yield
+    finally:
+        sys.platform = _REAL_SYS_PLATFORM
+        if not cli_test:
+            return
+
+        # A few CLI tests intentionally start the process-wide Nous keepalive.
+        # Stop every instance that may have been created through a re-import
+        # before restoring module identity, otherwise its daemon thread can
+        # outlive the test's temporary HERMES_HOME.
+        keepalive_modules = {
+            module
+            for name, module in sys.modules.items()
+            if name == "hermes_cli.nous_auth_keepalive"
+        }
+        original_keepalive = original_modules.get("hermes_cli.nous_auth_keepalive")
+        if original_keepalive is not None:
+            keepalive_modules.add(original_keepalive)
+        for module in keepalive_modules:
+            stop = getattr(module, "stop_nous_auth_keepalive", None)
+            if callable(stop):
+                stop(timeout=1.0)
+
+        # Legacy fixtures delete every hermes_cli module to force a fresh
+        # HERMES_HOME import. Restore the exact pre-test objects afterward so
+        # collection-time references and later imports cannot diverge.
+        new_module_names = sorted(
+            (
+                name
+                for name in sys.modules
+                if _is_runtime_module(name) and name not in original_modules
+            ),
+            key=lambda name: name.count("."),
+            reverse=True,
+        )
+        for name in new_module_names:
+            module = sys.modules.pop(name, None)
+            if "." not in name:
+                continue
+            parent_name, child_name = name.rsplit(".", 1)
+            parent = sys.modules.get(parent_name)
+            if parent is not None and getattr(parent, child_name, None) is module:
+                delattr(parent, child_name)
+        sys.modules.update(original_modules)
+
+        # ``from package import child`` also consults attributes cached on the
+        # package object. Rebind those attributes to the restored child module.
+        for name, module in sorted(
+            original_modules.items(), key=lambda item: item[0].count(".")
+        ):
+            if "." not in name:
+                continue
+            parent_name, child_name = name.rsplit(".", 1)
+            parent = original_modules.get(parent_name) or sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, child_name, module)
+
+        if reset_session_context is not None:
+            reset_session_context()
+
 
 @pytest.fixture()
 def tmp_dir(tmp_path):

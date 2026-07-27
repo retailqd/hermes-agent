@@ -2195,3 +2195,149 @@ def test_relay_status_rejected_for_terminal_task(rig):
             now_text="não deveria postar",
             next_milestone="nunca",
         )
+
+
+def test_reaper_opens_one_structured_gate_for_stale_task(rig):
+    service, store, bot, owner, _, _, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    task = service.create(
+        task_id="task-reaper-stale",
+        title="Revisar execução parada",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:reaper-stale",
+    )
+    root = dict(owner.posts[task.execution_root_id])
+    root["create_at"] = int((now - timedelta(hours=25)).timestamp() * 1000)
+    bot.posts[task.execution_root_id] = root
+
+    first = service.reap_stale()
+    second = service.reap_stale()
+
+    assert first == {
+        "closed": [],
+        "asked": [task.task_id],
+        "waiting": [],
+        "active": [],
+        "errors": {},
+    }
+    assert second == {
+        "closed": [],
+        "asked": [],
+        "waiting": [task.task_id],
+        "active": [],
+        "errors": {},
+    }
+    waiting = store.get_task(task.task_id)
+    assert waiting is not None and waiting.lifecycle is Lifecycle.WAITING_OWNER
+    gate = store.get_active_gate(task.task_id)
+    assert gate is not None
+    prompt = bot.get_post(gate.prompt_post_id)["message"]
+    assert prompt.startswith("**Preciso de uma decisão sua**")
+    assert "continuar ou encerrar" in prompt
+
+
+def test_reaper_ignores_task_with_recent_thread_activity(rig):
+    service, _, bot, owner, _, _, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    task = service.create(
+        task_id="task-reaper-recent",
+        title="Execução recente",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:reaper-recent",
+    )
+    root = dict(owner.posts[task.execution_root_id])
+    root["create_at"] = int((now - timedelta(hours=1)).timestamp() * 1000)
+    bot.posts[task.execution_root_id] = root
+
+    assert service.reap_stale() == {
+        "closed": [],
+        "asked": [],
+        "waiting": [],
+        "active": [task.task_id],
+        "errors": {},
+    }
+
+
+def test_reaper_finishes_stale_cleanup_pending_task(rig):
+    service, store, bot, owner, _, units, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    task = service.create(
+        task_id="task-reaper-cleanup",
+        title="Finalizar limpeza",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:reaper-cleanup",
+    )
+    root = dict(owner.posts[task.execution_root_id])
+    root["create_at"] = int((now - timedelta(hours=25)).timestamp() * 1000)
+    bot.posts[task.execution_root_id] = root
+    prepared = store.prepare_close(
+        task.task_id,
+        expected_version=task.version,
+        outcome=Lifecycle.CANCELLED,
+        result_summary="Execução cancelada",
+        evidence={},
+        last_error=None,
+    )
+    assert prepared.cleanup_state is not None
+
+    result = service.reap_stale()
+
+    assert result["closed"] == [task.task_id]
+    closed = store.get_task(task.task_id)
+    assert closed is not None and closed.lifecycle is Lifecycle.CANCELLED
+    assert task.task_id in units.stopped
+
+
+def test_reaper_isolates_thread_failure_and_continues(rig, monkeypatch):
+    service, store, bot, owner, _, _, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    first = service.create(
+        task_id="task-reaper-broken",
+        title="Execução inacessível",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:reaper-broken",
+    )
+    second = service.create(
+        task_id="task-reaper-healthy",
+        title="Execução parada",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:reaper-healthy",
+    )
+    for task in (first, second):
+        root = dict(owner.posts[task.execution_root_id])
+        root["create_at"] = int((now - timedelta(hours=25)).timestamp() * 1000)
+        bot.posts[task.execution_root_id] = root
+
+    original_get_thread = bot.get_thread
+
+    def selective_get_thread(root_id):
+        if root_id == first.execution_root_id:
+            raise RuntimeError("thread unavailable")
+        return original_get_thread(root_id)
+
+    monkeypatch.setattr(bot, "get_thread", selective_get_thread)
+
+    result = service.reap_stale()
+
+    assert result["errors"] == {first.task_id: "RuntimeError: thread unavailable"}
+    assert result["asked"] == [second.task_id]
+    assert store.get_active_gate(second.task_id) is not None

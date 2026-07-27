@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
+from hermes_cli.mattermost_cockpit import cli as cockpit_cli
 from hermes_cli.mattermost_cockpit.cli import main
 from hermes_cli.mattermost_cockpit.contracts import GateDecision, Lifecycle
 
@@ -20,6 +24,16 @@ class FakeService:
     def status(self, task_id=None):
         self.calls.append(("status", task_id))
         return {"task_id": task_id, "lifecycle": "RUNNING"}
+
+    def reap_stale(self, *, ttl: timedelta):
+        self.calls.append(("reap", ttl))
+        return {
+            "closed": [],
+            "asked": ["task-one"],
+            "waiting": [],
+            "active": [],
+            "errors": {},
+        }
 
     def open_gate(self, task_id, **kwargs):
         self.calls.append(("gate", task_id, kwargs))
@@ -94,6 +108,42 @@ def test_open_gate_reads_prompt_from_stdin():
     assert service.calls == [
         ("gate", "task-one", {"gate_id": "gate-one", "prompt": "Pode aprovar?"})
     ]
+
+
+def test_reap_uses_configurable_ttl_and_returns_summary():
+    service = FakeService()
+    rc, payload, stderr = _run(["reap", "--ttl-hours", "12.5"], service)
+
+    assert rc == 0 and stderr == ""
+    assert payload == {
+        "ok": True,
+        "result": {
+            "closed": [],
+            "asked": ["task-one"],
+            "waiting": [],
+            "active": [],
+            "errors": {},
+        },
+    }
+    assert service.calls == [("reap", timedelta(hours=12.5))]
+
+
+def test_reap_returns_nonzero_when_a_task_errors():
+    service = FakeService()
+    service.reap_stale = lambda *, ttl: {
+        "closed": [],
+        "asked": [],
+        "waiting": [],
+        "active": [],
+        "errors": {"task-one": "RuntimeError: unavailable"},
+    }
+
+    rc, payload, stderr = _run(["reap"], service)
+
+    assert rc == 1 and stderr == ""
+    assert payload is not None
+    assert payload["ok"] is False
+    assert payload["result"]["errors"] == {"task-one": "RuntimeError: unavailable"}
 
 
 def test_resume_owner_message_reads_stdin_and_binds_source_post():
@@ -173,3 +223,35 @@ def test_error_is_json_and_fail_closed():
     rc, payload, stderr = _run(["status", "--task", "task-one"], Broken())
     assert rc == 2 and payload is None
     assert json.loads(stderr) == {"ok": False, "error": "target mismatch"}
+
+
+def test_service_builder_reads_open_task_limit_from_config(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cockpit_cli, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(cockpit_cli, "load_hermes_dotenv", lambda **kwargs: [])
+    monkeypatch.setattr(cockpit_cli, "load_config", lambda: {"mattermost_cockpit": {"max_open_tasks": 7}})
+    values = {
+        "MATTERMOST_URL": "https://mattermost.example",
+        "MATTERMOST_COCKPIT_TEAM_ID": "1" * 26,
+        "MATTERMOST_COCKPIT_MAIN_CHANNEL_ID": "2" * 26,
+        "MATTERMOST_COCKPIT_EXECUTIONS_CHANNEL_ID": "3" * 26,
+        "MATTERMOST_COCKPIT_OWNER_USER_ID": "4" * 26,
+        "MATTERMOST_COCKPIT_BOT_USER_ID": "5" * 26,
+        "MATTERMOST_BOT_TOKEN": "test-bot-token",
+        "MATTERMOST_OWNER_TOKEN": "test-owner-token",
+        "MATTERMOST_COCKPIT_DB": str(tmp_path / "cockpit.db"),
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    service = cockpit_cli.build_service_from_env()
+
+    assert service.store._max_open_tasks == 7
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "4"])
+def test_service_builder_rejects_invalid_open_task_limit(value, monkeypatch):
+    monkeypatch.setattr(cockpit_cli, "load_hermes_dotenv", lambda **kwargs: [])
+    monkeypatch.setattr(cockpit_cli, "load_config", lambda: {"mattermost_cockpit": {"max_open_tasks": value}})
+
+    with pytest.raises(ValueError, match="max_open_tasks"):
+        cockpit_cli.build_service_from_env()
