@@ -1630,9 +1630,10 @@ mattermost_cockpit:
   max_open_tasks: 4
 ```
 
-The default is `4`. The limit is enforced transactionally in the cockpit SQLite
-store, so concurrent creates cannot exceed it. Existing open tasks keep running;
-new creates are rejected until the count drops below the configured ceiling.
+The default is `4`. Set `max_open_tasks: null` for unlimited open tasks. The
+limit is enforced transactionally in the cockpit SQLite store, so concurrent
+creates cannot exceed it. Existing open tasks keep running; new creates are
+rejected until the count drops below the configured ceiling.
 
 The cockpit reaper is available as
 `hermes-mattermost-cockpit reap --ttl-hours 24`. It asks the owner how to proceed

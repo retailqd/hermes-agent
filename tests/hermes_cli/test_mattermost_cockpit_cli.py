@@ -225,10 +225,9 @@ def test_error_is_json_and_fail_closed():
     assert json.loads(stderr) == {"ok": False, "error": "target mismatch"}
 
 
-def test_service_builder_reads_open_task_limit_from_config(tmp_path: Path, monkeypatch):
+def _set_cockpit_env(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cockpit_cli, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(cockpit_cli, "load_hermes_dotenv", lambda **kwargs: [])
-    monkeypatch.setattr(cockpit_cli, "load_config", lambda: {"mattermost_cockpit": {"max_open_tasks": 7}})
     values = {
         "MATTERMOST_URL": "https://mattermost.example",
         "MATTERMOST_COCKPIT_TEAM_ID": "1" * 26,
@@ -243,14 +242,38 @@ def test_service_builder_reads_open_task_limit_from_config(tmp_path: Path, monke
     for key, value in values.items():
         monkeypatch.setenv(key, value)
 
+
+def test_service_builder_defaults_open_task_limit_when_config_key_is_missing(tmp_path: Path, monkeypatch):
+    _set_cockpit_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cockpit_cli, "load_config", lambda: {"mattermost_cockpit": {}})
+
     service = cockpit_cli.build_service_from_env()
 
-    assert service.store._max_open_tasks == 7
+    assert service.store._max_open_tasks == 4
 
 
-@pytest.mark.parametrize("value", [0, -1, True, "4"])
-def test_service_builder_rejects_invalid_open_task_limit(value, monkeypatch):
-    monkeypatch.setattr(cockpit_cli, "load_hermes_dotenv", lambda **kwargs: [])
+def test_service_builder_allows_explicit_unlimited_open_task_limit(tmp_path: Path, monkeypatch):
+    _set_cockpit_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cockpit_cli, "load_config", lambda: {"mattermost_cockpit": {"max_open_tasks": None}})
+
+    service = cockpit_cli.build_service_from_env()
+
+    assert service.store._max_open_tasks is None
+
+
+@pytest.mark.parametrize("value", [7])
+def test_service_builder_reads_open_task_limit_from_config(value, tmp_path: Path, monkeypatch):
+    _set_cockpit_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cockpit_cli, "load_config", lambda: {"mattermost_cockpit": {"max_open_tasks": value}})
+
+    service = cockpit_cli.build_service_from_env()
+
+    assert service.store._max_open_tasks == value
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "4", 4.0])
+def test_service_builder_rejects_invalid_open_task_limit(value, tmp_path: Path, monkeypatch):
+    _set_cockpit_env(tmp_path, monkeypatch)
     monkeypatch.setattr(cockpit_cli, "load_config", lambda: {"mattermost_cockpit": {"max_open_tasks": value}})
 
     with pytest.raises(ValueError, match="max_open_tasks"):

@@ -95,8 +95,11 @@ def build_service_from_env() -> CockpitService:
     if not isinstance(cockpit_config, dict):
         raise ValueError("mattermost_cockpit config must be a mapping")
     max_open_tasks = cockpit_config.get("max_open_tasks", 4)
-    if isinstance(max_open_tasks, bool) or not isinstance(max_open_tasks, int) or max_open_tasks < 1:
-        raise ValueError("mattermost_cockpit.max_open_tasks must be a positive integer")
+    # Omit the key to keep the historical default of 4. Set null for unlimited.
+    if max_open_tasks is not None and (
+        isinstance(max_open_tasks, bool) or not isinstance(max_open_tasks, int) or max_open_tasks < 1
+    ):
+        raise ValueError("mattermost_cockpit.max_open_tasks must be a positive integer or null")
     base_url = _first_env("MATTERMOST_URL", "MATTERMOST_BASE_URL", "MATTERMOST_SERVER_URL")
     contracts = MattermostCockpitContracts(
         team_id=_required_env("MATTERMOST_COCKPIT_TEAM_ID"),
