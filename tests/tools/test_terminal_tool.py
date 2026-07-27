@@ -202,6 +202,17 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
 
 
+def test_validate_workdir_allows_accented_unicode_paths():
+    assert terminal_tool._validate_workdir("/home/pht2/Projetos Programação/GeneralPipes") is None
+    assert terminal_tool._validate_workdir("/home/pht2/Programação/frontend") is None
+
+
+def test_validate_workdir_still_blocks_shell_metacharacters_with_accents():
+    assert terminal_tool._validate_workdir("/home/pht2/Programação; rm -rf /")
+    assert terminal_tool._validate_workdir("/home/pht2/Programação$(whoami)")
+    assert terminal_tool._validate_workdir("/home/pht2/Programação|cat")
+
+
 def test_get_env_config_ignores_bad_docker_json_for_local_backend(monkeypatch):
     """Docker-only JSON env vars must not break the default local backend."""
     monkeypatch.setenv("TERMINAL_ENV", "local")

@@ -3976,7 +3976,7 @@ def refresh_launchd_plist_if_needed() -> bool:
             pass
         # Retry until launchctl LISTS the label (not merely a zero bootstrap
         # exit) or the drain window elapses. The failure happens while the old
-        # gateway is still draining (default agent.restart_drain_timeout=180s),
+        # gateway is still draining (agent.restart_drain_timeout, default 0),
         # so a fixed ~10s window is too short — bound by that budget instead.
         _reload_budget = int(max(30.0, _get_restart_drain_timeout()))
         reload_script = (

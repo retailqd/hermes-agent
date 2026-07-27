@@ -10445,7 +10445,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 return cmd
 
             # Drain budget for graceful SIGUSR1 restarts.  The gateway drains
-            # for up to ``agent.restart_drain_timeout`` (default 60s) before
+            # for up to ``agent.restart_drain_timeout`` (default 0) before
             # exiting with code 75; we wait slightly longer so the drain
             # completes before we fall back to a hard restart.  On older
             # systemd units without SIGUSR1 wiring this wait just times out

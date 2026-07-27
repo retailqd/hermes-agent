@@ -287,10 +287,11 @@ def _check_all_guards(command: str, env_type: str,
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
-# Covers alphanumeric, path separators, Windows drive/UNC separators, tilde,
-# dot, hyphen, underscore, space, plus, at, equals, and comma.  Everything
-# else is rejected.
-_WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:_\-.~ +@=,]+$')
+# Covers word characters in any script (Unicode letters/digits/underscore, so
+# accented dirs like "Programação" pass), path separators, Windows drive/UNC
+# separators, tilde, dot, hyphen, space, plus, at, equals, and comma.  Shell
+# metacharacters stay rejected.
+_WORKDIR_SAFE_RE = re.compile(r'^[\w/\\:\-.~ +@=,]+$', re.UNICODE)
 
 
 def _validate_workdir(workdir: str) -> str | None:
