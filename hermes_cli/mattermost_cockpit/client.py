@@ -110,6 +110,19 @@ class MattermostClient:
             payload["props"] = dict(props)
         return self._request_json_object("PUT", f"/api/v4/posts/{post_id}", payload)
 
+    def add_reaction(self, *, user_id: str, post_id: str, emoji_name: str) -> dict[str, Any]:
+        return self._request_json_object(
+            "POST",
+            "/api/v4/reactions",
+            {"user_id": user_id, "post_id": post_id, "emoji_name": emoji_name},
+        )
+
+    def remove_reaction(self, *, user_id: str, post_id: str, emoji_name: str) -> dict[str, Any]:
+        return self._request_json_object(
+            "DELETE",
+            f"/api/v4/users/{user_id}/posts/{post_id}/reactions/{emoji_name}",
+        )
+
     def set_thread_following(
         self,
         *,

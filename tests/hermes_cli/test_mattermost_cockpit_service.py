@@ -115,6 +115,16 @@ class FakeClient:
         self.events.append(f"update:{self.user_id}:{post_id}")
         return dict(post)
 
+    def add_reaction(self, *, user_id: str, post_id: str, emoji_name: str) -> dict:
+        self.reactions = getattr(self, "reactions", [])
+        self.reactions.append((user_id, post_id, emoji_name))
+        return {"status": "OK"}
+
+    def remove_reaction(self, *, user_id: str, post_id: str, emoji_name: str) -> dict:
+        self.reactions = getattr(self, "reactions", [])
+        self.reactions = [r for r in self.reactions if r != (user_id, post_id, emoji_name)]
+        return {"status": "OK"}
+
     def search_posts(self, team_id: str, terms: str) -> dict:
         assert team_id == TEAM
         matches = {pid: p for pid, p in self.posts.items() if terms in p.get("message", "")}
@@ -2464,3 +2474,48 @@ def test_open_gate_never_fails_because_of_origin_notice(rig, monkeypatch):
 
     assert current.lifecycle is Lifecycle.WAITING_OWNER
     assert store.get_active_gate(task.task_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# Lógica de fechamento: selo na raiz + revisão do dono
+# ---------------------------------------------------------------------------
+
+
+def test_close_succeeded_marks_root_pending_review(rig):
+    service, _, bot, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-seal-eyes", "source:seal-eyes")
+    service.close(task.task_id, **_close_kwargs())
+    assert (service.contracts.watcher_user_id, task.source_root_id, "eyes") in getattr(bot, "reactions", [])
+
+
+def test_close_cancelled_seals_root_directly(rig):
+    service, _, bot, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-seal-cancel", "source:seal-cancel")
+    service.close(
+        task.task_id,
+        outcome=Lifecycle.CANCELLED,
+        summary="Encerrada durante o teste.",
+        evidence={"validation": "test"},
+        last_error=None,
+    )
+    assert (service.contracts.watcher_user_id, task.source_root_id, "no_entry_sign") in getattr(bot, "reactions", [])
+
+
+def test_seal_reviewed_swaps_eyes_for_check(rig):
+    service, _, bot, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-seal-review", "source:seal-review")
+    service.close(task.task_id, **_close_kwargs())
+
+    result = service.seal_reviewed(task.task_id)
+
+    reactions = getattr(bot, "reactions", [])
+    assert (service.contracts.watcher_user_id, task.source_root_id, "eyes") not in reactions
+    assert (service.contracts.watcher_user_id, task.source_root_id, "white_check_mark") in reactions
+    assert result["sealed"] == "white_check_mark"
+
+
+def test_seal_reviewed_rejects_open_task(rig):
+    service, _, _, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-seal-open", "source:seal-open")
+    with pytest.raises(ValueError, match="terminal"):
+        service.seal_reviewed(task.task_id)

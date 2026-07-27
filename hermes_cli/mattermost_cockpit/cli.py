@@ -58,6 +58,9 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--source-root-id")
     resume.add_argument("--source-post-id")
 
+    seal = commands.add_parser("seal")
+    seal.add_argument("--task", required=True)
+
     status_relay = commands.add_parser("status-relay")
     status_relay.add_argument("--task", required=True)
     status_relay.add_argument("--now", required=True, dest="status_now")
@@ -190,6 +193,8 @@ def main(
             else:
                 task = service.open_gate(args.task, gate_id=args.gate_id, prompt=stdin.read())
             payload = _task_payload(task)
+        elif args.command == "seal":
+            payload = {"ok": True, "result": service.seal_reviewed(args.task)}
         elif args.command == "status-relay":
             record = service.relay_status(
                 args.task,

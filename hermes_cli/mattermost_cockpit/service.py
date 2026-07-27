@@ -643,7 +643,54 @@ class CockpitService:
         )
         self._audit(closed, "task_closed", {"outcome": outcome.value}, f"close:{task_id}")
         self._notify_order_origin(closed, outcome)
+        self._seal_source_root(closed, outcome)
         return closed
+
+    def _seal_source_root(self, task: MattermostCockpitTask, outcome: Lifecycle) -> None:
+        """Lógica de fechamento visível (pedido do dono 2026-07-27).
+
+        A entrega não é o lacre: sucesso marca a raiz com 👀 (entregue,
+        aguardando a revisão do dono; ele responde "fechar" e o selo vira ✅
+        via CLI `seal`); falha ❌ e cancelamento 🚫 lacram direto. Reação na
+        raiz é o "arquivo" honesto do Mattermost (mover thread é desabilitado
+        no servidor). Best-effort: selo nunca falha um close.
+        """
+        emoji = {
+            Lifecycle.SUCCEEDED: "eyes",
+            Lifecycle.FAILED: "x",
+            Lifecycle.CANCELLED: "no_entry_sign",
+        }.get(outcome)
+        if not emoji:
+            return
+        try:
+            self.bot_client.add_reaction(
+                user_id=self.contracts.watcher_user_id,
+                post_id=task.source_root_id,
+                emoji_name=emoji,
+            )
+        except Exception:
+            pass
+
+    def seal_reviewed(self, task_id: str) -> dict[str, str]:
+        """Dono revisou e mandou fechar: troca 👀 por ✅ na raiz da task."""
+        task = self._require_task(task_id)
+        if task.lifecycle not in TERMINAL_LIFECYCLES:
+            raise ValueError("only terminal tasks can be sealed")
+        try:
+            self.bot_client.remove_reaction(
+                user_id=self.contracts.watcher_user_id,
+                post_id=task.source_root_id,
+                emoji_name="eyes",
+            )
+        except Exception:
+            pass
+        self.bot_client.add_reaction(
+            user_id=self.contracts.watcher_user_id,
+            post_id=task.source_root_id,
+            emoji_name="white_check_mark",
+        )
+        self._audit(task, "owner_sealed", {}, f"seal:{task_id}")
+        return {"task_id": task_id, "sealed": "white_check_mark"}
 
     def _notify_order_origin(self, task: MattermostCockpitTask, outcome: Lifecycle) -> None:
         emoji = "✅" if outcome is Lifecycle.SUCCEEDED else "❌"
