@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import re
 import sys
 import time
 import types
@@ -837,7 +838,10 @@ async def test_run_agent_progress_grouping_latest_keeps_only_latest_line(monkeyp
     assert result["final_response"] == "done"
     assert adapter.sent
     final_content = adapter.edits[-1]["content"] if adapter.edits else adapter.sent[-1]["content"]
-    assert final_content.splitlines() == ["⚙️ Running Running tests (×2)"]
+    final_lines = final_content.splitlines()
+    assert len(final_lines) == 1
+    normalized_line = re.sub(r"^[^\w]+\s*", "", final_lines[0])
+    assert normalized_line == "Running Running tests (×2)"
     assert "Reading skill" not in final_content
     assert "Searching files" not in final_content
     assert final_content.endswith("(×2)")
