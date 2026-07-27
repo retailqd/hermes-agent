@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -491,3 +493,100 @@ def test_audit_events_require_fk_dedupe_restart_persistence_and_quick_check(stor
 
     with restarted.connect() as conn:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+
+def test_open_task_limit_allows_replay_and_releases_capacity(
+    tmp_path: Path,
+    contracts: MattermostCockpitContracts,
+    utc_now: datetime,
+) -> None:
+    limited = MattermostCockpitStore(
+        db_path=tmp_path / "limited.db",
+        contracts=contracts,
+        max_open_tasks=2,
+    )
+    first = limited.create_task(
+        _task(
+            task_id="1" * 26,
+            source_post_id="1" * 26,
+            dedupe_key="source:one",
+            created_at=utc_now,
+            updated_at=utc_now,
+        )
+    )
+    limited.create_task(
+        _task(
+            task_id="2" * 26,
+            source_post_id="2" * 26,
+            dedupe_key="source:two",
+            created_at=utc_now,
+            updated_at=utc_now,
+        )
+    )
+
+    replay = limited.create_task(
+        _task(
+            task_id="9" * 26,
+            source_post_id="1" * 26,
+            dedupe_key="source:one",
+            created_at=utc_now,
+            updated_at=utc_now,
+        )
+    )
+    assert replay.task_id == first.task_id
+
+    third = _task(
+        task_id="3" * 26,
+        source_post_id="3" * 26,
+        dedupe_key="source:three",
+        created_at=utc_now,
+        updated_at=utc_now,
+    )
+    with pytest.raises(ValueError, match=r"open task limit reached \(2\)"):
+        limited.create_task(third)
+
+    current = limited.get_task(first.task_id)
+    assert current is not None
+    limited.transition(
+        first.task_id,
+        expected_version=current.version,
+        lifecycle=Lifecycle.CANCELLED,
+        result_summary="Capacidade liberada",
+        closed_at=utc_now,
+    )
+    assert limited.create_task(third).task_id == third.task_id
+
+
+def test_open_task_limit_is_atomic_across_concurrent_writers(
+    tmp_path: Path,
+    contracts: MattermostCockpitContracts,
+    utc_now: datetime,
+) -> None:
+    db_path = tmp_path / "concurrent-limit.db"
+    stores = [
+        MattermostCockpitStore(db_path=db_path, contracts=contracts, max_open_tasks=1),
+        MattermostCockpitStore(db_path=db_path, contracts=contracts, max_open_tasks=1),
+    ]
+    barrier = threading.Barrier(2)
+
+    def create(index: int) -> str:
+        barrier.wait()
+        try:
+            stores[index].create_task(
+                _task(
+                    task_id=str(index + 4) * 26,
+                    source_post_id=str(index + 4) * 26,
+                    dedupe_key=f"source:concurrent:{index}",
+                    created_at=utc_now,
+                    updated_at=utc_now,
+                )
+            )
+        except ValueError as exc:
+            return str(exc)
+        return "created"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(create, range(2)))
+
+    assert outcomes.count("created") == 1
+    assert outcomes.count("open task limit reached (1)") == 1

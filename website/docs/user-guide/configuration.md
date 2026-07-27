@@ -1621,6 +1621,24 @@ For separate natural mid-turn assistant updates without progressive token editin
 The master `streaming.enabled` switch is `false` by default — nothing streams until you flip it. Once enabled, streaming is decided **per platform**: Telegram ships with `display.platforms.telegram.streaming: true` (streams) and Discord with `display.platforms.discord.streaming: false` (does not). So after enabling streaming, Telegram streams out of the box and Discord stays on whole-message replies until you change its toggle. You can adjust these per-platform switches from the dashboard's **Channels** toggles or directly in `~/.hermes/config.yaml`.
 :::
 
+## Mattermost Cockpit Task Limit
+
+Limit how many non-terminal cockpit tasks may be open at once:
+
+```yaml
+mattermost_cockpit:
+  max_open_tasks: 4
+```
+
+The default is `4`. The limit is enforced transactionally in the cockpit SQLite
+store, so concurrent creates cannot exceed it. Existing open tasks keep running;
+new creates are rejected until the count drops below the configured ceiling.
+
+The cockpit reaper is available as
+`hermes-mattermost-cockpit reap --ttl-hours 24`. It asks the owner how to proceed
+when a task has no execution-thread activity beyond the configured TTL, and it
+finishes tasks that were already waiting only for close cleanup.
+
 ## Group Chat Session Isolation
 
 Limit how many chat sessions can actively be open across CLI, TUI/dashboard,

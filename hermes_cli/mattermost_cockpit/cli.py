@@ -5,9 +5,11 @@ import json
 import os
 import sys
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Callable, TextIO
 
+from hermes_cli.config import load_config
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import get_hermes_home
 
@@ -33,6 +35,9 @@ def _parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status")
     status.add_argument("--task")
+
+    reap = commands.add_parser("reap")
+    reap.add_argument("--ttl-hours", type=float, default=24.0)
 
     gate = commands.add_parser("gate")
     gate.add_argument("--task", required=True)
@@ -85,6 +90,13 @@ def _first_env(*names: str) -> str:
 def build_service_from_env() -> CockpitService:
     home = get_hermes_home()
     load_hermes_dotenv(hermes_home=home)
+    config = load_config() or {}
+    cockpit_config = config.get("mattermost_cockpit") or {}
+    if not isinstance(cockpit_config, dict):
+        raise ValueError("mattermost_cockpit config must be a mapping")
+    max_open_tasks = cockpit_config.get("max_open_tasks", 4)
+    if isinstance(max_open_tasks, bool) or not isinstance(max_open_tasks, int) or max_open_tasks < 1:
+        raise ValueError("mattermost_cockpit.max_open_tasks must be a positive integer")
     base_url = _first_env("MATTERMOST_URL", "MATTERMOST_BASE_URL", "MATTERMOST_SERVER_URL")
     contracts = MattermostCockpitContracts(
         team_id=_required_env("MATTERMOST_COCKPIT_TEAM_ID"),
@@ -104,7 +116,11 @@ def build_service_from_env() -> CockpitService:
         default_channel=os.environ.get("MATTERMOST_COCKPIT_EXECUTIONS_CHANNEL_NAME", "execucoes"),
     )
     db_path = Path(os.environ.get("MATTERMOST_COCKPIT_DB", MattermostCockpitStore.default_db_path()))
-    store = MattermostCockpitStore(db_path=db_path, contracts=contracts)
+    store = MattermostCockpitStore(
+        db_path=db_path,
+        contracts=contracts,
+        max_open_tasks=max_open_tasks,
+    )
     return CockpitService(
         store=store,
         contracts=contracts,
@@ -149,6 +165,12 @@ def main(
             payload = _task_payload(task)
         elif args.command == "status":
             payload = {"ok": True, "result": service.status(args.task)}
+        elif args.command == "reap":
+            result = service.reap_stale(ttl=timedelta(hours=args.ttl_hours))
+            payload = {
+                "ok": not bool(result.get("errors")),
+                "result": result,
+            }
         elif args.command == "gate":
             if args.decision_json_stdin:
                 raw = json.loads(stdin.read())
@@ -205,7 +227,7 @@ def main(
             )
             payload = _task_payload(task)
         stdout.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-        return 0
+        return 0 if payload.get("ok") else 1
     except Exception as exc:
         message = str(exc).replace("\r", " ").replace("\n", " ")[:1000]
         stderr.write(json.dumps({"ok": False, "error": message}, ensure_ascii=False, sort_keys=True) + "\n")

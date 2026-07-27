@@ -19,9 +19,7 @@ def test_no_duplicate_skills_subparser():
     # argparse.ArgumentError at module load time
     import sys
 
-    # Remove cached module if present
-    if 'hermes_cli.main' in sys.modules:
-        del sys.modules['hermes_cli.main']
+    original_main = sys.modules.pop("hermes_cli.main", None)
 
     try:
         import hermes_cli.main  # noqa: F401
@@ -32,3 +30,8 @@ def test_no_duplicate_skills_subparser():
                 "See issue #898 for details."
             ) from e
         raise
+    finally:
+        if original_main is not None:
+            sys.modules["hermes_cli.main"] = original_main
+        else:
+            sys.modules.pop("hermes_cli.main", None)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -150,10 +151,14 @@ class MattermostCockpitStore:
         db_path: Path | None = None,
         contracts: MattermostCockpitContracts,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        max_open_tasks: int | None = None,
     ) -> None:
         self._db_path = Path(db_path) if db_path is not None else self.default_db_path()
         self._contracts = contracts
         self._busy_timeout_ms = int(busy_timeout_ms) if int(busy_timeout_ms) > 0 else DEFAULT_BUSY_TIMEOUT_MS
+        if max_open_tasks is not None and (isinstance(max_open_tasks, bool) or int(max_open_tasks) < 1):
+            raise ValueError("max_open_tasks must be a positive integer")
+        self._max_open_tasks = int(max_open_tasks) if max_open_tasks is not None else None
 
     @staticmethod
     def default_db_path() -> Path:
@@ -164,7 +169,16 @@ class MattermostCockpitStore:
         conn = sqlite3.connect(str(self._db_path), timeout=self._busy_timeout_ms / 1000.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-        conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        deadline = time.monotonic() + (self._busy_timeout_ms / 1000.0)
+        while True:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    conn.close()
+                    raise
+                time.sleep(0.01)
         conn.execute("PRAGMA foreign_keys=ON")
         self._initialize(conn)
         return conn
@@ -266,6 +280,16 @@ class MattermostCockpitStore:
                     if existing.creation_binding() != task.creation_binding():
                         raise ValueError("dedupe collision: immutable binding differs")
                     return existing
+            if self._max_open_tasks is not None:
+                placeholders = ", ".join("?" for _ in NONTERMINAL_LIFECYCLES)
+                open_count = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM cockpit_tasks WHERE lifecycle IN ({placeholders})",
+                        tuple(state.value for state in NONTERMINAL_LIFECYCLES),
+                    ).fetchone()[0]
+                )
+                if open_count >= self._max_open_tasks:
+                    raise ValueError(f"open task limit reached ({self._max_open_tasks})")
             record = task.to_record()
             conn.execute(
                 TASK_INSERT_SQL,

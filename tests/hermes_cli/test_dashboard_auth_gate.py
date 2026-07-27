@@ -15,6 +15,26 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def _restore_dashboard_app_state():
+    """Keep server-start tests from leaking FastAPI app state across files."""
+    sentinel = object()
+    names = ("auth_required", "bound_host", "bound_port")
+    previous = {
+        name: getattr(web_server.app.state, name, sentinel)
+        for name in names
+    }
+    yield
+    for name, value in previous.items():
+        if value is sentinel:
+            try:
+                delattr(web_server.app.state, name)
+            except (AttributeError, KeyError):
+                pass
+        else:
+            setattr(web_server.app.state, name, value)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with

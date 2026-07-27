@@ -98,8 +98,14 @@ def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://old.example/v1")
     monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
 
-    sys.modules.pop("hermes_cli.main", None)
-    importlib.import_module("hermes_cli.main")
+    original_main = sys.modules.pop("hermes_cli.main", None)
+    try:
+        importlib.import_module("hermes_cli.main")
+    finally:
+        if original_main is not None:
+            sys.modules["hermes_cli.main"] = original_main
+        else:
+            sys.modules.pop("hermes_cli.main", None)
 
     assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
     assert os.getenv("HERMES_INFERENCE_PROVIDER") == "custom"

@@ -11,11 +11,6 @@ from unittest.mock import patch
 
 import pytest
 
-if "dotenv" not in sys.modules:
-    fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
-    sys.modules["dotenv"] = fake_dotenv
-
 from hermes_cli.auth import resolve_provider
 from hermes_cli.config import load_config
 from hermes_cli.models import (
@@ -306,23 +301,28 @@ class TestGmiAuxiliary:
 
 class TestGmiMainFlow:
     def test_chat_parser_accepts_gmi_provider(self, monkeypatch):
+        import importlib
+
         recorded: dict[str, str] = {}
+        main_module = importlib.import_module("hermes_cli.main")
 
         monkeypatch.setattr("hermes_cli.config.get_container_exec_info", lambda: None)
         monkeypatch.setattr(
-            "hermes_cli.main.cmd_chat",
+            main_module,
+            "cmd_chat",
             lambda args: recorded.setdefault("provider", args.provider),
         )
         monkeypatch.setattr(sys, "argv", ["hermes", "chat", "--provider", "gmi"])
 
-        from hermes_cli.main import main
-
-        main()
+        main_module.main()
 
         assert recorded["provider"] == "gmi"
 
     def test_select_provider_and_model_routes_gmi_to_generic_flow(self, monkeypatch):
+        import importlib
+
         recorded: dict[str, str] = {}
+        main_module = importlib.import_module("hermes_cli.main")
 
         monkeypatch.setattr("hermes_cli.auth.resolve_provider", lambda *args, **kwargs: None)
 
@@ -332,12 +332,10 @@ class TestGmiMainFlow:
         def fake_model_flow_api_key_provider(config, provider_id, current_model=""):
             recorded["provider_id"] = provider_id
 
-        monkeypatch.setattr("hermes_cli.main._prompt_provider_choice", fake_prompt_provider_choice)
-        monkeypatch.setattr("hermes_cli.main._model_flow_api_key_provider", fake_model_flow_api_key_provider)
+        monkeypatch.setattr(main_module, "_prompt_provider_choice", fake_prompt_provider_choice)
+        monkeypatch.setattr(main_module, "_model_flow_api_key_provider", fake_model_flow_api_key_provider)
 
-        from hermes_cli.main import select_provider_and_model
-
-        select_provider_and_model()
+        main_module.select_provider_and_model()
 
         assert recorded["provider_id"] == "gmi"
 

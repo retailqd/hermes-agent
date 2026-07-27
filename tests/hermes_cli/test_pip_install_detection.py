@@ -20,6 +20,15 @@ def test_git_install_detected_when_git_dir_exists(tmp_path):
         assert method == "git"
 
 
+def test_git_worktree_detected_when_git_pointer_file_exists(tmp_path):
+    """Linked git worktrees store .git as a pointer file, not a directory."""
+    (tmp_path / ".git").write_text("gitdir: /repo/.git/worktrees/example\n")
+    with patch("hermes_cli.config.get_managed_system", return_value=None), \
+         patch("hermes_cli.config.get_hermes_home", return_value=tmp_path):
+        from hermes_cli.config import detect_install_method
+        assert detect_install_method(project_root=tmp_path) == "git"
+
+
 def test_managed_install_takes_precedence(tmp_path):
     """When HERMES_MANAGED is set, that takes precedence over git detection."""
     (tmp_path / ".git").mkdir()

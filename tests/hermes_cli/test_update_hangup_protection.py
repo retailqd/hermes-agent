@@ -8,6 +8,7 @@ that ``hermes update`` survives a terminal disconnect mid-install
 
 from __future__ import annotations
 
+import importlib
 import io
 import signal
 import sys
@@ -21,6 +22,20 @@ from hermes_cli.main import (
     _log_only_write,
     _run_logged_subprocess,
 )
+
+
+@pytest.fixture(autouse=True)
+def _refresh_main_symbols_after_reload():
+    """Rebind symbols that other CLI tests may replace via importlib.reload."""
+    module = importlib.import_module("hermes_cli.main")
+    for name in (
+        "_UpdateOutputStream",
+        "_finalize_update_output",
+        "_install_hangup_protection",
+        "_log_only_write",
+        "_run_logged_subprocess",
+    ):
+        globals()[name] = getattr(module, name)
 
 
 # -----------------------------------------------------------------------------
