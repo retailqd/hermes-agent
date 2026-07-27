@@ -2416,3 +2416,51 @@ def test_close_never_fails_because_of_origin_notice(rig, monkeypatch):
 
     assert closed.lifecycle is Lifecycle.SUCCEEDED
     assert store.get_task(task.task_id).lifecycle is Lifecycle.SUCCEEDED
+
+
+def test_open_gate_notifies_ordens_room_when_origin_marker_present(rig, monkeypatch):
+    service, _, bot, _, _, _, _ = rig
+    monkeypatch.setenv("ORDENS_MATRIX_ROOM", "!room:example.org")
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(service, "_send_matrix_notice", lambda room, text: sent.append((room, text)))
+    task = _t7_running_task(service, "task-gate-ordens", "source:gate-ordens")
+    bot.posts[task.source_root_id]["message"] += "\n**Origem:** conversa no Ordens (Matrix), 2026-07-27"
+
+    service.open_gate(task.task_id, gate_id="gate-ordens", decision=_t7_decision())
+
+    gate_notices = [t for _, t in sent if t.startswith("🚦")]
+    assert len(gate_notices) == 1
+    assert "Preciso de uma decisão sua" in gate_notices[0]
+
+    # replay idempotente do mesmo gate não re-notifica
+    service.open_gate(task.task_id, gate_id="gate-ordens", decision=_t7_decision())
+    assert len([t for _, t in sent if t.startswith("🚦")]) == 1
+
+
+def test_open_gate_does_not_notify_without_origin_marker(rig, monkeypatch):
+    service, _, _, _, _, _, _ = rig
+    monkeypatch.setenv("ORDENS_MATRIX_ROOM", "!room:example.org")
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(service, "_send_matrix_notice", lambda room, text: sent.append((room, text)))
+    task = _t7_running_task(service, "task-gate-sem-origem", "source:gate-sem-origem")
+
+    service.open_gate(task.task_id, gate_id="gate-sem-origem", decision=_t7_decision())
+
+    assert sent == []
+
+
+def test_open_gate_never_fails_because_of_origin_notice(rig, monkeypatch):
+    service, store, bot, _, _, _, _ = rig
+    monkeypatch.setenv("ORDENS_MATRIX_ROOM", "!room:example.org")
+
+    def boom(room, text):
+        raise RuntimeError("matrix fora do ar")
+
+    monkeypatch.setattr(service, "_send_matrix_notice", boom)
+    task = _t7_running_task(service, "task-gate-boom", "source:gate-boom")
+    bot.posts[task.source_root_id]["message"] += "\n**Origem:** conversa no Ordens (Matrix), 2026-07-27"
+
+    current = service.open_gate(task.task_id, gate_id="gate-boom", decision=_t7_decision())
+
+    assert current.lifecycle is Lifecycle.WAITING_OWNER
+    assert store.get_active_gate(task.task_id) is not None

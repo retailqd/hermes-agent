@@ -191,6 +191,10 @@ class CockpitService:
                     self._audit(blocked, "execution_start_blocked", {"error_type": exc.__class__.__name__}, f"start-blocked:{blocked.version}")
                 except Exception:
                     pass
+                self._origin_notice(
+                    blocked,
+                    f"⛔ Travou e preciso de ajuda: {blocked.title}\n{self._permalink(blocked.source_root_id)}",
+                )
             raise
 
     def _ensure_owner_unfollowed(
@@ -301,7 +305,8 @@ class CockpitService:
                         updated_at=self.now().astimezone(UTC),
                     )
                 )
-            if gate.prompt_post_id == pending_prompt_post_id:
+            newly_posted = gate.prompt_post_id == pending_prompt_post_id
+            if newly_posted:
                 post = self._ensure_source_relay(
                     task,
                     marker=marker,
@@ -331,6 +336,11 @@ class CockpitService:
                 lifecycle=Lifecycle.WAITING_OWNER,
             )
         self._audit(current, "owner_gate_opened", {"gate_id": gate_id, "prompt_post_id": gate.prompt_post_id}, f"gate:{gate_id}")
+        if newly_posted:
+            self._origin_notice(
+                current,
+                f"🚦 Preciso de uma decisão sua: {current.title}\n{self._permalink(current.source_root_id)}",
+            )
         return current
 
     @staticmethod
@@ -636,12 +646,18 @@ class CockpitService:
         return closed
 
     def _notify_order_origin(self, task: MattermostCockpitTask, outcome: Lifecycle) -> None:
-        """Fecha o ciclo da sala Ordens: ordem nascida lá recebe o desfecho lá.
+        emoji = "✅" if outcome is Lifecycle.SUCCEEDED else "❌"
+        state = "Concluído e validado" if outcome is Lifecycle.SUCCEEDED else f"Encerrada ({outcome.value.lower()})"
+        self._origin_notice(task, f"{emoji} {state}: {task.title}\n{self._permalink(task.source_root_id)}")
 
-        Best-effort por contrato: o aviso é cortesia, nunca pode falhar um
-        close. Só dispara quando a raiz da ordem carrega a assinatura de
-        origem da sala ("Origem:" + "Ordens") e o ambiente tem sala/token
-        Matrix configurados.
+    def _origin_notice(self, task: MattermostCockpitTask, text: str) -> None:
+        """Aviso na sala de origem (Ordens) quando a ordem nasceu lá.
+
+        Cobre os momentos em que o dono precisa saber sem abrir o Mattermost:
+        desfecho (✅/❌), decisão pendente (🚦) e bloqueio (⛔). Best-effort por
+        contrato: o aviso é cortesia, nunca pode falhar a operação principal.
+        Só dispara quando a raiz da ordem carrega a assinatura de origem da
+        sala ("Origem:" + "Ordens") e o ambiente tem sala/token configurados.
         """
         room = os.environ.get("ORDENS_MATRIX_ROOM", "").strip()
         if not room:
@@ -651,12 +667,7 @@ class CockpitService:
             message = str(source_root.get("message") or "")
             if "Origem:" not in message or "Ordens" not in message:
                 return
-            emoji = "✅" if outcome is Lifecycle.SUCCEEDED else "❌"
-            state = "Concluído e validado" if outcome is Lifecycle.SUCCEEDED else f"Encerrada ({outcome.value.lower()})"
-            self._send_matrix_notice(
-                room,
-                f"{emoji} {state}: {task.title}\n{self._permalink(task.source_root_id)}",
-            )
+            self._send_matrix_notice(room, text)
         except Exception:
             pass
 
