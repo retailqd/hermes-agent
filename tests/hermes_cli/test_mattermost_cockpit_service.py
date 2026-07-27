@@ -1225,7 +1225,7 @@ def test_close_publishes_one_human_terminal_post_after_cleanup_and_retry(
 
     assert units.stopped == [task.task_id]
     stop_index = events.index("unit:stop")
-    readback_index = events.index("unit:is-active:false")
+    readback_index = events.index("unit:is-active:false", stop_index)
     final_post_index = max(index for index, event in enumerate(events) if event == f"post:{BOT}:{MAIN}")
     assert stop_index < readback_index < final_post_index
 
@@ -1306,8 +1306,8 @@ def test_close_resumes_after_unfollow_already_completed(rig):
 @pytest.mark.parametrize(
     ("outcome", "summary", "evidence", "last_error"),
     [
-        (Lifecycle.SUCCEEDED, "completed", {"validation": "5 passed"}, None),
-        (Lifecycle.FAILED, "failed", {"error": "worker failed"}, "worker failed"),
+        (Lifecycle.SUCCEEDED, "A limpeza terminou e está validada.", {"validation": "5 passed"}, None),
+        (Lifecycle.FAILED, "A limpeza parou por um erro interno.", {"error": "worker failed"}, "worker failed"),
     ],
 )
 def test_close_clears_persisted_watcher_lease_without_watcher_finally(
@@ -1320,8 +1320,8 @@ def test_close_clears_persisted_watcher_lease_without_watcher_finally(
     service, store, bot, owner, _, units, events = rig
     task = service.create(
         task_id=f"task-close-lease-{outcome.value.lower()}",
-        title="Close persisted watcher lease",
-        handoff="Watcher process is stopped before its finally runs",
+        title="Concluir a limpeza da tarefa de teste",
+        handoff="O processo de acompanhamento para antes da etapa final",
         source_channel_id=MAIN,
         source_root_id=SOURCE_ROOT,
         source_post_id=SOURCE_POST,
@@ -1361,8 +1361,16 @@ def test_close_clears_persisted_watcher_lease_without_watcher_finally(
     assert persisted.watcher_heartbeat_at is None
     evidence_marker = f"[cockpit-evidence:{task.task_id}:"
     final_marker = f"[cockpit-final:{task.task_id}]"
+
+    def final_marker_posts() -> int:
+        return sum(
+            post.get("props", {}).get("cockpit_relay_marker") == final_marker
+            for post in bot.posts.values()
+        )
+
     assert sum(evidence_marker in post["message"] for post in bot.posts.values()) == 1
-    assert sum(final_marker in post["message"] for post in bot.posts.values()) == 1
+    assert final_marker_posts() == 1
+    assert not any(final_marker in post["message"] for post in bot.posts.values())
 
     replay = service.close(
         task.task_id,
@@ -1375,7 +1383,7 @@ def test_close_clears_persisted_watcher_lease_without_watcher_finally(
     assert replay == closed
     assert units.stopped == [task.task_id]
     assert sum(evidence_marker in post["message"] for post in bot.posts.values()) == 1
-    assert sum(final_marker in post["message"] for post in bot.posts.values()) == 1
+    assert final_marker_posts() == 1
 
 
 def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
