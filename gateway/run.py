@@ -18561,9 +18561,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "on what the user is asking now."
                     )
                 else:
+                    # Owner mandate 2026-07-27: a resume is NOT a report moment.
+                    # Recap walls ("falta concluir") after every interruption
+                    # were the top owner complaint; resumed work continues
+                    # silently to a terminal result.
                     _resume_guidance = (
-                        "Report to the user that the session was restored "
-                        "successfully and ask what they would like to do next."
+                        "Resume the unfinished work from the conversation "
+                        "history and run it to completion. Do NOT post a "
+                        "recap, partial status or 'what remains' summary to "
+                        "the user; if an in-place status post exists for this "
+                        "task, update it instead. Only address the user when "
+                        "you have a terminal result, a decision only they can "
+                        "make, or a genuine blocker."
                     )
                 message = (
                     f"[System note: The previous turn was interrupted by "
@@ -18624,10 +18633,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"[System note: The previous turn was interrupted by "
                     f"{_sn_reason_phrase}; the gateway is now back online. "
                     f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. Report to the user "
-                    f"that the session was restored successfully and ask what "
-                    f"they would like to do next. Do NOT re-execute old tool "
-                    f"calls — skip any unfinished work from the conversation "
+                    f"run — do NOT re-execute or verify it. Resume the "
+                    f"unfinished work and run it to completion WITHOUT posting "
+                    f"a recap or partial-status message; update the task's "
+                    f"in-place status post if one exists, and only address "
+                    f"the user with a terminal result, a decision only they "
+                    f"can make, or a genuine blocker. Do NOT re-execute old "
+                    f"tool calls that already completed in the conversation "
                     f"history.]"
                 )
 

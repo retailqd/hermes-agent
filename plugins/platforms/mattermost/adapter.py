@@ -388,6 +388,7 @@ class MattermostAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
 
+        content = self._owner_channel_hygiene(chat_id, content)
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
 
@@ -432,10 +433,37 @@ class MattermostAdapter(BasePlatformAdapter):
             {"channel_id": chat_id},
         )
 
+    @staticmethod
+    def _owner_channel_hygiene(chat_id: str, content: str) -> str:
+        """No Markdown headings in the management channel (owner mandate
+        2026-07-27): automated posts use a bold first line instead. Applied at
+        the transport layer so conversational replies — which bypass the
+        cockpit renderers and their linting — can never reintroduce heading
+        walls in `main`. Headings inside code fences are left untouched.
+        """
+        main_channel = os.getenv("MATTERMOST_COCKPIT_MAIN_CHANNEL_ID", "").strip()
+        if not main_channel or chat_id != main_channel or "#" not in content:
+            return content
+        lines = []
+        changed = False
+        in_code = False
+        for line in content.splitlines():
+            if line.lstrip().startswith("```"):
+                in_code = not in_code
+            elif not in_code:
+                match = re.match(r"^(\s*)#{1,6}\s+(.*)$", line)
+                if match:
+                    text = match.group(2).strip().rstrip("#").strip()
+                    line = f"{match.group(1)}**{text}**" if text else match.group(1)
+                    changed = True
+            lines.append(line)
+        return "\n".join(lines) if changed else content
+
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
     ) -> SendResult:
         """Edit an existing post."""
+        content = self._owner_channel_hygiene(chat_id, content)
         formatted = self.format_message(content)
         data = await self._api_put(
             f"posts/{message_id}/patch",

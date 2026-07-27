@@ -1244,3 +1244,42 @@ async def test_mattermost_dm_post_does_not_seed_thread_root():
     msg_event = adapter.handle_message.call_args[0][0]
     assert msg_event.source.thread_id is None
     assert msg_event.source.message_id == "dm_post_123"
+
+
+class TestOwnerChannelHygiene:
+    """Owner mandate 2026-07-27: no heading walls in the management channel."""
+
+    def test_headings_become_bold_in_main_channel(self, monkeypatch):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        monkeypatch.setenv("MATTERMOST_COCKPIT_MAIN_CHANNEL_ID", "mainchan")
+        out = MattermostAdapter._owner_channel_hygiene(
+            "mainchan", "## Falta concluir\n\ntexto\n### Sub\nfim"
+        )
+        assert "## " not in out
+        assert "**Falta concluir**" in out
+        assert "**Sub**" in out
+        assert "texto" in out and "fim" in out
+
+    def test_other_channels_untouched(self, monkeypatch):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        monkeypatch.setenv("MATTERMOST_COCKPIT_MAIN_CHANNEL_ID", "mainchan")
+        content = "## Execução técnica\ndetalhe"
+        assert MattermostAdapter._owner_channel_hygiene("execchan", content) == content
+
+    def test_code_fences_preserved(self, monkeypatch):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        monkeypatch.setenv("MATTERMOST_COCKPIT_MAIN_CHANNEL_ID", "mainchan")
+        content = "resumo\n```\n# comentario de shell\n```\n# Titulo"
+        out = MattermostAdapter._owner_channel_hygiene("mainchan", content)
+        assert "# comentario de shell" in out
+        assert "**Titulo**" in out
+
+    def test_no_env_means_no_change(self, monkeypatch):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        monkeypatch.delenv("MATTERMOST_COCKPIT_MAIN_CHANNEL_ID", raising=False)
+        content = "# Titulo"
+        assert MattermostAdapter._owner_channel_hygiene("qualquer", content) == content
