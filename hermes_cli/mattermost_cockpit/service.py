@@ -632,7 +632,54 @@ class CockpitService:
             final_last_error=last_error,
         )
         self._audit(closed, "task_closed", {"outcome": outcome.value}, f"close:{task_id}")
+        self._notify_order_origin(closed, outcome)
         return closed
+
+    def _notify_order_origin(self, task: MattermostCockpitTask, outcome: Lifecycle) -> None:
+        """Fecha o ciclo da sala Ordens: ordem nascida lá recebe o desfecho lá.
+
+        Best-effort por contrato: o aviso é cortesia, nunca pode falhar um
+        close. Só dispara quando a raiz da ordem carrega a assinatura de
+        origem da sala ("Origem:" + "Ordens") e o ambiente tem sala/token
+        Matrix configurados.
+        """
+        room = os.environ.get("ORDENS_MATRIX_ROOM", "").strip()
+        if not room:
+            return
+        try:
+            source_root = self.bot_client.get_post(task.source_root_id)
+            message = str(source_root.get("message") or "")
+            if "Origem:" not in message or "Ordens" not in message:
+                return
+            emoji = "✅" if outcome is Lifecycle.SUCCEEDED else "❌"
+            state = "Concluído e validado" if outcome is Lifecycle.SUCCEEDED else f"Encerrada ({outcome.value.lower()})"
+            self._send_matrix_notice(
+                room,
+                f"{emoji} {state}: {task.title}\n{self._permalink(task.source_root_id)}",
+            )
+        except Exception:
+            pass
+
+    def _send_matrix_notice(self, room_id: str, text: str) -> None:
+        import ssl
+        import urllib.parse
+        import urllib.request
+
+        token = os.environ.get("MATRIX_ACCESS_TOKEN", "").strip()
+        if not token:
+            return
+        base = (os.environ.get("MATRIX_HOMESERVER") or "https://matrix-private.95.155.151.94.sslip.io").rstrip("/")
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        txn = str(int(time.time() * 1000))
+        req = urllib.request.Request(
+            f"{base}/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}/send/m.room.message/{txn}",
+            data=json.dumps({"msgtype": "m.notice", "body": text}).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="PUT",
+        )
+        urllib.request.urlopen(req, context=ctx, timeout=15).read()
 
     def watch_once(self, task_id: str) -> bool:
         task = self._require_task(task_id)

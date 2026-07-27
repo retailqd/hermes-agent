@@ -2356,3 +2356,63 @@ def test_reaper_isolates_thread_failure_and_continues(rig, monkeypatch):
     assert result["errors"] == {first.task_id: "RuntimeError: thread unavailable"}
     assert result["asked"] == [second.task_id]
     assert store.get_active_gate(second.task_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# Ciclo fechado da sala Ordens: close notifica a origem
+# ---------------------------------------------------------------------------
+
+
+def _close_kwargs():
+    return {
+        "outcome": Lifecycle.SUCCEEDED,
+        "summary": "A tarefa terminou e está validada.",
+        "evidence": {"validation": "test"},
+        "last_error": None,
+    }
+
+
+def test_close_notifies_ordens_room_when_origin_marker_present(rig, monkeypatch):
+    service, _, bot, _, _, _, _ = rig
+    monkeypatch.setenv("ORDENS_MATRIX_ROOM", "!room:example.org")
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(service, "_send_matrix_notice", lambda room, text: sent.append((room, text)))
+    task = _t7_running_task(service, "task-ordens-origin", "source:ordens-origin")
+    bot.posts[task.source_root_id]["message"] += "\n**Origem:** conversa no Ordens (Matrix), 2026-07-27"
+
+    service.close(task.task_id, **_close_kwargs())
+
+    assert len(sent) == 1
+    room, text = sent[0]
+    assert room == "!room:example.org"
+    assert "Concluído e validado" in text
+    assert task.title in text
+
+
+def test_close_does_not_notify_without_origin_marker(rig, monkeypatch):
+    service, _, _, _, _, _, _ = rig
+    monkeypatch.setenv("ORDENS_MATRIX_ROOM", "!room:example.org")
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(service, "_send_matrix_notice", lambda room, text: sent.append((room, text)))
+    task = _t7_running_task(service, "task-sem-origem", "source:sem-origem")
+
+    service.close(task.task_id, **_close_kwargs())
+
+    assert sent == []
+
+
+def test_close_never_fails_because_of_origin_notice(rig, monkeypatch):
+    service, store, bot, _, _, _, _ = rig
+    monkeypatch.setenv("ORDENS_MATRIX_ROOM", "!room:example.org")
+
+    def boom(room, text):
+        raise RuntimeError("matrix fora do ar")
+
+    monkeypatch.setattr(service, "_send_matrix_notice", boom)
+    task = _t7_running_task(service, "task-ordens-boom", "source:ordens-boom")
+    bot.posts[task.source_root_id]["message"] += "\n**Origem:** conversa no Ordens (Matrix), 2026-07-27"
+
+    closed = service.close(task.task_id, **_close_kwargs())
+
+    assert closed.lifecycle is Lifecycle.SUCCEEDED
+    assert store.get_task(task.task_id).lifecycle is Lifecycle.SUCCEEDED
