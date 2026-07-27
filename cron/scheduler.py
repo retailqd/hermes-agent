@@ -1344,13 +1344,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
-    wrap_response = True
+    configured_wrap_response = True
     user_cfg = None
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        configured_wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    wrap_response = bool(configured_wrap_response) and not bool(job.get("no_agent"))
 
     if wrap_response:
         task_name = job.get("name", job["id"])

@@ -48,6 +48,12 @@ _CHANNEL_TYPE_MAP = {
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+_MATTERMOST_POST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*\Z")
+
+
+def _is_safe_mattermost_post_id(message_id: str) -> bool:
+    """Return True for opaque Mattermost post IDs we are willing to delete."""
+    return bool(_MATTERMOST_POST_ID_RE.fullmatch(message_id))
 
 
 def check_mattermost_requirements() -> bool:
@@ -100,7 +106,6 @@ class MattermostAdapter(BasePlatformAdapter):
 
         self._last_post_status: Optional[int] = None
         self._last_post_error: str = ""
-
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
 
@@ -235,6 +240,39 @@ class MattermostAdapter(BasePlatformAdapter):
         except aiohttp.ClientError as exc:
             logger.error("MM API PUT %s network error: %s", path, exc)
             return {}
+
+    async def _api_delete(self, path: str) -> bool:
+        """DELETE /api/v4/{path}."""
+        import aiohttp
+
+        if ".." in path:
+            logger.error("MM API path traversal blocked: %s", path)
+            return False
+
+        url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
+        try:
+            async with self._session.delete(
+                url,
+                headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status in {200, 204}:
+                    return True
+                if resp.status == 404:
+                    logger.debug("MM API DELETE %s → 404 (already deleted)", path)
+                    return True
+                if resp.status == 403:
+                    logger.warning("MM API DELETE %s → 403", path)
+                else:
+                    body = await resp.text()
+                    logger.error("MM API DELETE %s → %s: %s", path, resp.status, body[:200])
+                return False
+        except TimeoutError as exc:
+            logger.error("MM API DELETE %s timed out: %s", path, exc)
+            return False
+        except aiohttp.ClientError as exc:
+            logger.error("MM API DELETE %s network error: %s", path, exc)
+            return False
 
     async def _upload_file(
         self, channel_id: str, file_data: bytes, filename: str, content_type: str = "application/octet-stream"
@@ -406,6 +444,13 @@ class MattermostAdapter(BasePlatformAdapter):
         if not data or "id" not in data:
             return SendResult(success=False, error="Failed to edit post")
         return SendResult(success=True, message_id=data["id"])
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:  # type: ignore[override]
+        """Delete a previously sent Mattermost post."""
+        if not _is_safe_mattermost_post_id(message_id):
+            logger.warning("MM API DELETE rejected unsafe post ID: %r", message_id)
+            return False
+        return await self._api_delete(f"posts/{message_id}")
 
     async def send_image(
         self,

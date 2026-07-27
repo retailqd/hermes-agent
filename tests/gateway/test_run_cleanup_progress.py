@@ -13,8 +13,10 @@ Adapters without ``delete_message`` silently no-op.
 import asyncio
 import importlib
 import inspect as _inspect
+import json
 import sys
 import time
+import threading
 import types
 from types import SimpleNamespace
 
@@ -104,6 +106,18 @@ class NoDeleteAdapter(CleanupCaptureAdapter):
 NoDeleteAdapter.delete_message = BasePlatformAdapter.delete_message
 
 
+class FalseDeleteAdapter(CleanupCaptureAdapter):
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.deleted.append({"chat_id": chat_id, "message_id": str(message_id)})
+        return False
+
+
+class RaisingDeleteAdapter(CleanupCaptureAdapter):
+    async def delete_message(self, chat_id, message_id) -> bool:
+        self.deleted.append({"chat_id": chat_id, "message_id": str(message_id)})
+        raise RuntimeError("delete failed")
+
+
 class ProgressAgent:
     """Emits two tool-progress events and returns a normal final response."""
 
@@ -134,6 +148,73 @@ class FailingAgent:
         # Empty final_response + failed=True is the shape the gateway
         # actually returns on provider errors (see gateway/run.py where
         # failed keys are only propagated when final_response is empty).
+        return {
+            "final_response": "",
+            "messages": [],
+            "api_calls": 1,
+            "failed": True,
+            "error": "simulated provider failure",
+        }
+
+
+class BackgroundReviewAgent:
+    """Agent that tries to emit a background review payload twice.
+
+    The first attempt happens during the run. The second one is delayed until
+    after the run has already returned, so the test can prove that Mattermost's
+    default wiring keeps ``background_review_callback`` unset and does not leak
+    a late review post into chat.
+    """
+
+    last_instance = None
+
+    def __init__(self, **kwargs):
+        BackgroundReviewAgent.last_instance = self
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+        self.review_attempts = []
+        self._late_review_done = threading.Event()
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        payload = json.dumps(
+            {
+                "kind": "self_review",
+                "source": "agent",
+                "summary": "Mattermost review payload",
+            },
+            sort_keys=True,
+        )
+        callback = getattr(self, "background_review_callback", None)
+        self.review_attempts.append(callback)
+        if callable(callback):
+            callback(payload)
+
+        def _late_review() -> None:
+            time.sleep(0.05)
+            late_callback = getattr(self, "background_review_callback", None)
+            self.review_attempts.append(late_callback)
+            if callable(late_callback):
+                late_callback(payload)
+            self._late_review_done.set()
+
+        threading.Thread(target=_late_review, daemon=True).start()
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class MultiProgressFailingAgent:
+    """Agent that emits multiple distinct tool progress updates and fails."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        if cb is not None:
+            cb("tool.started", "terminal", "pwd", {})
+            time.sleep(0.25)
+            cb("tool.started", "browser_navigate", "https://example.com", {})
+            time.sleep(0.25)
         return {
             "final_response": "",
             "messages": [],
@@ -303,6 +384,143 @@ async def test_cleanup_skipped_on_failed_run(monkeypatch, tmp_path):
         for _ in range(10):
             await asyncio.sleep(0.01)
     assert adapter.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_mattermost_background_review_notifications_off_by_default_suppresses_callback_and_late_post(monkeypatch, tmp_path):
+    """Mattermost's default keeps background review silent unless explicitly enabled."""
+    adapter = CleanupCaptureAdapter(platform=Platform.MATTERMOST)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, BackgroundReviewAgent, cleanup_on=False)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.MATTERMOST, chat_id="owner-1")
+    session_key = "agent:main:mattermost:channel:owner-1"
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-review-off",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    agent = BackgroundReviewAgent.last_instance
+    assert agent is not None
+    assert agent.background_review_callback is None
+    await asyncio.to_thread(agent._late_review_done.wait, 1.0)
+    assert agent.review_attempts == [None, None]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_mattermost_background_review_notifications_override_true_releases_review(monkeypatch, tmp_path):
+    """An explicit Mattermost override still wires the delayed review release."""
+    adapter = CleanupCaptureAdapter(platform=Platform.MATTERMOST)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, BackgroundReviewAgent, cleanup_on=False)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "display": {
+                "platforms": {
+                    "mattermost": {"background_review_notifications": True},
+                }
+            }
+        },
+    )
+
+    source = SessionSource(platform=Platform.MATTERMOST, chat_id="owner-2")
+    session_key = "agent:main:mattermost:channel:owner-2"
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-review-on",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    agent = BackgroundReviewAgent.last_instance
+    assert agent is not None
+    assert callable(agent.background_review_callback)
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    await _fire_post_delivery_cb(cb)
+    for _ in range(20):
+        if any("self_review" in entry["content"] for entry in adapter.sent):
+            break
+        await asyncio.sleep(0.01)
+    assert any("self_review" in entry["content"] for entry in adapter.sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter_cls", [FalseDeleteAdapter, RaisingDeleteAdapter])
+async def test_cleanup_delete_message_failures_do_not_break_final_delivery(monkeypatch, tmp_path, adapter_cls):
+    """delete_message returning False or raising should not break the final response."""
+    adapter = adapter_cls()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-cleanup-failure",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    await _fire_post_delivery_cb(cb)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+    assert adapter.deleted
+
+
+@pytest.mark.asyncio
+async def test_failed_run_keeps_single_line_progress_bubble(monkeypatch, tmp_path):
+    """Failed runs should keep, at most, one compact breadcrumb bubble."""
+    adapter = CleanupCaptureAdapter(platform=Platform.MATTERMOST)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, MultiProgressFailingAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    source = SessionSource(platform=Platform.MATTERMOST, chat_id="owner-1")
+    session_key = "agent:main:mattermost:channel:owner-1"
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-failed-progress",
+        session_key=session_key,
+    )
+
+    assert result.get("failed") is True
+    await asyncio.sleep(0.1)
+    final_progress = None
+    if adapter.edits:
+        final_progress = adapter.edits[-1]["content"]
+    elif adapter.sent:
+        final_progress = adapter.sent[-1]["content"]
+    assert final_progress is not None
+    assert "\n" not in final_progress
 
 
 @pytest.mark.asyncio

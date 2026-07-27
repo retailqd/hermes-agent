@@ -1,4 +1,5 @@
 """Tests for Mattermost platform adapter."""
+import asyncio
 import json
 import os
 import time
@@ -198,6 +199,15 @@ def _make_adapter():
     )
     adapter = MattermostAdapter(config)
     return adapter
+
+
+def _make_delete_response(status: int, body: str = ""):
+    response = AsyncMock()
+    response.status = status
+    response.text = AsyncMock(return_value=body)
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=False)
+    return response
 
 
 class TestMattermostFormatMessage:
@@ -475,6 +485,103 @@ class TestMattermostSend:
         result = await self.adapter.send("channel_1", "Hello!")
 
         assert result.success is False
+
+
+class TestMattermostDeleteMessage:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._session = MagicMock()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [200, 204])
+    async def test_delete_message_returns_true_for_successful_api_delete(self, status):
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(status))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is True
+        call_args = self.adapter._session.delete.call_args
+        assert "/api/v4/posts/post-123" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_true_for_404_idempotent_delete(self):
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(404, body='{"error": "not found"}'))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is True
+        call_args = self.adapter._session.delete.call_args
+        assert "/api/v4/posts/post-123" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_concurrent_403_and_404_are_isolated(self, monkeypatch):
+        first_call_started = asyncio.Event()
+        second_call_released = asyncio.Event()
+
+        async def fake_api_delete(path: str) -> bool:
+            if path.endswith("post-403"):
+                setattr(self.adapter, "_last_delete_status", 403)
+                first_call_started.set()
+                await second_call_released.wait()
+                return False
+            if path.endswith("post-404"):
+                await first_call_started.wait()
+                setattr(self.adapter, "_last_delete_status", 404)
+                second_call_released.set()
+                return True
+            raise AssertionError(f"unexpected delete path: {path}")
+
+        monkeypatch.setattr(self.adapter, "_api_delete", fake_api_delete)
+
+        results = await asyncio.gather(
+            self.adapter.delete_message("channel_1", "post-403"),
+            self.adapter.delete_message("channel_1", "post-404"),
+        )
+
+        assert results == [False, True]
+        assert getattr(self.adapter, "_last_delete_status") == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_message_rejects_encoded_path_traversal(self):
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(200))
+
+        result = await self.adapter.delete_message("channel_1", "%2e%2e")
+
+        assert result is False
+        self.adapter._session.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_false_for_403_without_leaking_secret(self, caplog):
+        secret = "super-secret-token"
+        self.adapter._token = secret
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(403, body=f"denied {secret}"))
+
+        with caplog.at_level("WARNING"):
+            result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is False
+        assert "/api/v4/posts/post-123" in self.adapter._session.delete.call_args[0][0]
+        assert secret not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_false_on_timeout(self):
+        self.adapter._session.delete = MagicMock(side_effect=TimeoutError("timed out"))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is False
+        assert "/api/v4/posts/post-123" in self.adapter._session.delete.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_false_on_client_error(self):
+        import aiohttp
+
+        self.adapter._session.delete = MagicMock(side_effect=aiohttp.ClientError("boom"))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is False
+        assert "/api/v4/posts/post-123" in self.adapter._session.delete.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------

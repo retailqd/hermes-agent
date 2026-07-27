@@ -1,0 +1,74 @@
+[
+  {
+    "kind": "decision",
+    "state": "decision",
+    "terminal": false,
+    "message": "**Preciso de uma decisão sua**\n\n**Em linguagem simples:** aprovar ou rejeitar.\n\n**Risco:** baixo.\n\n**Como responder:** `aprovar`.",
+    "max_lines": 12,
+    "allow_headings": false
+  },
+  {
+    "kind": "status",
+    "state": "progress",
+    "terminal": false,
+    "message": "**Em andamento, ainda não concluído**\n\n**Agora:** validando o status.\n\n**Próximo marco:** causa confirmada ou bloqueio.",
+    "max_lines": 8,
+    "allow_headings": false
+  },
+  {
+    "kind": "final",
+    "state": "completed",
+    "terminal": true,
+    "message": "**Concluído e validado**\n\n**Resultado:** fluxo restaurado.\n\n**Validado:** smoke real passou.\n\n**Pendente:** nada.",
+    "max_lines": 10,
+    "allow_headings": false
+  },
+  {
+    "kind": "failure",
+    "state": "failed",
+    "terminal": true,
+    "message": "**Não concluído**\n\n**Motivo:** validação falhou.\n\n**Próximo passo:** corrigir a causa.",
+    "max_lines": 8,
+    "allow_headings": false
+  },
+  {
+    "kind": "duplicate",
+    "state": "blocked",
+    "terminal": false,
+    "message": "**Bloqueado, ainda não concluído**\n\n**Agora:** já existe uma resposta igual.\n\n**Próximo passo:** continuar a conversa original.",
+    "max_lines": 8,
+    "allow_headings": false
+  },
+  {
+    "kind": "cron",
+    "state": "next_step",
+    "terminal": false,
+    "message": "**Próximo passo, ainda não concluído**\n\n**Agora:** agendamento confirmado.\n\n**Próximo marco:** executar no horário combinado.",
+    "max_lines": 8,
+    "allow_headings": false
+  },
+  {
+    "kind": "watchdog",
+    "state": "blocked",
+    "terminal": false,
+    "message": "**Bloqueado, ainda não concluído**\n\n**Agora:** o monitor está aguardando sinal.\n\n**Próximo passo:** confirmar o evento externo.",
+    "max_lines": 8,
+    "allow_headings": false
+  },
+  {
+    "kind": "progress",
+    "state": "progress",
+    "terminal": false,
+    "message": "**Em andamento, ainda não concluído**\n\n**Agora:** validando a causa.\n\n**Próximo marco:** causa confirmada ou bloqueio.",
+    "max_lines": 8,
+    "allow_headings": false
+  },
+  {
+    "kind": "self_review",
+    "state": "completed",
+    "terminal": true,
+    "message": "**Concluído e validado**\n\n**Resultado:** revisão própria concluída.\n\n**Validado:** o texto está claro.\n\n**Pendente:** nada.",
+    "max_lines": 10,
+    "allow_headings": false
+  }
+]

@@ -614,6 +614,31 @@ class TestDeliverResultWrapping:
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: abc-123" in sent_content
 
+    def test_no_agent_delivery_is_always_verbatim(self):
+        """Jobs marked no_agent must send raw content without cron wrapper."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.MATTERMOST: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}):
+            job = {
+                "id": "job-1",
+                "name": "Pendências do main",
+                "no_agent": True,
+                "deliver": "mattermost:channel",
+            }
+            _deliver_result(job, "**Pendências do main**\n\nNada novo.")
+
+        sent = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent == "**Pendências do main**\n\nNada novo."
+        assert "Cronjob Response:" not in sent
+        assert "job_id" not in sent
+
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
         from gateway.config import Platform

@@ -344,8 +344,9 @@ display:
   # How progress is grouped on platforms that support message editing:
   #   accumulate (default) — edit one bubble in place as tools run
   #   separate             — send one message per tool (pre-v0.9 style; noisier)
+  #   latest               — keep only the latest rendered line in the bubble
   # Only applies where tool_progress is already enabled.
-  tool_progress_grouping: accumulate   # accumulate | separate
+  tool_progress_grouping: accumulate   # accumulate | separate | latest
 ```
 
 ### Message timestamps in model context
