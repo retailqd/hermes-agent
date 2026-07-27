@@ -508,7 +508,10 @@ class CockpitService:
             )
         else:
             if existing["body"] != rendered.markdown:
-                self.bot_client.update_post(existing["post_id"], rendered.markdown)
+                current_post = self.bot_client.get_post(existing["post_id"])
+                current_props = current_post.get("props")
+                props = current_props if isinstance(current_props, Mapping) else None
+                self.bot_client.update_post(existing["post_id"], rendered.markdown, props=props)
             record = self.store.upsert_status_relay(
                 task.task_id, post_id=existing["post_id"], body=rendered.markdown
             )

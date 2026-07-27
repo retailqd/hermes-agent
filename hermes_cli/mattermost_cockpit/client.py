@@ -98,12 +98,17 @@ class MattermostClient:
     def delete_post(self, post_id: str) -> dict[str, Any]:
         return self._request_json_object("DELETE", f"/api/v4/posts/{post_id}")
 
-    def update_post(self, post_id: str, message: str) -> dict[str, Any]:
-        return self._request_json_object(
-            "PUT",
-            f"/api/v4/posts/{post_id}",
-            {"id": post_id, "message": message},
-        )
+    def update_post(
+        self,
+        post_id: str,
+        message: str,
+        *,
+        props: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"id": post_id, "message": message}
+        if props is not None:
+            payload["props"] = dict(props)
+        return self._request_json_object("PUT", f"/api/v4/posts/{post_id}", payload)
 
     def set_thread_following(
         self,

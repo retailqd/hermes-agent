@@ -61,6 +61,7 @@ class FakeClient:
         self.following = False
         self.fail_unfollow = False
         self._counter = 0
+        self.update_calls: list[dict[str, object]] = []
 
     def get_post(self, post_id: str) -> dict:
         return self.posts[post_id]
@@ -105,9 +106,12 @@ class FakeClient:
         self.events.append(f"delete:{self.user_id}:{post_id}")
         return {"status": "OK"}
 
-    def update_post(self, post_id: str, message: str) -> dict:
+    def update_post(self, post_id: str, message: str, *, props: dict | None = None) -> dict:
         post = self.posts[post_id]
         post["message"] = message
+        if props is not None:
+            post["props"] = dict(props)
+        self.update_calls.append({"post_id": post_id, "message": message, "props": None if props is None else dict(props)})
         self.events.append(f"update:{self.user_id}:{post_id}")
         return dict(post)
 
@@ -2165,6 +2169,7 @@ def test_relay_status_upserts_single_post_in_place(rig):
     assert "a causa foi confirmada" in body.lower()
     assert "[cockpit" not in body
     assert events.count(f"update:{BOT}:{first['post_id']}") == 1
+    assert bot.update_calls[-1]["props"] == status_posts[0]["props"]
 
 
 def test_relay_status_same_text_does_not_edit_again(rig):

@@ -221,6 +221,33 @@ class TestMattermostClient:
         assert str(captured["url"]).endswith("/api/v4/posts/post-77")
         assert captured["body"] == {"id": "post-77", "message": "updated"}
 
+    def test_update_post_can_preserve_props_on_edit(self):
+        captured: dict[str, object] = {}
+
+        def urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode())
+            return FakeResponse(
+                200,
+                json.dumps({"id": "post-77", "message": "updated"}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        client = make_client(urlopen)
+        client.update_post(
+            "post-77",
+            "updated",
+            props={"cockpit_relay_marker": "[cockpit-status:task-77]", "cockpit_relay_schema": 1},
+        )
+
+        assert captured["body"] == {
+            "id": "post-77",
+            "message": "updated",
+            "props": {
+                "cockpit_relay_marker": "[cockpit-status:task-77]",
+                "cockpit_relay_schema": 1,
+            },
+        }
+
     @pytest.mark.parametrize("following,expected_method", [(True, "PUT"), (False, "DELETE")])
     def test_set_thread_following_uses_user_team_thread_endpoint(self, following, expected_method):
         captured: dict[str, object] = {}
