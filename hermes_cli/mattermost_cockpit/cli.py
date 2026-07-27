@@ -13,6 +13,7 @@ from hermes_constants import get_hermes_home
 
 from .client import MattermostClient
 from .contracts import GateDecision, Lifecycle, MattermostCockpitContracts
+from .presentation import OwnerDecisionPrompt
 from .helpers import HelperBridge
 from .service import CockpitService, UnitController
 from .store import MattermostCockpitStore
@@ -36,7 +37,11 @@ def _parser() -> argparse.ArgumentParser:
     gate = commands.add_parser("gate")
     gate.add_argument("--task", required=True)
     gate.add_argument("--gate-id", required=True)
-    gate.add_argument("--prompt-stdin", action="store_true", required=True)
+    gate_mode = gate.add_mutually_exclusive_group(required=True)
+    gate_mode.add_argument("--decision-json-stdin", action="store_true")
+    # Legacy free-form prompt: kept for producers not yet migrated to the
+    # structured lay-language contract; remove once zero call sites remain.
+    gate_mode.add_argument("--prompt-stdin", action="store_true")
 
     resume = commands.add_parser("resume")
     resume.add_argument("--task", required=True)
@@ -140,7 +145,20 @@ def main(
         elif args.command == "status":
             payload = {"ok": True, "result": service.status(args.task)}
         elif args.command == "gate":
-            task = service.open_gate(args.task, gate_id=args.gate_id, prompt=stdin.read())
+            if args.decision_json_stdin:
+                raw = json.loads(stdin.read())
+                if not isinstance(raw, dict):
+                    raise ValueError("decision JSON must be an object")
+                decision = OwnerDecisionPrompt(
+                    decision=str(raw.get("decision", "")),
+                    plain_language=str(raw.get("plain_language", "")),
+                    risk=str(raw.get("risk", "")),
+                    reply_instruction=str(raw.get("reply_instruction", "")),
+                    technical_url=raw.get("technical_url"),
+                )
+                task = service.open_gate(args.task, gate_id=args.gate_id, decision=decision)
+            else:
+                task = service.open_gate(args.task, gate_id=args.gate_id, prompt=stdin.read())
             payload = _task_payload(task)
         elif args.command == "resume" and args.watch:
             watcher_state = service.watch_forever(args.task)

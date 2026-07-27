@@ -7,6 +7,7 @@ import os
 import socket
 import subprocess
 import time
+import dataclasses
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from .contracts import (
 )
 from .helpers import HelperBridge
 from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, utc_now
+from .presentation import OwnerDecisionPrompt, render_owner_decision
 from .relay_renderer import RenderedRelay, render_closed, render_execution_update, render_gate, render_started
 from .store import MattermostCockpitStore, WatcherLeaseConflictError
 
@@ -233,8 +235,26 @@ class CockpitService:
                 self.sleep(_UNFOLLOW_READBACK_INTERVAL_SECONDS)
         raise ValueError("owner unfollow readback mismatch")
 
-    def open_gate(self, task_id: str, *, gate_id: str, prompt: str) -> MattermostCockpitTask:
+    def open_gate(
+        self,
+        task_id: str,
+        *,
+        gate_id: str,
+        prompt: str | None = None,
+        decision: OwnerDecisionPrompt | None = None,
+    ) -> MattermostCockpitTask:
         task = self._require_open_bound_task(task_id)
+        if (prompt is None) == (decision is None):
+            raise ValueError("provide exactly one of prompt or decision")
+        if decision is not None:
+            # Structured lay-language contract (T7): the renderer enforces the
+            # "Preciso de uma decisão sua" shape, plain language, risk and
+            # reply instruction; free-form prompts stay as legacy compat only.
+            if decision.technical_url is None:
+                decision = dataclasses.replace(
+                    decision, technical_url=self._permalink(task.execution_root_id)
+                )
+            prompt = render_owner_decision(prompt=decision).markdown
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("gate prompt must not be empty")
@@ -247,6 +267,11 @@ class CockpitService:
             and existing_gate.prompt_body == legacy_prompt_body
         ):
             prompt_body = legacy_prompt_body
+            source_message = prompt
+        elif decision is not None:
+            # Already rendered by the structured contract; render_gate's legacy
+            # blocker/decision shape does not apply to it.
+            prompt_body = prompt
             source_message = prompt
         else:
             relay = render_gate(prompt, self._permalink(task.execution_root_id))
@@ -485,12 +510,25 @@ class CockpitService:
         if not task.execution_root_id:
             raise ValueError("execution root is not bound")
         execution_root_id = task.execution_root_id
-        relay = render_closed(
-            outcome=outcome.value,
-            requested=task.title,
-            summary=summary,
-            permalink=self._permalink(execution_root_id),
-        )
+        try:
+            relay = render_closed(
+                outcome=outcome.value,
+                requested=task.title,
+                summary=summary,
+                permalink=self._permalink(execution_root_id),
+            )
+        except ValueError as exc:
+            if "requested work" not in str(exc):
+                raise
+            # Legacy tasks (autopilot incidents) carry technical titles that the
+            # lay-language linter rejects; close must never be impossible, so
+            # fall back to a neutral request line. The summary stays strict.
+            relay = render_closed(
+                outcome=outcome.value,
+                requested="o pedido registrado nesta conversa",
+                summary=summary,
+                permalink=self._permalink(execution_root_id),
+            )
         if task.cleanup_state == CLEANUP_PENDING_STATE:
             if task.pending_outcome is not outcome or task.result_summary != summary or task.evidence != evidence:
                 raise ValueError("cleanup retry intent mismatch")

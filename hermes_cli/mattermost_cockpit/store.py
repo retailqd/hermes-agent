@@ -473,6 +473,7 @@ class MattermostCockpitStore:
                 raise ValueError("version mismatch")
             if current.cleanup_state != CLEANUP_PENDING_STATE or current.pending_outcome is None:
                 raise ValueError("task is not cleanup pending")
+            self._resolve_active_gates_for_terminal(conn, task_id)
             updated = replace(
                 current,
                 lifecycle=current.pending_outcome,
@@ -514,6 +515,7 @@ class MattermostCockpitStore:
             new_closed_at = closed_at
             if lifecycle in TERMINAL_LIFECYCLES:
                 new_closed_at = new_closed_at or utc_now()
+                self._resolve_active_gates_for_terminal(conn, task_id)
             elif new_closed_at is not None:
                 raise ValueError("nonterminal lifecycle must not carry closed_at")
 
@@ -799,34 +801,75 @@ class MattermostCockpitStore:
             return MattermostCockpitGateRelay.from_row(updated)  # type: ignore[arg-type]
 
     def append_audit_event(self, event: MattermostCockpitAuditEvent) -> MattermostCockpitAuditEvent:
-        record = event.to_record()
         with self.connect() as conn, write_txn(conn):
-            if event.dedupe_key is not None:
-                existing = conn.execute(
-                    "SELECT task_id, event_type, actor_user_id, created_at, payload_json, dedupe_key "
-                    "FROM cockpit_audit_events WHERE task_id = ? AND dedupe_key = ?",
-                    (event.task_id, event.dedupe_key),
-                ).fetchone()
-                if existing is not None:
-                    return MattermostCockpitAuditEvent.from_row(existing)
-            cursor = conn.execute(
-                "INSERT INTO cockpit_audit_events (task_id, event_type, actor_user_id, created_at, payload_json, dedupe_key) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    record["task_id"],
-                    record["event_type"],
-                    record["actor_user_id"],
-                    record["created_at"],
-                    record["payload_json"],
-                    record["dedupe_key"],
+            return self._append_audit_event_in_txn(conn, event)
+
+    def _append_audit_event_in_txn(
+        self, conn: sqlite3.Connection, event: MattermostCockpitAuditEvent
+    ) -> MattermostCockpitAuditEvent:
+        record = event.to_record()
+        if event.dedupe_key is not None:
+            existing = conn.execute(
+                "SELECT task_id, event_type, actor_user_id, created_at, payload_json, dedupe_key "
+                "FROM cockpit_audit_events WHERE task_id = ? AND dedupe_key = ?",
+                (event.task_id, event.dedupe_key),
+            ).fetchone()
+            if existing is not None:
+                return MattermostCockpitAuditEvent.from_row(existing)
+        cursor = conn.execute(
+            "INSERT INTO cockpit_audit_events (task_id, event_type, actor_user_id, created_at, payload_json, dedupe_key) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                record["task_id"],
+                record["event_type"],
+                record["actor_user_id"],
+                record["created_at"],
+                record["payload_json"],
+                record["dedupe_key"],
+            ),
+        )
+        row = conn.execute(
+            "SELECT task_id, event_type, actor_user_id, created_at, payload_json, dedupe_key "
+            "FROM cockpit_audit_events WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        return MattermostCockpitAuditEvent.from_row(row)  # type: ignore[arg-type]
+
+    def _resolve_active_gates_for_terminal(self, conn: sqlite3.Connection, task_id: str) -> None:
+        """Resolve (and audit) any active gate while a task turns terminal.
+
+        The legacy CHECK on cockpit_gate_relays forbids inactive rows without a
+        real owner decision, and rebuilding the live table under concurrent
+        watchers is riskier than it is worth, so terminal resolution deletes
+        the row and preserves the full gate snapshot in the audit trail within
+        the same transaction. Invariant: terminal tasks have zero active gates.
+        """
+        rows = conn.execute(
+            "SELECT " + GATE_COLUMNS + " FROM cockpit_gate_relays WHERE task_id = ? AND active = 1",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            gate = MattermostCockpitGateRelay.from_row(row)
+            conn.execute(
+                "DELETE FROM cockpit_gate_relays WHERE gate_id = ? AND active = 1",
+                (gate.gate_id,),
+            )
+            self._append_audit_event_in_txn(
+                conn,
+                MattermostCockpitAuditEvent(
+                    task_id=task_id,
+                    event_type="gate_resolved_terminal",
+                    actor_user_id=self._contracts.watcher_user_id,
+                    created_at=utc_now(),
+                    payload={
+                        "gate_id": gate.gate_id,
+                        "resolution_reason": "task_terminal",
+                        "prompt_post_id": gate.prompt_post_id,
+                        "prompt_body": gate.prompt_body,
+                    },
+                    dedupe_key=f"gate-terminal:{gate.gate_id}",
                 ),
             )
-            row = conn.execute(
-                "SELECT task_id, event_type, actor_user_id, created_at, payload_json, dedupe_key "
-                "FROM cockpit_audit_events WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-            return MattermostCockpitAuditEvent.from_row(row)  # type: ignore[arg-type]
 
     def record_audit_event(self, event: MattermostCockpitAuditEvent) -> MattermostCockpitAuditEvent:
         return self.append_audit_event(event)

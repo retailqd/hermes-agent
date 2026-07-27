@@ -13,6 +13,7 @@ import pytest
 from hermes_cli.mattermost_cockpit import service as service_module
 from hermes_cli.mattermost_cockpit.contracts import GateDecision, Lifecycle, MattermostCockpitContracts
 from hermes_cli.mattermost_cockpit.models import MattermostCockpitGateRelay
+from hermes_cli.mattermost_cockpit.presentation import OwnerDecisionPrompt
 from hermes_cli.mattermost_cockpit.service import CockpitService
 from hermes_cli.mattermost_cockpit.store import MattermostCockpitStore
 
@@ -1994,3 +1995,133 @@ def test_local_watcher_owner_liveness_detects_dead_pid(monkeypatch):
     monkeypatch.setattr(os, "kill", process_missing)
 
     assert CockpitService._local_watcher_owner_liveness(f"{socket.gethostname()}:123", "task-one") is False
+
+
+# ---------------------------------------------------------------------------
+# T7: structured lay-language gates + terminal lifecycle invariants
+# ---------------------------------------------------------------------------
+
+
+def _t7_running_task(service, task_id, dedupe):
+    return service.create(
+        task_id=task_id,
+        title="Ajustar o catálogo de produtos da loja",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key=dedupe,
+    )
+
+
+def _t7_decision():
+    return OwnerDecisionPrompt(
+        decision="Reprocessar itens incompletos",
+        plain_language="Vou atualizar somente os itens listados, sem criar pedidos novos.",
+        risk="Baixo e restrito aos itens listados.",
+        reply_instruction="Responda `aprovar` para continuar ou diga o ajuste.",
+    )
+
+
+def test_open_gate_structured_renders_plain_language_contract(rig):
+    service, store, bot, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-gate-structured", "source:gate-structured")
+    service.open_gate(task.task_id, gate_id="gate-structured", decision=_t7_decision())
+    gate_posts = [
+        p
+        for p in bot.posts.values()
+        if p.get("root_id") == SOURCE_ROOT
+        and "Preciso de uma decisão sua" in p.get("message", "")
+    ]
+    assert len(gate_posts) == 1
+    body = gate_posts[0]["message"]
+    assert body.startswith("**Preciso de uma decisão sua**")
+    assert "**Em linguagem simples:**" in body
+    assert "**Risco:**" in body
+    assert "**Como responder:**" in body
+    assert "##" not in body
+    assert "[cockpit" not in body
+    assert store.get_task(task.task_id).lifecycle is Lifecycle.WAITING_OWNER
+
+
+def test_open_gate_requires_exactly_one_prompt_form(rig):
+    service, _, _, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-gate-forms", "source:gate-forms")
+    with pytest.raises(ValueError, match="exactly one"):
+        service.open_gate(
+            task.task_id, gate_id="gate-both", prompt="texto", decision=_t7_decision()
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        service.open_gate(task.task_id, gate_id="gate-none")
+
+
+@pytest.mark.parametrize("outcome", [Lifecycle.SUCCEEDED, Lifecycle.FAILED, Lifecycle.CANCELLED])
+def test_terminal_task_rejects_new_gate(rig, outcome):
+    service, _, _, _, _, _, _ = rig
+    task = _t7_running_task(
+        service,
+        f"task-terminal-gate-{outcome.value.lower()}",
+        f"source:terminal-gate:{outcome.value}",
+    )
+    service.close(
+        task.task_id,
+        outcome=outcome,
+        summary="A tarefa terminou durante o teste.",
+        evidence={"validation": "test"},
+        last_error=None,
+    )
+    with pytest.raises(ValueError, match="terminal"):
+        service.open_gate(task.task_id, gate_id="late-gate", decision=_t7_decision())
+
+
+def test_close_resolves_active_gate_before_terminal_transition(rig):
+    service, store, _, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-close-gate", "source:close-gate")
+    service.open_gate(task.task_id, gate_id="gate-close", decision=_t7_decision())
+    assert store.get_active_gate(task.task_id) is not None
+
+    service.close(
+        task.task_id,
+        outcome=Lifecycle.CANCELLED,
+        summary="Encerrada durante o teste de limpeza.",
+        evidence={"validation": "test"},
+        last_error=None,
+    )
+
+    assert store.get_active_gate(task.task_id) is None
+    assert store.get_task(task.task_id).lifecycle is Lifecycle.CANCELLED
+    events = store.list_audit_events(task.task_id)
+    assert any(e.event_type == "gate_resolved_terminal" for e in events)
+
+
+def test_close_falls_back_to_neutral_request_when_title_has_jargon(rig):
+    # Legacy autopilot tasks carry technical titles; close must still succeed
+    # with a neutral lay request line instead of failing closed forever.
+    service, store, bot, _, _, _, _ = rig
+    task = service.create(
+        task_id="task-legacy-title",
+        title="INC-GP gateway watcher deploy f350f4c4",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:legacy-title",
+    )
+    closed = service.close(
+        task.task_id,
+        outcome=Lifecycle.CANCELLED,
+        summary="Encerrada na limpeza geral por falta de atividade.",
+        evidence={"validation": "test"},
+        last_error=None,
+    )
+    assert closed.lifecycle is Lifecycle.CANCELLED
+    final_posts = [
+        p
+        for p in bot.posts.values()
+        if p.get("props", {}).get("cockpit_relay_marker") == "[cockpit-final:task-legacy-title]"
+    ]
+    assert len(final_posts) == 1
+    body = final_posts[0]["message"]
+    assert "o pedido registrado nesta conversa" in body
+    assert "gateway" not in body
+    assert "watcher" not in body
