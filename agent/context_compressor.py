@@ -19,6 +19,7 @@ Improvements over v2:
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import re
 import copy
@@ -27,7 +28,12 @@ import time
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.auxiliary_client import (
+    _effective_aux_timeout,
+    _is_connection_error,
+    aux_interrupt_protection,
+    call_llm,
+)
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -45,8 +51,27 @@ HISTORICAL_REMAINING_WORK_HEADING = "## Historical Remaining Work"
 BACKGROUND_CANDIDATE_VERSION = "context-summary-v3"
 SUMMARY_PROMPT_VERSION = "structured-handoff-v1"
 SUMMARY_SERIALIZER_VERSION = "summary-wire-v1"
-_BACKGROUND_JOIN_TIMEOUT_SECONDS = 120.0
+_BACKGROUND_JOIN_COMPLETION_GRACE_SECONDS = 5.0
 _BACKGROUND_PREPARATION_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _finite_background_join_budget(value: Any) -> float:
+    """Return a finite positive join budget, or zero to fail closed."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if math.isfinite(parsed) and parsed > 0.0 else 0.0
+
+
+def _default_background_join_timeout_seconds() -> float:
+    """Keep the hard-gate join aligned with the worker's provider deadline."""
+    worker_deadline = _finite_background_join_budget(
+        _effective_aux_timeout("compression", None)
+    )
+    if worker_deadline == 0.0:
+        return 0.0
+    return worker_deadline + _BACKGROUND_JOIN_COMPLETION_GRACE_SECONDS
 
 
 SUMMARY_PREFIX = (
@@ -1482,8 +1507,9 @@ class ContextCompressor(ContextEngine):
                     _BACKGROUND_PREPARATION_SLOTS.release()
                 if published:
                     logger.info(
-                        "Background context preparation ready: session=%s messages=%d elapsed=%.1fs",
+                        "Background context preparation ready: session=%s generation=%d messages=%d elapsed=%.1fs",
                         self._session_id or "none",
+                        window["generation"],
                         window["count"],
                         time.monotonic() - preparation_started_at,
                     )
@@ -1497,8 +1523,9 @@ class ContextCompressor(ContextEngine):
             self._background_thread = thread
         thread.start()
         logger.info(
-            "Background context preparation started: session=%s messages=%d tokens=%d hard_threshold=%d",
+            "Background context preparation started: session=%s generation=%d messages=%d tokens=%d hard_threshold=%d",
             self._session_id or "none",
+            window["generation"],
             window["count"],
             tokens,
             self.threshold_tokens,
@@ -1509,7 +1536,7 @@ class ContextCompressor(ContextEngine):
         self,
         turns: List[Dict[str, Any]],
         requested_focus_topic: Optional[str] = None,
-        timeout: float = _BACKGROUND_JOIN_TIMEOUT_SECONDS,
+        timeout: Optional[float] = None,
     ) -> Optional[bool]:
         """Join an in-flight worker for this exact prefix.
 
@@ -1552,7 +1579,12 @@ class ContextCompressor(ContextEngine):
             return False
 
         worker_age = max(0.0, time.monotonic() - started_monotonic)
-        remaining = max(0.0, float(timeout) - worker_age)
+        join_budget = (
+            _default_background_join_timeout_seconds()
+            if timeout is None
+            else _finite_background_join_budget(timeout)
+        )
+        remaining = max(0.0, join_budget - worker_age)
         if remaining > 0.0 and done.wait(remaining):
             return True
 
@@ -1567,6 +1599,16 @@ class ContextCompressor(ContextEngine):
             ):
                 active["timed_out"] = True
                 self._background_generation += 1
+                logger.warning(
+                    "Background context preparation join timed out: "
+                    "session=%s generation=%s messages=%d "
+                    "worker_age=%.1fs budget=%.1fs",
+                    self._session_id or "none",
+                    active_generation,
+                    covered,
+                    worker_age,
+                    join_budget,
+                )
         return False
 
     def wait_for_background_preparation(self, timeout: float = 0.0) -> bool:
@@ -3690,7 +3732,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # prefix candidate before joining a newer worker. Continuous-growth
         # sessions commonly have both: an older ready candidate and a newer
         # in-flight refresh. Waiting for the refresh first turns useful prepared
-        # work into a user-visible 120-second hard-gate stall.
+        # work into a user-visible hard-gate stall.
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
         background_tail_mode = None
         summary = None
@@ -3718,7 +3760,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     logger.warning(
                         "Compression aborted after waiting %.0fs for matching "
                         "background preparation; transcript preserved",
-                        _BACKGROUND_JOIN_TIMEOUT_SECONDS,
+                        _default_background_join_timeout_seconds(),
                     )
                 return original_messages
             # A successful join may have published a fresher exact candidate.

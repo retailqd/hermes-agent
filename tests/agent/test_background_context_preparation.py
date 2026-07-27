@@ -861,6 +861,105 @@ def test_hard_gate_uses_remaining_worker_budget_not_full_timeout(monkeypatch):
     assert wait_calls == [pytest.approx(14.1)]
 
 
+@pytest.mark.parametrize(
+    ("effective_timeout", "explicit_timeout"),
+    [
+        (float("inf"), None),
+        (float("nan"), None),
+        (300.0, float("inf")),
+        (300.0, float("nan")),
+    ],
+)
+def test_non_finite_join_budget_fails_closed_without_waiting(
+    monkeypatch,
+    effective_timeout,
+    explicit_timeout,
+):
+    compressor = _compressor()
+    window = compressor._background_window(_messages())
+    assert window is not None
+
+    class MustNotWait:
+        def wait(self, timeout):
+            raise AssertionError(f"unsafe non-finite join wait: {timeout!r}")
+
+        def is_set(self):
+            return False
+
+    window["generation"] = 1
+    window["started_monotonic"] = 1000.0
+    compressor._background_generation = 1
+    compressor._background_active = window
+    monkeypatch.setattr(compressor, "_background_done", MustNotWait())
+    monkeypatch.setattr(time, "monotonic", lambda: 1010.0)
+    monkeypatch.setattr(
+        "agent.context_compressor._effective_aux_timeout",
+        lambda task, timeout: effective_timeout,
+    )
+
+    assert compressor._join_compatible_background_preparation(
+        window["turns"], timeout=explicit_timeout
+    ) is False
+    assert window["timed_out"] is True
+    assert compressor._background_generation == 2
+
+
+def test_public_hard_gate_joins_aged_worker_within_compression_deadline(monkeypatch):
+    """The public hard gate must not abandon a worker before its own deadline."""
+    compressor = _compressor()
+    messages = _messages()
+    window = compressor._background_window(messages)
+    assert window is not None
+    timeout_requests = []
+    wait_calls = []
+
+    monkeypatch.setattr(
+        "agent.context_compressor._effective_aux_timeout",
+        lambda task, timeout: timeout_requests.append((task, timeout)) or 420.0,
+    )
+
+    class CompletesWithinProviderBudget:
+        def wait(self, timeout):
+            wait_calls.append(timeout)
+            compressor._background_candidate = {
+                "namespace": compressor._background_namespace(),
+                "source_hash": window["source_hash"],
+                "count": window["count"],
+                "requested_focus_topic": None,
+                "summary": "aged worker summary",
+            }
+            return True
+
+        def is_set(self):
+            return False
+
+    window["generation"] = 1
+    window["started_monotonic"] = 1000.0
+    compressor._background_generation = 1
+    compressor._background_active = window
+    monkeypatch.setattr(
+        compressor,
+        "_background_done",
+        CompletesWithinProviderBudget(),
+    )
+    monkeypatch.setattr(time, "monotonic", lambda: 1145.0)
+    monkeypatch.setattr(
+        compressor,
+        "_generate_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("public hard gate started a second summarizer call")
+        ),
+    )
+
+    result = compressor.compress(messages, current_tokens=200)
+
+    assert timeout_requests == [("compression", None)]
+    assert wait_calls == [pytest.approx(420.0 + 5.0 - 145.0)]
+    assert result is not messages
+    assert any("aged worker summary" in str(item.get("content")) for item in result)
+    assert window.get("timed_out") is not True
+
+
 def test_timed_out_generation_ignores_late_result():
     compressor = _compressor()
     messages = _messages()
