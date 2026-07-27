@@ -52,6 +52,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -168,6 +169,54 @@ def write_drain_request(
     }
     atomic_json_write(drain_request_path(home), payload)
     return payload
+
+
+_DEFAULT_DRAIN_MAX_SECONDS = 900.0
+
+
+def drain_max_seconds() -> float:
+    """Maximum seconds an external drain may hold the gateway before expiring.
+
+    Bounds the operator-lockout window: a drain whose lifecycle action never
+    completes (in-flight turn wedged, caller crashed) must not refuse new turns
+    forever. Tunable via ``HERMES_DRAIN_MAX_SECONDS``; a value <= 0 disables
+    expiry entirely (escape hatch for deliberately long maintenance). An unset
+    or unparseable value falls back to the 900s default.
+    """
+    raw = os.environ.get("HERMES_DRAIN_MAX_SECONDS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_DRAIN_MAX_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        _log.warning(
+            "drain-control: invalid HERMES_DRAIN_MAX_SECONDS=%r; using default %s",
+            raw,
+            _DEFAULT_DRAIN_MAX_SECONDS,
+        )
+        return _DEFAULT_DRAIN_MAX_SECONDS
+
+
+def expire_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """Archive then remove the drain marker when its deadline has passed.
+
+    The body is preserved under ``<HERMES_HOME>/backups/`` so the maintenance
+    action that armed the drain can be audited post-mortem. Archival is
+    best-effort: a failure to archive never blocks the removal (bounding the
+    lockout wins). Returns the archived body, or ``None`` if no marker existed.
+    """
+    body = read_drain_request(home=home)
+    if body is None:
+        return None
+    backup_dir = drain_request_path(home).parent / "backups"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        atomic_json_write(backup_dir / f"drain_request-expired-{stamp}.json", body)
+    except OSError as e:
+        _log.warning("drain-control: failed to archive expired marker: %s", e)
+    clear_drain_request(home=home)
+    return body
 
 
 def clear_drain_request(*, home: Optional[Path] = None) -> bool:

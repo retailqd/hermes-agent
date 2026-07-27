@@ -2788,6 +2788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _external_drain_engaged_at: Optional[float] = None
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -2872,6 +2873,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._external_drain_engaged_at = None
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -4514,6 +4516,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._external_drain_active:
             return
         self._external_drain_active = True
+        self._external_drain_engaged_at = time.monotonic()
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.",
@@ -4534,6 +4537,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        self._external_drain_engaged_at = None
         if self._draining or not self._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
@@ -4561,13 +4565,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         and is NOT honoured; only a marker from the current instantiation flips
         the gateway into drain. Best-effort: any tick error is logged and the
         loop continues (a transient stat() failure must not wedge the gateway).
+
+        Deadline: a drain held longer than ``drain_max_seconds()`` (measured
+        from ENGAGE, so a marker rewritten mid-drain does not reset the clock)
+        is force-expired — marker archived+cleared, gateway re-accepts turns.
+        In-flight turns keep running; only the refuse-new-turns lock is bounded.
+        The operator's home channels get a one-line notice on ENGAGE and on
+        expiry, regardless of the marker's ``suppress_notification`` flag (that
+        flag gates only the shutdown broadcast; a lockout must never be silent).
         """
-        from gateway.drain_control import drain_requested
+        from gateway.drain_control import (
+            drain_max_seconds,
+            drain_requested,
+            expire_drain_request,
+            read_drain_request,
+        )
 
         while self._running:
             try:
                 if drain_requested():
-                    self._enter_external_drain()
+                    if not self._external_drain_active:
+                        self._enter_external_drain()
+                        body = read_drain_request() or {}
+                        principal = str(body.get("principal") or "unknown")
+                        max_age = drain_max_seconds()
+                        limit_note = (
+                            f" Auto-releases in ≤{max(1, int(max_age // 60))} min if it doesn't finish."
+                            if max_age > 0
+                            else ""
+                        )
+                        await self._broadcast_home_channels(
+                            "🔧 Maintenance drain engaged "
+                            f"(principal: {principal}) — new messages are paused "
+                            f"while in-flight work finishes.{limit_note}"
+                        )
+                    else:
+                        max_age = drain_max_seconds()
+                        engaged_at = self._external_drain_engaged_at
+                        if max_age > 0 and engaged_at is not None:
+                            held = time.monotonic() - engaged_at
+                            if held > max_age:
+                                body = expire_drain_request() or {}
+                                principal = str(body.get("principal") or "unknown")
+                                logger.error(
+                                    "External drain EXPIRED after %.0fs (max %.0fs, "
+                                    "principal=%s) — marker archived and cleared; "
+                                    "re-accepting new turns. In-flight turn(s) keep "
+                                    "running.",
+                                    held,
+                                    max_age,
+                                    principal,
+                                )
+                                self._exit_external_drain()
+                                await self._broadcast_home_channels(
+                                    "🔓 Maintenance drain "
+                                    f"(principal: {principal}) exceeded its "
+                                    f"{max(1, int(max_age // 60))} min limit and was "
+                                    "auto-released — accepting new messages again."
+                                )
                 else:
                     self._exit_external_drain()
             except asyncio.CancelledError:
@@ -4575,6 +4630,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("Drain-control watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
+
+    async def _broadcast_home_channels(self, msg: str) -> None:
+        """Best-effort one-line operator notice to every configured home channel.
+
+        Used by the external-drain watcher (ENGAGE / expiry). Honours the
+        per-platform ``gateway_restart_notification`` opt-out, mirrors the
+        shutdown broadcast's send shape, and never raises — a notification
+        failure must not affect drain state handling.
+        """
+        for platform, adapter in list(self.adapters.items()):
+            try:
+                home = self.config.get_home_channel(platform)
+                if not home or not home.chat_id:
+                    continue
+                platform_cfg = self.config.platforms.get(platform)
+                if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                    continue
+                metadata = self._thread_metadata_for_target(
+                    platform,
+                    home.chat_id,
+                    home.thread_id,
+                    adapter=adapter,
+                )
+                if metadata:
+                    await adapter.send(str(home.chat_id), msg, metadata=metadata)
+                else:
+                    await adapter.send(str(home.chat_id), msg)
+            except Exception as e:
+                logger.debug(
+                    "Home-channel drain notice failed for %s: %s",
+                    getattr(platform, "value", platform),
+                    e,
+                )
 
     def _update_platform_runtime_status(
         self,

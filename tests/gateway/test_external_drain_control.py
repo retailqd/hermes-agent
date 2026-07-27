@@ -341,3 +341,126 @@ class TestNewTurnGate:
         runner._enter_external_drain()
         assert runner._running_agents.get("k") is sentinel
         sentinel.interrupt.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Drain deadline: bounded operator lockout (engage notice + forced expiry)
+# ---------------------------------------------------------------------------
+
+
+class TestDrainMaxSeconds:
+    def test_default_900(self, monkeypatch):
+        monkeypatch.delenv("HERMES_DRAIN_MAX_SECONDS", raising=False)
+        assert dc.drain_max_seconds() == 900.0
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DRAIN_MAX_SECONDS", "42.5")
+        assert dc.drain_max_seconds() == 42.5
+
+    def test_invalid_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DRAIN_MAX_SECONDS", "banana")
+        assert dc.drain_max_seconds() == 900.0
+
+    def test_zero_reads_as_disabled(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DRAIN_MAX_SECONDS", "0")
+        assert dc.drain_max_seconds() == 0.0
+
+
+class TestExpireDrainRequest:
+    def test_absent_returns_none(self, home):
+        assert dc.expire_drain_request() is None
+
+    def test_archives_then_clears(self, home):
+        import json
+
+        dc.write_drain_request(principal="wedged-release")
+        body = dc.expire_drain_request()
+        assert body is not None and body["principal"] == "wedged-release"
+        assert dc.drain_requested() is False
+        assert dc.read_drain_request() is None
+        archives = list((home / "backups").glob("drain_request-expired-*.json"))
+        assert len(archives) == 1
+        archived = json.loads(archives[0].read_text())
+        assert archived["principal"] == "wedged-release"
+
+
+def _deadline_runner():
+    """Runner with the real watcher bound and home-channel notices recorded."""
+    runner, adapter = _drain_runner()
+    runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+        runner, GatewayRunner
+    )
+    sent: list[str] = []
+
+    async def _record(msg: str) -> None:
+        sent.append(msg)
+
+    runner._broadcast_home_channels = _record
+    return runner, sent
+
+
+async def _stop_watcher(runner, task):
+    runner._running = False
+    await asyncio.sleep(0.04)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+class TestDrainDeadline:
+    @pytest.mark.asyncio
+    async def test_engage_notifies_home_channel_even_when_suppressed(self, home):
+        # suppress_notification gates ONLY the shutdown broadcast; the lockout
+        # notice on ENGAGE must always reach the operator.
+        runner, sent = _deadline_runner()
+        dc.write_drain_request(principal="unit-test", suppress_notification=True)
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.02))
+        await asyncio.sleep(0.08)
+        assert runner._external_drain_active is True
+        assert any(
+            "Maintenance drain engaged" in m and "unit-test" in m for m in sent
+        )
+        await _stop_watcher(runner, task)
+
+    @pytest.mark.asyncio
+    async def test_deadline_expires_archives_and_releases(self, home, monkeypatch):
+        monkeypatch.setenv("HERMES_DRAIN_MAX_SECONDS", "0.05")
+        runner, sent = _deadline_runner()
+        dc.write_drain_request(principal="wedged")
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.02))
+        await asyncio.sleep(0.3)
+        assert runner._external_drain_active is False
+        assert dc.drain_requested() is False
+        archives = list((home / "backups").glob("drain_request-expired-*.json"))
+        assert len(archives) == 1
+        assert any("auto-released" in m and "wedged" in m for m in sent)
+        await _stop_watcher(runner, task)
+
+    @pytest.mark.asyncio
+    async def test_zero_max_disables_expiry(self, home, monkeypatch):
+        monkeypatch.setenv("HERMES_DRAIN_MAX_SECONDS", "0")
+        runner, sent = _deadline_runner()
+        dc.write_drain_request(principal="long-maintenance")
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.02))
+        await asyncio.sleep(0.2)
+        assert runner._external_drain_active is True
+        assert dc.drain_requested() is True
+        await _stop_watcher(runner, task)
+
+    @pytest.mark.asyncio
+    async def test_marker_rewrite_does_not_reset_deadline_clock(self, home, monkeypatch):
+        # A second maintenance replacing the marker mid-drain must not extend
+        # the operator lockout: the clock runs from ENGAGE, not from the marker.
+        monkeypatch.setenv("HERMES_DRAIN_MAX_SECONDS", "0.10")
+        runner, sent = _deadline_runner()
+        dc.write_drain_request(principal="first")
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.02))
+        await asyncio.sleep(0.06)
+        assert runner._external_drain_active is True
+        dc.write_drain_request(principal="second")  # rewrite refreshes requested_at
+        await asyncio.sleep(0.3)
+        assert runner._external_drain_active is False
+        assert dc.drain_requested() is False
+        await _stop_watcher(runner, task)
