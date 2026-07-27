@@ -93,6 +93,7 @@ class FakeBridge:
         self.owner_client = owner_client
         self.posts: list[tuple[str, str | None]] = []
         self.poll_output = "NENHUM"
+        self.poll_calls = 0
         self.watch_calls = 0
 
     def post_owner(self, message: str, *, timeout: float, team=None, channel=None, root_id=None):
@@ -108,6 +109,7 @@ class FakeBridge:
 
     def poll_main(self, **kwargs):
         del kwargs
+        self.poll_calls += 1
         return SimpleNamespace(stdout=self.poll_output, stderr="")
 
 
@@ -927,6 +929,27 @@ def test_close_does_not_publish_final_result_before_cleanup_succeeds(rig):
     assert closed.lifecycle is Lifecycle.SUCCEEDED
     assert closed.cleanup_state is None
     assert closed.pending_outcome is None
+
+
+def test_watch_once_does_not_relay_technical_poll_output_to_source(rig):
+    service, _, bot, owner, bridge, _, _ = rig
+    task = service.create(
+        task_id="task-no-technical-source-relay",
+        title="No technical source relay",
+        handoff="handoff",
+        source_channel_id=MAIN,
+        source_root_id=SOURCE_ROOT,
+        source_post_id=SOURCE_POST,
+        dedupe_key="source:no-technical-source-relay",
+    )
+    bot.posts[task.execution_root_id] = dict(owner.posts[task.execution_root_id])
+    bridge.poll_output = "WAKE: internal specialist log"
+    source_before = dict(bot.get_thread(SOURCE_ROOT)["posts"])
+
+    assert service.watch_once(task.task_id) is True
+
+    assert bridge.poll_calls == 1
+    assert bot.get_thread(SOURCE_ROOT)["posts"] == source_before
 
 
 def test_watch_once_operates_while_owner_does_not_follow_execution_thread(rig):

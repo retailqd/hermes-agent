@@ -542,19 +542,13 @@ class CockpitService:
         )
         state_path = self.state_dir / f"{task_id}.json"
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        poll = self.bridge.poll_main(
+        self.bridge.poll_main(
             timeout=30,
             thread_id=task.execution_root_id,
             channel=self.executions_channel_name,
             state=str(state_path),
             max_pages=20,
         )
-        output = poll.stdout.strip()
-        if output and output not in {"NENHUM", "BASELINE"}:
-            bounded = output[:_MAX_RELAY_CHARS]
-            digest = hashlib.sha256(bounded.encode("utf-8")).hexdigest()[:16]
-            marker = f"[cockpit-relay:{task_id}:{digest}]"
-            self._ensure_source_relay(task, marker=marker, message=f"{marker}\n{bounded}")
         thread = self.bot_client.get_thread(task.execution_root_id)
         posts = thread.get("posts") or {}
         max_cursor = max((int(post.get("create_at") or 0) for post in posts.values()), default=task.execution_cursor_ms)
