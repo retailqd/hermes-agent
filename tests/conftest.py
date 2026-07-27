@@ -436,28 +436,27 @@ def _is_runtime_module(name: str) -> bool:
 def _restore_process_platform(request):
     """Prevent process-global platform, module, keepalive, and ContextVar leaks."""
     cli_test = "tests/hermes_cli" in request.node.path.as_posix()
-    reset_session_context = None
-    if cli_test:
-        from gateway.session_context import reset_session_vars
-
-        reset_session_context = reset_session_vars
-        reset_session_context()
-    original_modules = (
-        {
-            name: module
-            for name, module in sys.modules.items()
-            if _is_runtime_module(name)
-        }
-        if cli_test
-        else {}
-    )
     sys.platform = _REAL_SYS_PLATFORM
+    if not cli_test:
+        try:
+            yield
+        finally:
+            sys.platform = _REAL_SYS_PLATFORM
+        return
+
+    from gateway.session_context import reset_session_vars
+
+    reset_session_context = reset_session_vars
+    reset_session_context()
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_runtime_module(name)
+    }
     try:
         yield
     finally:
         sys.platform = _REAL_SYS_PLATFORM
-        if not cli_test:
-            return
 
         # A few CLI tests intentionally start the process-wide Nous keepalive.
         # Stop every instance that may have been created through a re-import
