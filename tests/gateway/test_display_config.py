@@ -177,6 +177,18 @@ class TestYAMLNormalisation:
         config = {"display": {"platforms": {"whatsapp": {"tool_progress": " off\n"}}}}
         assert resolve_display_setting(config, "whatsapp", "tool_progress") == "off"
 
+    def test_tool_progress_grouping_accepts_latest(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "mattermost": {"tool_progress_grouping": "latest"},
+                }
+            }
+        }
+        assert resolve_display_setting(config, "mattermost", "tool_progress_grouping") == "latest"
+
     def test_only_long_running_visibility_accepts_generic_mode(self):
         from gateway.display_config import resolve_display_setting
 

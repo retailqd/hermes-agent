@@ -265,7 +265,7 @@ def _normalise(setting: str, value: Any) -> Any:
         return bool(value)
     if setting == "tool_progress_grouping":
         val = str(value).lower()
-        return val if val in ("accumulate", "separate") else "accumulate"
+        return val if val in ("accumulate", "separate", "latest") else "accumulate"
     if setting == "reasoning_style":
         val = str(value).lower()
         return val if val in ("code", "blockquote", "subtext") else "code"

@@ -228,6 +228,29 @@ class ManyProgressLinesAgent:
         }
 
 
+class LatestProgressAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", "Reading skill", {})
+        time.sleep(0.35)
+        cb("tool.started", "terminal", "Searching files", {})
+        time.sleep(0.35)
+        cb("tool.started", "terminal", "Running tests", {})
+        time.sleep(0.35)
+        cb("tool.started", "terminal", "Running tests", {})
+        time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class DelayedInterimAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -793,6 +816,31 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_grouping_latest_keeps_only_latest_line(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LatestProgressAgent,
+        session_id="sess-progress-latest-grouping",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "latest",
+                "interim_assistant_messages": False,
+            }
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    final_content = adapter.edits[-1]["content"] if adapter.edits else adapter.sent[-1]["content"]
+    assert final_content.splitlines() == ["⚙️ Running Running tests (×2)"]
+    assert "Reading skill" not in final_content
+    assert "Searching files" not in final_content
+    assert final_content.endswith("(×2)")
 
 
 @pytest.mark.asyncio

@@ -17287,6 +17287,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _progress_text(lines: list) -> str:
                 return "\n".join(str(line) for line in lines)
 
+            def _set_progress_line(line: Any) -> None:
+                if progress_grouping == "latest":
+                    progress_lines[:] = [line]
+                else:
+                    progress_lines.append(line)
+
+            def _set_dedup_progress_line(base_msg: str, count: int) -> str:
+                line = f"{base_msg} (×{count + 1})"
+                if progress_grouping == "latest":
+                    progress_lines[:] = [line]
+                elif progress_lines:
+                    progress_lines[-1] = line
+                else:
+                    progress_lines.append(line)
+                return line
+
             def _split_progress_groups(lines: list) -> list[list]:
                 """Partition progress lines into platform-sized editable bubbles."""
                 groups: list[list] = []
@@ -17387,9 +17403,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
-                        if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                        msg = progress_lines[-1] if progress_lines else base_msg
+                        msg = _set_dedup_progress_line(base_msg, count)
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
@@ -17406,7 +17420,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     else:
                         msg = raw
-                        progress_lines.append(msg)
+                        _set_progress_line(msg)
 
                     if await _roll_progress_overflow_if_needed():
                         _last_edit_ts = time.monotonic()
@@ -17509,9 +17523,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             raw = progress_queue.get_nowait()
                             if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
-                                if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                                    await _roll_progress_overflow_if_needed()
+                                _set_dedup_progress_line(base_msg, count)
+                                await _roll_progress_overflow_if_needed()
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
@@ -17528,7 +17541,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 last_progress_msg[0] = None
                                 repeat_count[0] = 0
                             else:
-                                progress_lines.append(raw)
+                                _set_progress_line(raw)
                                 await _roll_progress_overflow_if_needed()
                         except Exception:
                             break
