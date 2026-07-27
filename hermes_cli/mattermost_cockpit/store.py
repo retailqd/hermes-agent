@@ -20,7 +20,7 @@ from .contracts import (
     TERMINAL_LIFECYCLES,
     validate_mattermost_id,
 )
-from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, _require_text, _require_utc, utc_now
+from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, _format_utc, _require_text, _require_utc, utc_now
 
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_VERSION = 2
@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS cockpit_tasks (
     ),
     CHECK (cleanup_state IS NULL OR cleanup_state = 'cleanup_pending'),
     CHECK ((cleanup_state IS NULL AND pending_outcome IS NULL) OR (cleanup_state = 'cleanup_pending' AND pending_outcome IN ('SUCCEEDED', 'FAILED', 'CANCELLED')))
+);
+
+CREATE TABLE IF NOT EXISTS cockpit_status_relays (
+    task_id     TEXT PRIMARY KEY REFERENCES cockpit_tasks(task_id) ON DELETE CASCADE,
+    post_id     TEXT NOT NULL UNIQUE,
+    body        TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS cockpit_audit_events (
@@ -834,6 +841,35 @@ class MattermostCockpitStore:
             (cursor.lastrowid,),
         ).fetchone()
         return MattermostCockpitAuditEvent.from_row(row)  # type: ignore[arg-type]
+
+    def get_status_relay(self, task_id: str) -> dict[str, str] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT task_id, post_id, body, updated_at FROM cockpit_status_relays WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {key: str(row[key]) for key in ("task_id", "post_id", "body", "updated_at")}
+
+    def upsert_status_relay(self, task_id: str, *, post_id: str, body: str) -> dict[str, str]:
+        post_id = validate_mattermost_id(post_id, "post_id")
+        body = _require_text(body, "body")
+        with self.connect() as conn, write_txn(conn):
+            existing = conn.execute(
+                "SELECT post_id FROM cockpit_status_relays WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing is not None and str(existing["post_id"]) != post_id:
+                raise ValueError("status relay post binding is immutable")
+            now = _format_utc(utc_now())
+            conn.execute(
+                "INSERT INTO cockpit_status_relays (task_id, post_id, body, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+                (task_id, post_id, body, now),
+            )
+            return {"task_id": task_id, "post_id": post_id, "body": body, "updated_at": now}
 
     def _resolve_active_gates_for_terminal(self, conn: sqlite3.Connection, task_id: str) -> None:
         """Resolve (and audit) any active gate while a task turns terminal.

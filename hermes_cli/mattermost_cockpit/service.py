@@ -24,7 +24,7 @@ from .contracts import (
 )
 from .helpers import HelperBridge
 from .models import MattermostCockpitAuditEvent, MattermostCockpitGateRelay, MattermostCockpitTask, utc_now
-from .presentation import OwnerDecisionPrompt, render_owner_decision
+from .presentation import OwnerDecisionPrompt, render_owner_decision, render_owner_progress
 from .relay_renderer import RenderedRelay, render_closed, render_execution_update, render_gate, render_started
 from .store import MattermostCockpitStore, WatcherLeaseConflictError
 
@@ -475,6 +475,50 @@ class CockpitService:
             f"owner-decision:{gate_id}:{source_post_id}",
         )
         return current
+
+    def relay_status(
+        self,
+        task_id: str,
+        *,
+        now_text: str,
+        next_milestone: str,
+    ) -> dict[str, str]:
+        """Upsert the task's single owner-facing status post (T9).
+
+        One status post per task, edited in place: the first call creates the
+        post in the source thread (marker in props, never in the body), every
+        later call edits the same post. Lay language is enforced by the
+        presentation renderer; technical detail belongs in the execution root.
+        """
+        task = self._require_open_bound_task(task_id)
+        rendered = render_owner_progress(now=now_text, next_milestone=next_milestone)
+        existing = self.store.get_status_relay(task.task_id)
+        if existing is None:
+            post = self.bot_client.create_post(
+                task.source_channel_id,
+                rendered.markdown,
+                root_id=task.source_root_id,
+                props={
+                    "cockpit_relay_marker": f"[cockpit-status:{task.task_id}]",
+                    "cockpit_relay_schema": 1,
+                },
+            )
+            record = self.store.upsert_status_relay(
+                task.task_id, post_id=str(post["id"]), body=rendered.markdown
+            )
+        else:
+            if existing["body"] != rendered.markdown:
+                self.bot_client.update_post(existing["post_id"], rendered.markdown)
+            record = self.store.upsert_status_relay(
+                task.task_id, post_id=existing["post_id"], body=rendered.markdown
+            )
+        self._audit(
+            task,
+            "owner_status_relayed",
+            {"post_id": record["post_id"]},
+            f"status:{task.task_id}:{hashlib.sha256(rendered.markdown.encode('utf-8')).hexdigest()[:16]}",
+        )
+        return record
 
     def close(
         self,

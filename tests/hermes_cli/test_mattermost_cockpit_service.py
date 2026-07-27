@@ -105,6 +105,12 @@ class FakeClient:
         self.events.append(f"delete:{self.user_id}:{post_id}")
         return {"status": "OK"}
 
+    def update_post(self, post_id: str, message: str) -> dict:
+        post = self.posts[post_id]
+        post["message"] = message
+        self.events.append(f"update:{self.user_id}:{post_id}")
+        return dict(post)
+
     def search_posts(self, team_id: str, terms: str) -> dict:
         assert team_id == TEAM
         matches = {pid: p for pid, p in self.posts.items() if terms in p.get("message", "")}
@@ -2125,3 +2131,67 @@ def test_close_falls_back_to_neutral_request_when_title_has_jargon(rig):
     assert "o pedido registrado nesta conversa" in body
     assert "gateway" not in body
     assert "watcher" not in body
+
+
+# ---------------------------------------------------------------------------
+# T9: single owner status post per task, edited in place
+# ---------------------------------------------------------------------------
+
+
+def test_relay_status_upserts_single_post_in_place(rig):
+    service, store, bot, _, _, _, events = rig
+    task = _t7_running_task(service, "task-status-upsert", "source:status-upsert")
+
+    first = service.relay_status(
+        task.task_id,
+        now_text="estou revisando os dados antes de mexer em qualquer coisa",
+        next_milestone="volto quando a causa estiver confirmada",
+    )
+    second = service.relay_status(
+        task.task_id,
+        now_text="a causa foi confirmada e o ajuste está sendo preparado",
+        next_milestone="volto quando o ajuste estiver validado",
+    )
+
+    assert first["post_id"] == second["post_id"]
+    status_posts = [
+        p
+        for p in bot.posts.values()
+        if p.get("props", {}).get("cockpit_relay_marker") == f"[cockpit-status:{task.task_id}]"
+    ]
+    assert len(status_posts) == 1
+    body = status_posts[0]["message"]
+    assert body.startswith("**Em andamento, ainda não concluído**")
+    assert "a causa foi confirmada" in body.lower()
+    assert "[cockpit" not in body
+    assert events.count(f"update:{BOT}:{first['post_id']}") == 1
+
+
+def test_relay_status_same_text_does_not_edit_again(rig):
+    service, _, _, _, _, _, events = rig
+    task = _t7_running_task(service, "task-status-noop", "source:status-noop")
+    kwargs = {
+        "now_text": "estou revisando os dados",
+        "next_milestone": "volto quando houver novidade concreta",
+    }
+    first = service.relay_status(task.task_id, **kwargs)
+    service.relay_status(task.task_id, **kwargs)
+    assert events.count(f"update:{BOT}:{first['post_id']}") == 0
+
+
+def test_relay_status_rejected_for_terminal_task(rig):
+    service, _, _, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-status-terminal", "source:status-terminal")
+    service.close(
+        task.task_id,
+        outcome=Lifecycle.CANCELLED,
+        summary="Encerrada durante o teste.",
+        evidence={"validation": "test"},
+        last_error=None,
+    )
+    with pytest.raises(ValueError, match="terminal"):
+        service.relay_status(
+            task.task_id,
+            now_text="não deveria postar",
+            next_milestone="nunca",
+        )

@@ -53,6 +53,11 @@ def _parser() -> argparse.ArgumentParser:
     resume.add_argument("--source-root-id")
     resume.add_argument("--source-post-id")
 
+    status_relay = commands.add_parser("status-relay")
+    status_relay.add_argument("--task", required=True)
+    status_relay.add_argument("--now", required=True, dest="status_now")
+    status_relay.add_argument("--next-milestone", required=True)
+
     close = commands.add_parser("close")
     close.add_argument("--task", required=True)
     close.add_argument("--outcome", required=True, choices=("succeeded", "failed", "cancelled"))
@@ -160,6 +165,13 @@ def main(
             else:
                 task = service.open_gate(args.task, gate_id=args.gate_id, prompt=stdin.read())
             payload = _task_payload(task)
+        elif args.command == "status-relay":
+            record = service.relay_status(
+                args.task,
+                now_text=args.status_now,
+                next_milestone=args.next_milestone,
+            )
+            payload = {"ok": True, "result": record}
         elif args.command == "resume" and args.watch:
             watcher_state = service.watch_forever(args.task)
             payload = {"ok": True, "task_id": args.task, "watcher": watcher_state}
