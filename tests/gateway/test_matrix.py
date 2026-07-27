@@ -1716,8 +1716,8 @@ class TestMatrixDeviceId:
         assert adapter._device_id == "FROM_CONFIG"
 
     @pytest.mark.asyncio
-    async def test_connect_uses_configured_device_id_over_whoami(self):
-        """When MATRIX_DEVICE_ID is set, it should be used instead of whoami device_id."""
+    async def test_connect_accepts_matching_configured_and_whoami_device_id(self):
+        """Matching configured/token device IDs preserve stable E2EE identity."""
         from plugins.platforms.matrix.adapter import MatrixAdapter
 
         config = PlatformConfig(
@@ -1733,22 +1733,35 @@ class TestMatrixDeviceId:
         adapter = MatrixAdapter(config)
 
         fake_mautrix_mods = _make_fake_mautrix()
-
         mock_client = MagicMock()
         mock_client.mxid = "@bot:example.org"
         mock_client.device_id = None
         mock_client.state_store = MagicMock()
         mock_client.sync_store = MagicMock()
         mock_client.crypto = None
-        mock_client.whoami = AsyncMock(return_value=MagicMock(user_id="@bot:example.org", device_id="WHOAMI_DEV"))
-        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {"!room:server": {}}}})
+        mock_client.whoami = AsyncMock(
+            return_value=MagicMock(
+                user_id="@bot:example.org", device_id="MY_STABLE_DEVICE"
+            )
+        )
+        mock_client.sync = AsyncMock(
+            return_value={"rooms": {"join": {"!room:server": {}}}}
+        )
         mock_client.add_event_handler = MagicMock()
         mock_client.handle_sync = MagicMock(return_value=[])
-        mock_client.query_keys = AsyncMock(return_value={
-            "device_keys": {"@bot:example.org": {"MY_STABLE_DEVICE": {
-                "keys": {"ed25519:MY_STABLE_DEVICE": "fake_ed25519_key"},
-            }}},
-        })
+        mock_client.query_keys = AsyncMock(
+            return_value={
+                "device_keys": {
+                    "@bot:example.org": {
+                        "MY_STABLE_DEVICE": {
+                            "keys": {
+                                "ed25519:MY_STABLE_DEVICE": "fake_ed25519_key"
+                            }
+                        }
+                    }
+                }
+            }
+        )
         mock_client.api = MagicMock()
         mock_client.api.token = "syt_test_access_token"
         mock_client.api.session = MagicMock()
@@ -1766,17 +1779,92 @@ class TestMatrixDeviceId:
         fake_mautrix_mods["mautrix.crypto"].OlmMachine = MagicMock(return_value=mock_olm)
 
         import plugins.platforms.matrix.adapter as matrix_mod
-        with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
-            with patch.dict("sys.modules", fake_mautrix_mods):
-                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
-                        assert await adapter.connect() is True
 
-        # The configured device_id should override the whoami device_id.
-        # In mautrix, the adapter sets client.device_id directly.
+        mock_session = MagicMock()
+        mock_session.close = AsyncMock()
+        mock_client.api.session = mock_session
+        with patch.object(matrix_mod, "_create_matrix_session", return_value=mock_session):
+            with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+                with patch.dict("sys.modules", fake_mautrix_mods):
+                    with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                        with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                            assert await adapter.connect() is True
+
         assert adapter._device_id == "MY_STABLE_DEVICE"
+        assert mock_client.device_id == "MY_STABLE_DEVICE"
 
         await adapter.disconnect()
+        mock_session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_access_token_device_mismatch_fails_before_crypto_mutation(
+        self, caplog
+    ):
+        """A token/config mismatch must fail before DB, Olm, or key APIs."""
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test_access_token",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "encryption": True,
+                "device_id": "CONFIG_DEVICE",
+            },
+        )
+        adapter = MatrixAdapter(config)
+        fake_mautrix_mods = _make_fake_mautrix()
+
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.state_store = MagicMock()
+        mock_client.sync_store = MagicMock()
+        mock_client.crypto = None
+        mock_client.whoami = AsyncMock(
+            return_value=MagicMock(
+                user_id="@bot:example.org", device_id="TOKEN_DEVICE"
+            )
+        )
+        mock_client.query_keys = AsyncMock()
+        mock_api = MagicMock()
+        mock_api.token = "syt_test_access_token"
+        mock_api.session = MagicMock()
+        mock_api.session.close = AsyncMock()
+        mock_client.api = mock_api
+        fake_mautrix_mods["mautrix.api"].HTTPAPI = MagicMock(return_value=mock_api)
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(
+            return_value=mock_client
+        )
+
+        database_create = MagicMock()
+        crypto_store_create = MagicMock()
+        olm_create = MagicMock()
+        fake_mautrix_mods["mautrix.util.async_db"].Database.create = database_create
+        fake_mautrix_mods[
+            "mautrix.crypto.store.asyncpg"
+        ].PgCryptoStore = crypto_store_create
+        fake_mautrix_mods["mautrix.crypto"].OlmMachine = olm_create
+
+        import plugins.platforms.matrix.adapter as matrix_mod
+
+        mock_session = MagicMock()
+        mock_session.close = AsyncMock()
+        caplog.set_level("ERROR")
+        with patch.object(matrix_mod, "_create_matrix_session", return_value=mock_session):
+            with patch.object(matrix_mod, "_check_e2ee_deps", return_value=True):
+                with patch.dict("sys.modules", fake_mautrix_mods):
+                    assert await adapter.connect() is False
+
+        assert any("access-token device_id mismatch" in row.message for row in caplog.records)
+        assert mock_client.device_id == "TOKEN_DEVICE"
+        assert adapter._device_id == "CONFIG_DEVICE"
+        mock_client.query_keys.assert_not_awaited()
+        database_create.assert_not_called()
+        crypto_store_create.assert_not_called()
+        olm_create.assert_not_called()
+        mock_api.session.close.assert_awaited_once()
 
 
 class TestMatrixPasswordLoginDeviceId:
@@ -1793,6 +1881,7 @@ class TestMatrixPasswordLoginDeviceId:
                 "user_id": "@bot:example.org",
                 "password": "secret",
                 "device_id": "STABLE_PW_DEVICE",
+                "e2ee_mode": "off",
             },
         )
         adapter = MatrixAdapter(config)
@@ -1815,15 +1904,27 @@ class TestMatrixPasswordLoginDeviceId:
 
         fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
 
-        with patch.dict("sys.modules", fake_mautrix_mods):
-            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
-                    assert await adapter.connect() is True
+        import plugins.platforms.matrix.adapter as matrix_mod
 
-        mock_client.login.assert_awaited_once()
+        mock_session = MagicMock()
+        mock_session.close = AsyncMock()
+        mock_client.api.session = mock_session
+        with patch.object(matrix_mod, "_create_matrix_session", return_value=mock_session):
+            with patch.dict("sys.modules", fake_mautrix_mods):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        assert await adapter.connect() is True
+
+        mock_client.login.assert_awaited_once_with(
+            identifier="@bot:example.org",
+            password="secret",
+            device_name="Hermes Agent",
+            device_id="STABLE_PW_DEVICE",
+        )
         assert adapter._device_id == "STABLE_PW_DEVICE"
 
         await adapter.disconnect()
+        mock_session.close.assert_awaited_once()
 
 
 class TestMatrixDeviceIdConfig:

@@ -1199,15 +1199,37 @@ class MatrixAdapter(BasePlatformAdapter):
             try:
                 resp = await client.whoami()
                 resolved_user_id = getattr(resp, "user_id", "") or self._user_id
-                resolved_device_id = getattr(resp, "device_id", "")
                 if resolved_user_id:
                     self._user_id = str(resolved_user_id)
                     client.mxid = UserID(self._user_id)
 
-                # Prefer user-configured device_id for stable E2EE identity.
-                effective_device_id = self._device_id or resolved_device_id
-                if effective_device_id:
-                    client.device_id = effective_device_id
+                configured_device_id = self._device_id
+                resolved_device_id = str(getattr(resp, "device_id", "") or "")
+                if resolved_device_id:
+                    # The access token is bound to the device returned by whoami.
+                    # Never let configuration silently replace that authenticated
+                    # identity: doing so corrupts the local crypto binding and makes
+                    # Synapse reject uploaded device keys.
+                    client.device_id = resolved_device_id
+                    if (
+                        configured_device_id
+                        and configured_device_id != resolved_device_id
+                    ):
+                        logger.error(
+                            "Matrix: access-token device_id mismatch: "
+                            "MATRIX_DEVICE_ID does not match the authenticated "
+                            "token device. Refusing startup before crypto-store "
+                            "initialization or key upload."
+                        )
+                        await api.session.close()
+                        return False
+                    self._device_id = resolved_device_id
+                elif configured_device_id:
+                    # Some homeservers omit whoami.device_id. Preserve the stable
+                    # configured-ID fallback for that legacy response shape.
+                    client.device_id = configured_device_id
+
+                effective_device_id = str(client.device_id or "")
 
                 if not client.device_id:
                     try:
