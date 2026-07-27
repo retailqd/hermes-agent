@@ -1,4 +1,5 @@
 """Tests for Mattermost platform adapter."""
+import asyncio
 import json
 import os
 import time
@@ -511,6 +512,43 @@ class TestMattermostDeleteMessage:
         assert result is True
         call_args = self.adapter._session.delete.call_args
         assert "/api/v4/posts/post-123" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_concurrent_403_and_404_are_isolated(self, monkeypatch):
+        first_call_started = asyncio.Event()
+        second_call_released = asyncio.Event()
+
+        async def fake_api_delete(path: str) -> bool:
+            if path.endswith("post-403"):
+                setattr(self.adapter, "_last_delete_status", 403)
+                first_call_started.set()
+                await second_call_released.wait()
+                return False
+            if path.endswith("post-404"):
+                await first_call_started.wait()
+                setattr(self.adapter, "_last_delete_status", 404)
+                second_call_released.set()
+                return True
+            raise AssertionError(f"unexpected delete path: {path}")
+
+        monkeypatch.setattr(self.adapter, "_api_delete", fake_api_delete)
+
+        results = await asyncio.gather(
+            self.adapter.delete_message("channel_1", "post-403"),
+            self.adapter.delete_message("channel_1", "post-404"),
+        )
+
+        assert results == [False, True]
+        assert getattr(self.adapter, "_last_delete_status") == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_message_rejects_encoded_path_traversal(self):
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(200))
+
+        result = await self.adapter.delete_message("channel_1", "%2e%2e")
+
+        assert result is False
+        self.adapter._session.delete.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_delete_message_returns_false_for_403_without_leaking_secret(self, caplog):
