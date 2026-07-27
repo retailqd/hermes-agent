@@ -35,6 +35,7 @@ def load_cases() -> list[dict[str, Any]]:
         ("plain text\n[cockpit-secret]", "internal markers"),
         ("line\n" * 25, "line budget"),
         ("The fingerprint is visible", "technical terms"),
+        ("The FINGERPRINT is visible", "technical terms"),
     ],
 )
 def test_validate_owner_markdown_rejects_headings_markers_budget_and_technical_terms(
@@ -51,6 +52,9 @@ def test_validate_owner_markdown_rejects_headings_markers_budget_and_technical_t
         ("", "low", "aprovar"),
         ("aprovar", "", "aprovar"),
         ("aprovar", "low", ""),
+        ("   ", "low", "aprovar"),
+        ("aprovar", "   ", "aprovar"),
+        ("aprovar", "low", "   "),
     ],
 )
 def test_validate_owner_decision_prompt_rejects_empty_gating_fields(
@@ -147,6 +151,56 @@ def test_renderers_match_the_canonical_fixture_and_terminal_flags(
     assert len(rendered.markdown.splitlines()) <= cast(int, case["max_lines"])
     assert "fingerprint" not in rendered.markdown.lower()
     assert not rendered.markdown.startswith("#")
+
+
+@pytest.mark.parametrize(
+    ("renderer", "kwargs", "field"),
+    [
+        (render_owner_progress, {"now": "", "next_milestone": "causa confirmada ou bloqueio"}, "now"),
+        (render_owner_progress, {"now": "   ", "next_milestone": "causa confirmada ou bloqueio"}, "now"),
+        (render_owner_progress, {"now": "validando a causa", "next_milestone": ""}, "next_milestone"),
+        (render_owner_progress, {"now": "validando a causa", "next_milestone": "   "}, "next_milestone"),
+        (render_owner_next_step, {"now": "", "next_milestone": "executar no horário combinado"}, "now"),
+        (render_owner_next_step, {"now": "   ", "next_milestone": "executar no horário combinado"}, "now"),
+        (render_owner_next_step, {"now": "agendamento confirmado", "next_milestone": ""}, "next_milestone"),
+        (render_owner_next_step, {"now": "agendamento confirmado", "next_milestone": "   "}, "next_milestone"),
+        (render_owner_blocked, {"reason": "", "next_step": "confirmar o evento externo"}, "reason"),
+        (render_owner_blocked, {"reason": "   ", "next_step": "confirmar o evento externo"}, "reason"),
+        (render_owner_blocked, {"reason": "o monitor está aguardando sinal", "next_step": ""}, "next_step"),
+        (render_owner_blocked, {"reason": "o monitor está aguardando sinal", "next_step": "   "}, "next_step"),
+        (render_owner_duplicate, {"reason": "", "next_step": "continuar a conversa original"}, "reason"),
+        (render_owner_duplicate, {"reason": "   ", "next_step": "continuar a conversa original"}, "reason"),
+        (render_owner_duplicate, {"reason": "já existe uma resposta igual", "next_step": ""}, "next_step"),
+        (render_owner_duplicate, {"reason": "já existe uma resposta igual", "next_step": "   "}, "next_step"),
+        (render_owner_completed, {"result": "", "validation": "smoke real passou"}, "result"),
+        (render_owner_completed, {"result": "   ", "validation": "smoke real passou"}, "result"),
+        (render_owner_completed, {"result": "fluxo restaurado", "validation": ""}, "validation"),
+        (render_owner_completed, {"result": "fluxo restaurado", "validation": "   "}, "validation"),
+        (render_owner_failed, {"reason": "", "next_step": "corrigir a causa"}, "reason"),
+        (render_owner_failed, {"reason": "   ", "next_step": "corrigir a causa"}, "reason"),
+        (render_owner_failed, {"reason": "validação falhou", "next_step": ""}, "next_step"),
+        (render_owner_failed, {"reason": "validação falhou", "next_step": "   "}, "next_step"),
+    ],
+)
+def test_renderers_reject_empty_or_whitespace_owner_facing_fields(
+    renderer,
+    kwargs: dict[str, Any],
+    field: str,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        renderer(**kwargs)
+
+
+def test_render_owner_completed_normalizes_whitespace_pending_to_default_nada() -> None:
+    rendered = render_owner_completed(
+        result="fluxo restaurado",
+        validation="smoke real passou",
+        pending="   ",
+    )
+
+    assert rendered.state is OwnerMessageState.COMPLETED
+    assert rendered.terminal is True
+    assert rendered.markdown == "**Concluído e validado**\n\n**Resultado:** fluxo restaurado.\n\n**Validado:** smoke real passou.\n\n**Pendente:** nada."
 
 
 def test_render_owner_decision_preserves_optional_technical_url_without_breaking_the_linter() -> None:

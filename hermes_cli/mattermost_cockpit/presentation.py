@@ -49,6 +49,13 @@ class OwnerDecisionPrompt:
     technical_url: str | None = None
 
 
+def _required_text(label: str, text: str) -> str:
+    value = text.strip()
+    if not value:
+        raise ValueError(f"{label} must be non-empty")
+    return value
+
+
 def _sentence(text: str) -> str:
     value = text.strip()
     if not value:
@@ -70,8 +77,9 @@ def validate_owner_markdown(message: str, *, max_lines: int = 24) -> None:
 
 
 def validate_owner_decision_prompt(prompt: OwnerDecisionPrompt) -> None:
-    if not prompt.plain_language.strip() or not prompt.risk.strip() or not prompt.reply_instruction.strip():
-        raise ValueError("plain_language, risk, and reply_instruction must be non-empty")
+    _required_text("plain_language", prompt.plain_language)
+    _required_text("risk", prompt.risk)
+    _required_text("reply_instruction", prompt.reply_instruction)
 
 
 def _render(
@@ -89,26 +97,30 @@ def _render(
 
 
 def render_owner_progress(*, now: str, next_milestone: str) -> RenderedOwnerMessage:
+    now_text = _required_text("now", now)
+    next_milestone_text = _required_text("next_milestone", next_milestone)
     return _render(
         OwnerMessageState.PROGRESS,
         terminal=False,
         parts=[
             "**Em andamento, ainda não concluído**",
-            f"**Agora:** {_sentence(now)}",
-            f"**Próximo marco:** {_sentence(next_milestone)}",
+            f"**Agora:** {_sentence(now_text)}",
+            f"**Próximo marco:** {_sentence(next_milestone_text)}",
         ],
         max_lines=8,
     )
 
 
 def render_owner_next_step(*, now: str, next_milestone: str) -> RenderedOwnerMessage:
+    now_text = _required_text("now", now)
+    next_milestone_text = _required_text("next_milestone", next_milestone)
     return _render(
         OwnerMessageState.NEXT_STEP,
         terminal=False,
         parts=[
             "**Próximo passo, ainda não concluído**",
-            f"**Agora:** {_sentence(now)}",
-            f"**Próximo marco:** {_sentence(next_milestone)}",
+            f"**Agora:** {_sentence(now_text)}",
+            f"**Próximo marco:** {_sentence(next_milestone_text)}",
         ],
         max_lines=8,
     )
@@ -135,13 +147,15 @@ def render_owner_decision(*, prompt: OwnerDecisionPrompt) -> RenderedOwnerMessag
 
 
 def render_owner_blocked(*, reason: str, next_step: str) -> RenderedOwnerMessage:
+    reason_text = _required_text("reason", reason)
+    next_step_text = _required_text("next_step", next_step)
     return _render(
         OwnerMessageState.BLOCKED,
         terminal=False,
         parts=[
             "**Bloqueado, ainda não concluído**",
-            f"**Agora:** {_sentence(reason)}",
-            f"**Próximo passo:** {_sentence(next_step)}",
+            f"**Agora:** {_sentence(reason_text)}",
+            f"**Próximo passo:** {_sentence(next_step_text)}",
         ],
         max_lines=8,
     )
@@ -152,27 +166,32 @@ def render_owner_duplicate(*, reason: str, next_step: str) -> RenderedOwnerMessa
 
 
 def render_owner_completed(*, result: str, validation: str, pending: str = "nada") -> RenderedOwnerMessage:
+    result_text = _required_text("result", result)
+    validation_text = _required_text("validation", validation)
+    pending_text = pending.strip() or "nada"
     return _render(
         OwnerMessageState.COMPLETED,
         terminal=True,
         parts=[
             "**Concluído e validado**",
-            f"**Resultado:** {_sentence(result)}",
-            f"**Validado:** {_sentence(validation)}",
-            f"**Pendente:** {_sentence(pending)}",
+            f"**Resultado:** {_sentence(result_text)}",
+            f"**Validado:** {_sentence(validation_text)}",
+            f"**Pendente:** {_sentence(pending_text)}",
         ],
         max_lines=10,
     )
 
 
 def render_owner_failed(*, reason: str, next_step: str) -> RenderedOwnerMessage:
+    reason_text = _required_text("reason", reason)
+    next_step_text = _required_text("next_step", next_step)
     return _render(
         OwnerMessageState.FAILED,
         terminal=True,
         parts=[
             "**Não concluído**",
-            f"**Motivo:** {_sentence(reason)}",
-            f"**Próximo passo:** {_sentence(next_step)}",
+            f"**Motivo:** {_sentence(reason_text)}",
+            f"**Próximo passo:** {_sentence(next_step_text)}",
         ],
         max_lines=8,
     )
