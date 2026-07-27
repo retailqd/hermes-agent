@@ -200,6 +200,15 @@ def _make_adapter():
     return adapter
 
 
+def _make_delete_response(status: int, body: str = ""):
+    response = AsyncMock()
+    response.status = status
+    response.text = AsyncMock(return_value=body)
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=False)
+    return response
+
+
 class TestMattermostFormatMessage:
     def setup_method(self):
         self.adapter = _make_adapter()
@@ -475,6 +484,66 @@ class TestMattermostSend:
         result = await self.adapter.send("channel_1", "Hello!")
 
         assert result.success is False
+
+
+class TestMattermostDeleteMessage:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._session = MagicMock()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [200, 204])
+    async def test_delete_message_returns_true_for_successful_api_delete(self, status):
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(status))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is True
+        call_args = self.adapter._session.delete.call_args
+        assert "/api/v4/posts/post-123" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_true_for_404_idempotent_delete(self):
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(404, body='{"error": "not found"}'))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is True
+        call_args = self.adapter._session.delete.call_args
+        assert "/api/v4/posts/post-123" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_false_for_403_without_leaking_secret(self, caplog):
+        secret = "super-secret-token"
+        self.adapter._token = secret
+        self.adapter._session.delete = MagicMock(return_value=_make_delete_response(403, body=f"denied {secret}"))
+
+        with caplog.at_level("WARNING"):
+            result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is False
+        assert "/api/v4/posts/post-123" in self.adapter._session.delete.call_args[0][0]
+        assert secret not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_false_on_timeout(self):
+        self.adapter._session.delete = MagicMock(side_effect=TimeoutError("timed out"))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is False
+        assert "/api/v4/posts/post-123" in self.adapter._session.delete.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_delete_message_returns_false_on_client_error(self):
+        import aiohttp
+
+        self.adapter._session.delete = MagicMock(side_effect=aiohttp.ClientError("boom"))
+
+        result = await self.adapter.delete_message("channel_1", "post-123")
+
+        assert result is False
+        assert "/api/v4/posts/post-123" in self.adapter._session.delete.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------
