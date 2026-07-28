@@ -3083,20 +3083,25 @@ def run_job(
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
-        max_iteration_summary = (
+        budget_exhaustion_summary = (
             result.get("failed") is not True
             and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
+            and (
+                turn_exit_reason == "budget_exhausted"
+                or turn_exit_reason.startswith("max_iterations_reached(")
+            )
             and bool(final_response_text)
         )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if result.get("failed") is True or (
+            result.get("completed") is False and not budget_exhaustion_summary
+        ):
             _err_text = (
                 result.get("error")
                 or final_response_text
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
-        if max_iteration_summary:
+        if budget_exhaustion_summary:
             logger.warning(
                 "Job '%s' reached the iteration limit but produced a final fallback response; "
                 "delivering the response instead of failing the cron run",

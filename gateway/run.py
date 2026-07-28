@@ -11876,6 +11876,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # can find earlier @bot messages by their original message_id.
                     _user_msg_id_attached = False
                     for msg in new_messages:
+                        if msg.get("_budget_continuation_synthetic"):
+                            continue
                         # Skip system messages (they're rebuilt each run)
                         if msg.get("role") == "system":
                             continue
@@ -15499,6 +15501,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug("Process watcher ended: %s", session_id)
 
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
+    _MAX_BUDGET_CONTINUATIONS = 3
+    _TIMEOUT_UNWIND_GRACE_SECONDS = 30.0
+    _BUDGET_CONTINUATION_PROMPT = (
+        "[System note: The previous internal turn exhausted its iteration budget. "
+        "Continue the unfinished task from the handoff in history. Do not repeat "
+        "completed tool calls or post a recap. Keep working until the task is "
+        "complete, a genuine owner decision is required, or a blocker is proven.]"
+    )
+    _TIMEOUT_CONTINUATION_PROMPT = (
+        "[System note: The previous internal turn reached the gateway inactivity "
+        "timeout and unwound cleanly. Continue the unfinished task from the latest "
+        "history. Re-check only the in-flight step whose completion is not proven; "
+        "do not repeat completed work or post a recap. Keep working until complete, "
+        "an owner decision is required, or a blocker is proven.]"
+    )
 
     # Config keys whose values MUST invalidate the gateway's cached agent
     # when they change.  The agent bakes these into its compressor / context
@@ -16705,6 +16722,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
+        _budget_continue_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
@@ -16724,7 +16742,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                _interrupt_depth=_interrupt_depth,
+                _budget_continue_depth=_budget_continue_depth,
+                event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -16735,7 +16755,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                _interrupt_depth=_interrupt_depth,
+                _budget_continue_depth=_budget_continue_depth,
+                event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -16766,6 +16788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
+        _budget_continue_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
@@ -18646,6 +18669,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            setattr(
+                agent,
+                "_gateway_budget_autocontinue_enabled",
+                _budget_continue_depth < self._MAX_BUDGET_CONTINUATIONS
+                and not self._draining,
+            )
+            setattr(
+                agent,
+                "_budget_autocontinuation_turn",
+                _budget_continue_depth > 0,
+            )
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -18696,6 +18730,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
+                setattr(agent, "_budget_autocontinuation_turn", False)
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
@@ -18842,6 +18877,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "failed": result.get("failed", False),
                     "partial": result.get("partial", False),
                     "completed": result.get("completed"),
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "interrupted": result.get("interrupted", False),
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
@@ -18949,6 +18985,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
+                "turn_exit_reason": result_holder[0].get("turn_exit_reason") if result_holder[0] else None,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
@@ -19384,44 +19421,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _cur_tool or "none",
                 )
 
-                # Interrupt the agent if it's still running so the thread
-                # pool worker is freed.
+                # Interrupt the agent, then require a clean unwind before any
+                # automatic continuation. Starting another run while the prior
+                # worker still owns the cached agent/session would create
+                # concurrent writes and duplicate side effects.
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
                     _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
 
-                _timeout_mins = int(_agent_timeout // 60) or 1
+                _timeout_unwound = False
+                try:
+                    response = await asyncio.wait_for(
+                        asyncio.shield(_executor_task),
+                        timeout=self._TIMEOUT_UNWIND_GRACE_SECONDS,
+                    )
+                    _timeout_unwound = True
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Timed-out agent did not unwind within %.0fs for session %s; "
+                        "refusing concurrent auto-continuation",
+                        self._TIMEOUT_UNWIND_GRACE_SECONDS,
+                        session_key or "?",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _timeout_unwind_error:
+                    logger.error(
+                        "Timed-out agent unwind failed for session %s: %s",
+                        session_key or "?",
+                        _timeout_unwind_error,
+                    )
 
-                # Construct a user-facing message with diagnostic context.
-                _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
-                ]
-                if _cur_tool:
-                    _diag_lines.append(
-                        f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                _timeout_mins = int(_agent_timeout // 60) or 1
+                if _timeout_unwound and result_holder[0]:
+                    _timeout_result = result_holder[0]
+                    _timeout_result["turn_exit_reason"] = "timeout"
+                    _timeout_result["interrupted"] = False
+                    _timeout_result.pop("interrupt_message", None)
+                    if isinstance(response, dict):
+                        response["turn_exit_reason"] = "timeout"
+                        response["interrupted"] = False
+                        response.pop("interrupt_message", None)
+                    logger.info(
+                        "Timed-out agent unwound cleanly for session %s; "
+                        "eligible for guarded auto-continuation",
+                        session_key or "?",
                     )
                 else:
+                    # No safe handoff exists. Surface a blocker instead of
+                    # starting a second worker against the same live session.
+                    _diag_lines = [
+                        f"⏱️ Agent inactive for {_timeout_mins} min and the "
+                        f"worker did not stop within "
+                        f"{self._TIMEOUT_UNWIND_GRACE_SECONDS:.0f}s."
+                    ]
+                    if _cur_tool:
+                        _diag_lines.append(
+                            f"The agent appears stuck on tool `{_cur_tool}` "
+                            f"({_secs_ago:.0f}s since last activity, "
+                            f"iteration {_iter_n}/{_iter_max})."
+                        )
+                    else:
+                        _diag_lines.append(
+                            f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
+                            f"iteration {_iter_n}/{_iter_max})."
+                        )
                     _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
-                        "The agent may have been waiting on an API response."
+                        "Automatic continuation was blocked to prevent concurrent "
+                        "session writes. Use /stop or /reset if the worker remains stuck."
                     )
-                _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
-                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
-                    "Try again, or use /reset to start fresh."
-                )
-
-                response = {
-                    "final_response": "\n".join(_diag_lines),
-                    "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
-                    "api_calls": _iter_n,
-                    "tools": tools_holder[0] or [],
-                    "history_offset": 0,
-                    "failed": True,
-                }
+                    response = {
+                        "final_response": "\n".join(_diag_lines),
+                        "messages": (
+                            result_holder[0].get("messages", [])
+                            if result_holder[0]
+                            else []
+                        ),
+                        "api_calls": _iter_n,
+                        "turn_exit_reason": "timeout_unwind_blocked",
+                        "tools": tools_holder[0] or [],
+                        "history_offset": 0,
+                        "failed": True,
+                    }
 
             # Track fallback model state: if the agent switched to a
             # fallback model during this run, persist it so /model shows
@@ -19574,6 +19654,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 pending_event = None
                 pending = None
+
+            # A clean budget or timeout exit is an internal handoff, not a completed
+            # owner-facing turn. Pending user work has priority and is drained by
+            # the branch below. Otherwise continue in the same logical session
+            # with a fresh per-run budget, capped independently from interrupt
+            # recursion so user steering cannot consume continuation allowance.
+            _budget_result = result if isinstance(result, dict) else None
+            _continuable_exit_reason = (
+                _budget_result.get("turn_exit_reason")
+                if _budget_result
+                else None
+            )
+            _continuable_exit = _continuable_exit_reason in {
+                "budget_exhausted",
+                "timeout",
+            }
+            _budget_run_is_current = bool(
+                run_generation is None
+                or self._is_session_run_current(session_key, run_generation)
+            )
+            if (
+                _budget_result is not None
+                and _continuable_exit
+                and not pending_event
+                and not pending
+                and not self._draining
+                and _budget_run_is_current
+            ):
+                if _budget_continue_depth >= self._MAX_BUDGET_CONTINUATIONS:
+                    _budget_result["autocontinue_exhausted"] = True
+                    _budget_result["budget_autocontinue_exhausted"] = True
+                    _budget_result["budget_continuation_rounds"] = _budget_continue_depth
+                    _budget_result["continuation_exit_reason"] = _continuable_exit_reason
+                    if isinstance(response, dict):
+                        response["autocontinue_exhausted"] = True
+                        response["budget_autocontinue_exhausted"] = True
+                        response["budget_continuation_rounds"] = _budget_continue_depth
+                        response["continuation_exit_reason"] = _continuable_exit_reason
+                    logger.warning(
+                        "Budget auto-continuation cap %d reached for session %s",
+                        self._MAX_BUDGET_CONTINUATIONS,
+                        session_key or "?",
+                    )
+                else:
+                    logger.info(
+                        "Continuable exit %s for session %s; starting continuation %d/%d",
+                        _continuable_exit_reason,
+                        session_key or "?",
+                        _budget_continue_depth + 1,
+                        self._MAX_BUDGET_CONTINUATIONS,
+                    )
+                    updated_history = _budget_result.get("messages", history)
+                    _continuation_prompt = (
+                        self._TIMEOUT_CONTINUATION_PROMPT
+                        if _continuable_exit_reason == "timeout"
+                        else self._BUDGET_CONTINUATION_PROMPT
+                    )
+                    await self._refresh_agent_cache_message_count(
+                        session_key, session_id
+                    )
+                    followup_result = await self._run_agent(
+                        message=_continuation_prompt,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=source,
+                        session_id=session_id,
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth,
+                        _budget_continue_depth=_budget_continue_depth + 1,
+                        event_message_id=None,
+                        channel_prompt=None,
+                    )
+                    followup_result["budget_continuation_rounds"] = max(
+                        int(followup_result.get("budget_continuation_rounds", 0)),
+                        _budget_continue_depth + 1,
+                    )
+                    return _preserve_queued_followup_history_offset(
+                        _budget_result, followup_result
+                    )
 
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])

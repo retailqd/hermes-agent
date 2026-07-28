@@ -123,6 +123,16 @@ class MattermostClient:
             f"/api/v4/users/{user_id}/posts/{post_id}/reactions/{emoji_name}",
         )
 
+    def get_reactions(self, post_id: str) -> list[dict[str, Any]]:
+        response = self._perform_request("GET", f"/api/v4/posts/{post_id}/reactions")
+        if not isinstance(response, list) or any(
+            not isinstance(item, dict) for item in response
+        ):
+            raise MattermostClientError(
+                f"GET /api/v4/posts/{post_id}/reactions returned invalid JSON"
+            )
+        return response
+
     def set_thread_following(
         self,
         *,

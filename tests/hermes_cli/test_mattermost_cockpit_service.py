@@ -125,6 +125,13 @@ class FakeClient:
         self.reactions = [r for r in self.reactions if r != (user_id, post_id, emoji_name)]
         return {"status": "OK"}
 
+    def get_reactions(self, post_id: str) -> list[dict]:
+        return [
+            {"user_id": user_id, "post_id": reaction_post_id, "emoji_name": emoji_name}
+            for user_id, reaction_post_id, emoji_name in getattr(self, "reactions", [])
+            if reaction_post_id == post_id
+        ]
+
     def search_posts(self, team_id: str, terms: str) -> dict:
         assert team_id == TEAM
         matches = {pid: p for pid, p in self.posts.items() if terms in p.get("message", "")}
@@ -2247,6 +2254,8 @@ def test_reaper_opens_one_structured_gate_for_stale_task(rig):
         "asked": [task.task_id],
         "waiting": [],
         "active": [],
+        "sealed": [],
+        "review_waiting": [],
         "errors": {},
     }
     assert second == {
@@ -2254,6 +2263,8 @@ def test_reaper_opens_one_structured_gate_for_stale_task(rig):
         "asked": [],
         "waiting": [task.task_id],
         "active": [],
+        "sealed": [],
+        "review_waiting": [],
         "errors": {},
     }
     waiting = store.get_task(task.task_id)
@@ -2287,6 +2298,8 @@ def test_reaper_ignores_task_with_recent_thread_activity(rig):
         "asked": [],
         "waiting": [],
         "active": [task.task_id],
+        "sealed": [],
+        "review_waiting": [],
         "errors": {},
     }
 
@@ -2514,8 +2527,125 @@ def test_seal_reviewed_swaps_eyes_for_check(rig):
     assert result["sealed"] == "white_check_mark"
 
 
+def test_seal_reviewed_preserves_eyes_when_checkmark_add_fails(rig, monkeypatch):
+    service, _, bot, _, _, _, _ = rig
+    task = _t7_running_task(service, "task-seal-failure", "source:seal-failure")
+    service.close(task.task_id, **_close_kwargs())
+    original_add = bot.add_reaction
+
+    def fail_checkmark(*, user_id, post_id, emoji_name):
+        if emoji_name == "white_check_mark":
+            raise RuntimeError("injected checkmark failure")
+        return original_add(
+            user_id=user_id,
+            post_id=post_id,
+            emoji_name=emoji_name,
+        )
+
+    monkeypatch.setattr(bot, "add_reaction", fail_checkmark)
+
+    with pytest.raises(RuntimeError, match="injected checkmark failure"):
+        service.seal_reviewed(task.task_id)
+
+    assert (
+        service.contracts.watcher_user_id,
+        task.source_root_id,
+        "eyes",
+    ) in bot.reactions
+    assert (
+        service.contracts.watcher_user_id,
+        task.source_root_id,
+        "white_check_mark",
+    ) not in bot.reactions
+
+
 def test_seal_reviewed_rejects_open_task(rig):
     service, _, _, _, _, _, _ = rig
     task = _t7_running_task(service, "task-seal-open", "source:seal-open")
     with pytest.raises(ValueError, match="terminal"):
         service.seal_reviewed(task.task_id)
+
+
+def _age_closed_task(service, task_id: str, closed_at: datetime) -> None:
+    with service.store.connect() as conn:
+        conn.execute(
+            "UPDATE cockpit_tasks SET closed_at = ?, updated_at = ? WHERE task_id = ?",
+            (closed_at.isoformat(), closed_at.isoformat(), task_id),
+        )
+
+
+def test_reaper_auto_seals_unanswered_review_after_48_hours(rig):
+    service, _, bot, _, _, _, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    task = _t7_running_task(service, "task-review-expired", "source:review-expired")
+    service.close(task.task_id, **_close_kwargs())
+    _age_closed_task(service, task.task_id, now - timedelta(hours=49))
+
+    result = service.reap_stale()
+
+    assert result["sealed"] == [task.task_id]
+    assert (service.contracts.watcher_user_id, task.source_root_id, "eyes") not in bot.reactions
+    assert (
+        service.contracts.watcher_user_id,
+        task.source_root_id,
+        "white_check_mark",
+    ) in bot.reactions
+
+
+def test_reaper_waits_at_exactly_48_hours(rig):
+    service, _, bot, _, _, _, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    task = _t7_running_task(service, "task-review-boundary", "source:review-boundary")
+    service.close(task.task_id, **_close_kwargs())
+    _age_closed_task(service, task.task_id, now - timedelta(hours=48))
+
+    result = service.reap_stale()
+
+    assert result["sealed"] == []
+    assert result["review_waiting"] == [task.task_id]
+    assert (service.contracts.watcher_user_id, task.source_root_id, "eyes") in bot.reactions
+
+
+def test_reaper_keeps_review_open_when_owner_replied_after_delivery(rig):
+    service, _, bot, _, _, _, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    task = _t7_running_task(service, "task-review-replied", "source:review-replied")
+    service.close(task.task_id, **_close_kwargs())
+    closed_at = now - timedelta(hours=49)
+    _age_closed_task(service, task.task_id, closed_at)
+    owner_reply = bot.create_post(MAIN, "quero um ajuste", root_id=task.source_root_id)
+    owner_reply["user_id"] = task.owner_author_id
+    owner_reply["create_at"] = int((closed_at + timedelta(hours=1)).timestamp() * 1000)
+
+    result = service.reap_stale()
+
+    assert result["sealed"] == []
+    assert result["review_waiting"] == [task.task_id]
+    assert (service.contracts.watcher_user_id, task.source_root_id, "eyes") in bot.reactions
+
+
+def test_reaper_ignores_backfilled_checkmark_without_audit_row(rig):
+    service, _, bot, _, _, _, _ = rig
+    now = datetime(2026, 7, 27, 15, 0, tzinfo=UTC)
+    service.now = lambda: now
+    task = _t7_running_task(service, "task-review-backfilled", "source:review-backfilled")
+    service.close(task.task_id, **_close_kwargs())
+    bot.remove_reaction(
+        user_id=service.contracts.watcher_user_id,
+        post_id=task.source_root_id,
+        emoji_name="eyes",
+    )
+    bot.add_reaction(
+        user_id=service.contracts.watcher_user_id,
+        post_id=task.source_root_id,
+        emoji_name="white_check_mark",
+    )
+    _age_closed_task(service, task.task_id, now - timedelta(days=10))
+
+    result = service.reap_stale()
+
+    assert result["sealed"] == []
+    assert result["review_waiting"] == []

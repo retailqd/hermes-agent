@@ -314,7 +314,9 @@ def build_turn_context(
             agent._turns_since_memory = 0
 
     # Add user message.
-    user_msg = {"role": "user", "content": user_message}
+    user_msg: dict = {"role": "user", "content": user_message}
+    if getattr(agent, "_budget_autocontinuation_turn", False):
+        user_msg["_budget_continuation_synthetic"] = True
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

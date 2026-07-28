@@ -344,6 +344,16 @@ class MattermostCockpitStore:
             ).fetchall()
             return [MattermostCockpitTask.from_row(row) for row in rows]
 
+    def list_succeeded(self) -> list[MattermostCockpitTask]:
+        """Return delivered tasks that may still be awaiting owner review."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT " + TASK_COLUMNS
+                + " FROM cockpit_tasks WHERE lifecycle = ? ORDER BY closed_at ASC, task_id ASC",
+                (Lifecycle.SUCCEEDED.value,),
+            ).fetchall()
+            return [MattermostCockpitTask.from_row(row) for row in rows]
+
     def attach_execution(
         self,
         task_id: str,

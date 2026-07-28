@@ -232,6 +232,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # transcript and breaks prompt-prefix cache reuse on later turns. (#55733)
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # Gateway-only handoff pair used to continue after a full iteration
+    # budget. It is API context for the immediately following round, not a
+    # real owner/assistant exchange, so it must never reach durable history.
+    "_budget_continuation_synthetic",
 )
 
 

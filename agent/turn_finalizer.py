@@ -50,24 +50,36 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    _budget_autocontinue_handoff = False
+
     if final_response is None and (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     ):
-        # Budget exhausted — ask the model for a summary via one extra
-        # API call with tools stripped.  _handle_max_iterations injects a
-        # user message and makes a single toolless request.
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
-        agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-            "— asking model to summarise"
+        # Budget exhausted. The gateway may use the summary as an internal
+        # handoff for another full-budget round; other callers still receive it
+        # as the terminal response.
+        _turn_exit_reason = "budget_exhausted"
+        _budget_autocontinue_handoff = bool(
+            getattr(agent, "_gateway_budget_autocontinue_enabled", False)
         )
-        if not agent.quiet_mode:
-            agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— requesting summary..."
+        if not _budget_autocontinue_handoff:
+            agent._emit_status(
+                f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                "— asking model to summarise"
             )
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                    "— requesting summary..."
+                )
+
+        _handoff_start = len(messages)
         final_response = agent._handle_max_iterations(messages, api_call_count)
+        if _budget_autocontinue_handoff:
+            for _handoff_message in messages[_handoff_start:]:
+                if isinstance(_handoff_message, dict):
+                    _handoff_message["_budget_continuation_synthetic"] = True
 
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
@@ -202,7 +214,10 @@ def finalize_turn(
             except Exception:
                 _tail_role = None
             if _tail_role != "assistant":
-                messages.append({"role": "assistant", "content": final_response})
+                _closing_message = {"role": "assistant", "content": final_response}
+                if _budget_autocontinue_handoff:
+                    _closing_message["_budget_continuation_synthetic"] = True
+                messages.append(_closing_message)
 
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:

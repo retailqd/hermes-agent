@@ -676,6 +676,11 @@ class CockpitService:
         task = self._require_task(task_id)
         if task.lifecycle not in TERMINAL_LIFECYCLES:
             raise ValueError("only terminal tasks can be sealed")
+        self.bot_client.add_reaction(
+            user_id=self.contracts.watcher_user_id,
+            post_id=task.source_root_id,
+            emoji_name="white_check_mark",
+        )
         try:
             self.bot_client.remove_reaction(
                 user_id=self.contracts.watcher_user_id,
@@ -684,11 +689,6 @@ class CockpitService:
             )
         except Exception:
             pass
-        self.bot_client.add_reaction(
-            user_id=self.contracts.watcher_user_id,
-            post_id=task.source_root_id,
-            emoji_name="white_check_mark",
-        )
         self._audit(task, "owner_sealed", {}, f"seal:{task_id}")
         return {"task_id": task_id, "sealed": "white_check_mark"}
 
@@ -899,6 +899,60 @@ class CockpitService:
             if task is not None and task.watcher_owner == self.watcher_owner:
                 self.store.release_watcher(task_id, owner=self.watcher_owner)
 
+    def _reap_pending_reviews(
+        self,
+        result: dict[str, Any],
+        *,
+        review_ttl: timedelta = timedelta(hours=48),
+    ) -> None:
+        """Auto-seal delivered roots after the owner's review window expires.
+
+        The reaction state is authoritative so tasks sealed by a historical
+        backfill are skipped even when they have no ``owner_sealed`` audit row.
+        Any owner reply after delivery keeps the task pending for explicit
+        review or reopened scope.
+        """
+        if review_ttl.total_seconds() <= 0:
+            raise ValueError("review ttl must be positive")
+        cutoff = self.now().astimezone(UTC) - review_ttl
+        for task in self.store.list_succeeded():
+            try:
+                if task.closed_at is None:
+                    continue
+                reactions = self.bot_client.get_reactions(task.source_root_id)
+                bot_reactions = {
+                    str(reaction.get("emoji_name") or "")
+                    for reaction in reactions
+                    if reaction.get("user_id") == self.contracts.watcher_user_id
+                }
+                if "white_check_mark" in bot_reactions or "eyes" not in bot_reactions:
+                    continue
+                if task.closed_at >= cutoff:
+                    result["review_waiting"].append(task.task_id)
+                    continue
+
+                closed_at_ms = int(task.closed_at.timestamp() * 1000)
+                posts = (self.bot_client.get_thread(task.source_root_id).get("posts") or {}).values()
+                owner_replied = any(
+                    isinstance(post, dict)
+                    and post.get("id") != task.source_root_id
+                    and post.get("channel_id") == task.source_channel_id
+                    and post.get("root_id") == task.source_root_id
+                    and post.get("user_id") == task.owner_author_id
+                    and max(
+                        int(post.get("create_at") or 0),
+                        int(post.get("update_at") or 0),
+                    ) > closed_at_ms
+                    for post in posts
+                )
+                if owner_replied:
+                    result["review_waiting"].append(task.task_id)
+                    continue
+                self.seal_reviewed(task.task_id)
+                result["sealed"].append(task.task_id)
+            except Exception as exc:
+                result["errors"][task.task_id] = f"{type(exc).__name__}: {exc}"
+
     def reap_stale(self, *, ttl: timedelta = timedelta(hours=24)) -> dict[str, Any]:
         if ttl.total_seconds() <= 0:
             raise ValueError("reaper ttl must be positive")
@@ -910,6 +964,8 @@ class CockpitService:
             "asked": [],
             "waiting": [],
             "active": [],
+            "sealed": [],
+            "review_waiting": [],
             "errors": {},
         }
         for task in self.store.list_open():
@@ -969,6 +1025,7 @@ class CockpitService:
                 result["asked"].append(task.task_id)
             except Exception as exc:
                 result["errors"][task.task_id] = f"{type(exc).__name__}: {exc}"
+        self._reap_pending_reviews(result)
         return result
 
     @staticmethod

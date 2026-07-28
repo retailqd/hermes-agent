@@ -1510,8 +1510,16 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "all good"
 
-    def test_run_job_delivers_max_iteration_fallback_summary(self, tmp_path):
-        """Cron should deliver a usable max-iteration fallback summary.
+    @pytest.mark.parametrize(
+        "turn_exit_reason",
+        ["max_iterations_reached(60/60)", "budget_exhausted"],
+    )
+    def test_run_job_delivers_budget_fallback_summary(
+        self,
+        tmp_path,
+        turn_exit_reason,
+    ):
+        """Cron should deliver a usable iteration-budget fallback summary.
 
         A cron run can exhaust the iteration budget, get a final text summary
         from the no-tools fallback call, and still have ``completed=False`` in
@@ -1545,7 +1553,7 @@ class TestRunJobSessionPersistence:
                 "final_response": "final fallback report",
                 "completed": False,
                 "failed": False,
-                "turn_exit_reason": "max_iterations_reached(60/60)",
+                "turn_exit_reason": turn_exit_reason,
             }
             mock_agent_cls.return_value = mock_agent
 

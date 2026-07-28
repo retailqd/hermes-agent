@@ -89,6 +89,39 @@ class TestMattermostClient:
         assert captured["authorization"] == "Bearer explicit-token"
         assert captured["timeout"] == 12.5
 
+    def test_get_reactions_accepts_array_response(self):
+        captured: dict[str, object] = {}
+
+        def urlopen(request, timeout):
+            captured["url"] = request.full_url
+            return FakeResponse(
+                200,
+                json.dumps(
+                    [{"user_id": "bot-1", "post_id": "post-1", "emoji_name": "eyes"}]
+                ).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        reactions = make_client(urlopen).get_reactions("post-1")
+
+        assert reactions == [
+            {"user_id": "bot-1", "post_id": "post-1", "emoji_name": "eyes"}
+        ]
+        assert captured["url"] == (
+            "https://mattermost.example.com/api/v4/posts/post-1/reactions"
+        )
+
+    def test_get_reactions_rejects_non_array_response(self):
+        def urlopen(request, timeout):
+            return FakeResponse(
+                200,
+                json.dumps({"emoji_name": "eyes"}).encode(),
+                {"Content-Type": "application/json"},
+            )
+
+        with pytest.raises(MattermostClientError, match="invalid JSON"):
+            make_client(urlopen).get_reactions("post-1")
+
     def test_get_thread_requires_json_and_redacts_secrets_from_error(self):
         body = (
             b'Authorization: Bearer supersecret-token\n'
