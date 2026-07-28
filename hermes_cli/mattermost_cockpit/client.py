@@ -124,7 +124,13 @@ class MattermostClient:
         )
 
     def get_reactions(self, post_id: str) -> list[dict[str, Any]]:
-        response = self._perform_request("GET", f"/api/v4/posts/{post_id}/reactions")
+        response = self._perform_request(
+            "GET",
+            f"/api/v4/posts/{post_id}/reactions",
+            allow_null=True,
+        )
+        if response is None:
+            return []
         if not isinstance(response, list) or any(
             not isinstance(item, dict) for item in response
         ):
@@ -212,6 +218,7 @@ class MattermostClient:
         path: str,
         *,
         data: bytes | None = None,
+        allow_null: bool = False,
     ) -> Any:
         request = self._build_request(method, path, data=data)
         try:
@@ -231,7 +238,13 @@ class MattermostClient:
                     raise MattermostClientError(
                         f"{method} {request.full_url} returned a JSON body that is too large"
                     )
-                return self._decode_json_body(method, request.full_url, body, response.headers)
+                return self._decode_json_body(
+                    method,
+                    request.full_url,
+                    body,
+                    response.headers,
+                    allow_null=allow_null,
+                )
         except urllib.error.HTTPError as exc:
             body = exc.read(_ERROR_BODY_LIMIT + 1)
             raise self._error_from_body(
@@ -262,6 +275,8 @@ class MattermostClient:
         url: str,
         body: bytes,
         headers: Any,
+        *,
+        allow_null: bool = False,
     ) -> Any:
         if not body:
             raise MattermostClientError(f"{method} {url} returned an empty body")
@@ -273,6 +288,8 @@ class MattermostClient:
             raise MattermostClientError(
                 f"{method} {url} returned invalid JSON: {preview}"
             ) from exc
+        if parsed is None and allow_null:
+            return None
         if not isinstance(parsed, (dict, list)):
             raise MattermostClientError(
                 f"{method} {url} returned unsupported JSON type {type(parsed).__name__}"

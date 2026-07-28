@@ -111,6 +111,16 @@ class TestMattermostClient:
             "https://mattermost.example.com/api/v4/posts/post-1/reactions"
         )
 
+    def test_get_reactions_normalizes_null_response_to_empty_list(self):
+        def urlopen(request, timeout):
+            return FakeResponse(
+                200,
+                b"null",
+                {"Content-Type": "application/json"},
+            )
+
+        assert make_client(urlopen).get_reactions("post-1") == []
+
     def test_get_reactions_rejects_non_array_response(self):
         def urlopen(request, timeout):
             return FakeResponse(
