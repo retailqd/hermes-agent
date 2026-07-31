@@ -32,7 +32,10 @@ from typing import Any
 
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
-    "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    # "pinned" keeps one editable bubble for the entire turn, even when
+    # interim assistant commentary lands between tool calls. This avoids a
+    # fresh mobile notification for every tool segment.
+    "tool_progress_grouping": "accumulate",  # accumulate | latest | pinned | separate
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -136,7 +139,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # "new"/"all" spam permanent lines in channels (hermes-agent#14663).
     "slack":           {**_TIER_MEDIUM, "tool_progress": "off"},
     "mattermost":      {**_TIER_MEDIUM, "tool_progress_grouping": "latest", "cleanup_progress": True, "background_review_notifications": False},
-    "matrix":          _TIER_MEDIUM,
+    "matrix":          {**_TIER_MEDIUM, "tool_progress_grouping": "pinned"},
     "feishu":          _TIER_MEDIUM,
 
     # Tier 3 — no edit support, progress messages are permanent
@@ -231,6 +234,12 @@ def resolve_display_setting(
     return fallback
 
 
+def tool_progress_resets_after_content(grouping: str) -> bool:
+    """Return whether assistant content starts a fresh tool-progress bubble."""
+
+    return str(grouping or "accumulate").strip().lower() != "pinned"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -270,7 +279,7 @@ def _normalise(setting: str, value: Any) -> Any:
         return bool(value)
     if setting == "tool_progress_grouping":
         val = str(value).lower()
-        return val if val in ("accumulate", "separate", "latest") else "accumulate"
+        return val if val in ("accumulate", "separate", "latest", "pinned") else "accumulate"
     if setting == "reasoning_style":
         val = str(value).lower()
         return val if val in ("code", "blockquote", "subtext") else "code"

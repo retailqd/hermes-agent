@@ -189,6 +189,27 @@ class TestYAMLNormalisation:
         }
         assert resolve_display_setting(config, "mattermost", "tool_progress_grouping") == "latest"
 
+    def test_tool_progress_grouping_accepts_pinned(self):
+        """Pinned keeps one editable progress bubble across commentary messages."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "matrix": {"tool_progress_grouping": "pinned"},
+                }
+            }
+        }
+        assert resolve_display_setting(config, "matrix", "tool_progress_grouping") == "pinned"
+
+    def test_pinned_progress_does_not_reset_after_content(self):
+        from gateway.display_config import tool_progress_resets_after_content
+
+        assert tool_progress_resets_after_content("pinned") is False
+        assert tool_progress_resets_after_content("accumulate") is True
+        assert tool_progress_resets_after_content("latest") is True
+        assert tool_progress_resets_after_content("separate") is True
+
     def test_only_long_running_visibility_accepts_generic_mode(self):
         from gateway.display_config import resolve_display_setting
 
@@ -257,6 +278,11 @@ class TestPlatformDefaults:
 
         for plat in ("mattermost", "matrix", "feishu", "whatsapp"):
             assert resolve_display_setting({}, plat, "tool_progress") == "new", plat
+
+    def test_matrix_defaults_to_one_pinned_progress_bubble(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "matrix", "tool_progress_grouping") == "pinned"
 
     def test_mattermost_defaults_to_ephemeral_latest_progress(self):
         from gateway.display_config import resolve_display_setting
