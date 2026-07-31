@@ -16888,7 +16888,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # interim assistant commentary, avoiding one mobile notification per
         # tool segment while preserving the commentary itself.
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
-        from gateway.display_config import tool_progress_resets_after_content
+        from gateway.display_config import progress_queue_resets_after_content
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         _generic_status_recent: List[str] = []
         _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
@@ -17919,7 +17919,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None
-                                and tool_progress_resets_after_content(progress_grouping)
+                                and progress_queue_resets_after_content(
+                                    progress_grouping,
+                                    tool_progress_enabled=tool_progress_enabled,
+                                )
                                 else None
                             ),
                             on_before_finalize=_pause_typing_before_finalize,

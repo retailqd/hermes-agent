@@ -203,12 +203,23 @@ class TestYAMLNormalisation:
         assert resolve_display_setting(config, "matrix", "tool_progress_grouping") == "pinned"
 
     def test_pinned_progress_does_not_reset_after_content(self):
-        from gateway.display_config import tool_progress_resets_after_content
+        from gateway.display_config import progress_queue_resets_after_content
 
-        assert tool_progress_resets_after_content("pinned") is False
-        assert tool_progress_resets_after_content("accumulate") is True
-        assert tool_progress_resets_after_content("latest") is True
-        assert tool_progress_resets_after_content("separate") is True
+        assert progress_queue_resets_after_content(
+            "pinned", tool_progress_enabled=True
+        ) is False
+        assert progress_queue_resets_after_content(
+            "pinned", tool_progress_enabled=False
+        ) is True
+        assert progress_queue_resets_after_content(
+            "accumulate", tool_progress_enabled=True
+        ) is True
+        assert progress_queue_resets_after_content(
+            "latest", tool_progress_enabled=True
+        ) is True
+        assert progress_queue_resets_after_content(
+            "separate", tool_progress_enabled=True
+        ) is True
 
     def test_only_long_running_visibility_accepts_generic_mode(self):
         from gateway.display_config import resolve_display_setting

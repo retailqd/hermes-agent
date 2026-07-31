@@ -234,10 +234,22 @@ def resolve_display_setting(
     return fallback
 
 
-def tool_progress_resets_after_content(grouping: str) -> bool:
-    """Return whether assistant content starts a fresh tool-progress bubble."""
+def progress_queue_resets_after_content(
+    grouping: str,
+    *,
+    tool_progress_enabled: bool,
+) -> bool:
+    """Return whether assistant content starts a fresh progress bubble.
 
-    return str(grouping or "accumulate").strip().lower() != "pinned"
+    ``pinned`` only suppresses content-boundary resets when the queue is
+    carrying tool progress. Thinking-only queues keep their independent
+    segment reset behavior.
+    """
+
+    return (
+        not tool_progress_enabled
+        or str(grouping or "accumulate").strip().lower() != "pinned"
+    )
 
 
 # ---------------------------------------------------------------------------
