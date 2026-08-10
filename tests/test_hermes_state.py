@@ -75,6 +75,56 @@ def db(tmp_path):
     session_db.close()
 
 
+def test_storage_policy_can_disable_trigram_and_bound_wal(tmp_path):
+    db_path = tmp_path / "state.db"
+    session_db = SessionDB(
+        db_path=db_path,
+        fts_trigram_enabled=False,
+        wal_size_limit_mb=1,
+    )
+    try:
+        session_db.create_session(session_id="storage-policy", source="test")
+        session_db.append_message(
+            "storage-policy", role="user", content="normal full text search"
+        )
+        assert session_db._fts_table_exists("messages_fts") is True
+        assert session_db._fts_table_exists("messages_fts_trigram") is False
+        triggers = {
+            row[0]
+            for row in session_db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        assert not triggers.intersection(hermes_state._FTS_TRIGRAM_TRIGGERS)
+        assert session_db._conn.execute("PRAGMA journal_size_limit").fetchone()[0] == 1024 * 1024
+        page_size = session_db._conn.execute("PRAGMA page_size").fetchone()[0]
+        assert session_db._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == (1024 * 1024) // page_size
+    finally:
+        session_db.close()
+
+
+def test_disabling_trigram_removes_only_its_write_triggers(tmp_path):
+    db_path = tmp_path / "state.db"
+    seeded = SessionDB(db_path=db_path)
+    seeded.close()
+
+    disabled = SessionDB(db_path=db_path, fts_trigram_enabled=False)
+    try:
+        # Startup does not perform a surprise multi-GB DROP/VACUUM.  The
+        # durable maintenance copy owns physical table removal.
+        assert disabled._fts_table_exists("messages_fts_trigram") is True
+        triggers = {
+            row[0]
+            for row in disabled._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        assert set(hermes_state._FTS_BASE_TRIGGERS).issubset(triggers)
+        assert not triggers.intersection(hermes_state._FTS_TRIGRAM_TRIGGERS)
+    finally:
+        disabled.close()
+
+
 # =========================================================================
 # Session lifecycle
 # =========================================================================

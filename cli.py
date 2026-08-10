@@ -1796,6 +1796,9 @@ def _run_state_db_auto_maintenance(session_db) -> None:
         cfg = (_load_full_config().get("sessions") or {})
         if not cfg.get("auto_prune", False):
             return
+        if cfg.get("maintenance_managed_externally", False):
+            logger.debug("state.db prune delegated to external durable maintenance")
+            return
         session_db.maybe_auto_prune_and_vacuum(
             retention_days=int(cfg.get("retention_days", 90)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),

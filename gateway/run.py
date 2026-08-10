@@ -3058,7 +3058,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from hermes_cli.config import load_config as _load_full_config
                 _sess_cfg = (_load_full_config().get("sessions") or {})
-                if _sess_cfg.get("auto_prune", False):
+                if (
+                    _sess_cfg.get("auto_prune", False)
+                    and not _sess_cfg.get("maintenance_managed_externally", False)
+                ):
                     # Construction-time, before the loop serves traffic; sync DB is fine.
                     self._session_db._db.maybe_auto_prune_and_vacuum(
                         retention_days=int(_sess_cfg.get("retention_days", 90)),

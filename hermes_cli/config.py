@@ -2954,6 +2954,17 @@ DEFAULT_CONFIG = {
         # the sweep on every CLI invocation).  Tracked via state_meta in
         # state.db itself, so it's shared across all processes.
         "min_interval_hours": 24,
+        # Optional CJK/substring FTS index.  It can be several times larger
+        # than the canonical message table, so storage-constrained hosts may
+        # disable it while retaining the normal FTS5 index and LIKE fallback.
+        "fts_trigram_enabled": True,
+        # Bound the reusable WAL high-water mark after checkpoints.  Zero
+        # preserves SQLite's default unlimited journal_size_limit.
+        "wal_size_limit_mb": 0,
+        # When true, a durable external job owns archive-before-prune.  CLI
+        # and gateway startup still perform harmless repair work but never
+        # delete old sessions opportunistically.
+        "maintenance_managed_externally": False,
         # Legacy per-session JSON snapshot writer.  When true, the agent
         # rewrites ``~/.hermes/sessions/session_{sid}.json`` on every turn
         # boundary with the full message list.  state.db is canonical and
