@@ -524,7 +524,7 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 
 
 # ---------------------------------------------------------------------------
-# ff-only fallback to reset --hard on diverged history
+# Diverged-history updates fail closed without reset --hard
 # ---------------------------------------------------------------------------
 
 def _make_update_side_effect(
@@ -534,6 +534,7 @@ def _make_update_side_effect(
     reset_fails=False,
     fetch_fails=False,
     fetch_stderr="",
+    target_branch_diverged=False,
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
@@ -547,6 +548,14 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "--verify" in joined and "refs/heads/main" in joined:
+            return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
+        if "merge-base" in joined and "--is-ancestor" in joined:
+            return SimpleNamespace(
+                stdout="",
+                stderr="",
+                returncode=1 if target_branch_diverged else 0,
+            )
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
@@ -568,22 +577,55 @@ def _make_update_side_effect(
     return side_effect, recorded
 
 
-def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+def test_cmd_update_never_resets_when_ff_only_fails(monkeypatch, tmp_path, capsys):
+    """A late --ff-only failure must not destroy local history."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
     side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert exc_info.value.code == 1
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
-    assert len(reset_calls) == 1
-    assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
+    assert reset_calls == []
 
     out = capsys.readouterr().out
-    assert "Fast-forward not possible" in out
+    assert "automatic reset is disabled" in out
+
+
+def test_cmd_update_blocks_diverged_target_before_stash_or_checkout(
+    monkeypatch, tmp_path, capsys
+):
+    """Custom local commits block before any working-tree mutation."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    stash_calls = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *args, **kwargs: stash_calls.append((args, kwargs)),
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="fix/local",
+        target_branch_diverged=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert exc_info.value.code == 1
+    assert stash_calls == []
+    assert not any("checkout" in command for command in recorded)
+    assert not any("reset" in command for command in recorded)
+    out = capsys.readouterr().out
+    assert "Automatic update blocked" in out
+    assert "No branch switch, stash, reset" in out
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):

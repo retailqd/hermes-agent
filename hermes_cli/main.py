@@ -9538,6 +9538,43 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
+        # A managed checkout may carry owner-specific commits on its local
+        # target branch. Updating that branch with a later ``reset --hard``
+        # would silently discard those commits when histories diverge. Prove
+        # that the local target is an ancestor of the fetched remote before we
+        # switch branches or stash any work. A missing local branch is safe:
+        # the checkout path below creates it from the fetched remote.
+        local_branch_ref = f"refs/heads/{branch}"
+        local_branch_exists = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", "--quiet", local_branch_ref],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if local_branch_exists.returncode == 0:
+            ancestry = subprocess.run(
+                git_cmd
+                + [
+                    "merge-base",
+                    "--is-ancestor",
+                    local_branch_ref,
+                    f"origin/{branch}",
+                ],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if ancestry.returncode != 0:
+                print(
+                    f"✗ Automatic update blocked: local '{branch}' has commits "
+                    f"that are not in origin/{branch}."
+                )
+                print(
+                    "  No branch switch, stash, reset, or dependency update was performed."
+                )
+                print("  Reconcile this custom checkout in a clean worktree, then retry.")
+                sys.exit(1)
+
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -9726,26 +9763,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True,
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
-                    sys.exit(1)
+                # The ancestry check above makes a fast-forward the only safe
+                # automatic update.  If the remote moved again after that
+                # check, fail closed instead of destroying local commits with
+                # ``reset --hard``.  The existing finally block preserves any
+                # auto-stash for explicit recovery.
+                print("✗ Fast-forward update failed; automatic reset is disabled.")
+                if pull_result.stderr.strip():
+                    print(f"  {pull_result.stderr.strip().splitlines()[0]}")
+                print("  Fetch and reconcile the branch in a clean worktree, then retry.")
+                sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
