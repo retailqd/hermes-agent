@@ -459,6 +459,7 @@ class HermesACPAgent(acp.Agent):
         "compact": "Compress conversation context",
         "steer": "Inject guidance into the currently running agent turn",
         "queue": "Queue a prompt to run after the current turn finishes",
+        "plan": "Enter native planning mode, inspect status, or approve execution",
         "version": "Show Hermes version",
     }
 
@@ -483,6 +484,11 @@ class HermesACPAgent(acp.Agent):
         {
             "name": "reset",
             "description": "Clear conversation history",
+        },
+        {
+            "name": "plan",
+            "description": "Enter native read-only planning mode or approve execution",
+            "input_hint": "request | status | approve | exit",
         },
         {
             "name": "compact",
@@ -1352,6 +1358,58 @@ class HermesACPAgent(acp.Agent):
             elif rewrite_idle:
                 user_text = steer_text
                 user_content = steer_text
+
+        # Native /plan is a control command whose enter/approve transitions
+        # intentionally continue into a model turn with a cache-safe prompt.
+        # Status/exit are handled locally. It must run before the generic slash
+        # dispatcher, which always terminates the turn for known commands.
+        if (
+            text_only_prompt
+            and isinstance(user_content, str)
+            and (user_text == "/plan" or user_text.startswith("/plan "))
+        ):
+            parts = user_text.split(maxsplit=1)
+            plan_args = parts[1].strip() if len(parts) > 1 else ""
+            plan_verb = plan_args.lower().split(None, 1)[0] if plan_args else ""
+            with state.runtime_lock:
+                plan_busy = bool(state.is_running)
+            if plan_busy and plan_verb != "status":
+                response_text = "Agent is running — wait or interrupt first. Only /plan status is available mid-turn."
+                if self._conn:
+                    await self._conn.session_update(
+                        session_id,
+                        acp.update_agent_message_text(response_text),
+                    )
+                    await self._send_usage_update(state)
+                return PromptResponse(stop_reason="end_turn")
+            try:
+                from hermes_cli.plan_mode import handle_plan_command
+
+                plan_result = handle_plan_command(
+                    state.session_id,
+                    plan_args,
+                    task_id=state.session_id,
+                )
+            except Exception as exc:
+                response_text = f"Plan Mode error: {exc}"
+                if self._conn:
+                    await self._conn.session_update(
+                        session_id,
+                        acp.update_agent_message_text(response_text),
+                    )
+                    await self._send_usage_update(state)
+                return PromptResponse(stop_reason="end_turn")
+            if plan_result.prompt:
+                user_text = plan_result.prompt
+                user_content = plan_result.prompt
+            else:
+                if self._conn:
+                    await self._conn.session_update(
+                        session_id,
+                        acp.update_agent_message_text(plan_result.message),
+                    )
+                    await self._send_usage_update(state)
+                return PromptResponse(stop_reason="end_turn")
 
         # Intercept slash commands — handle locally without calling the LLM.
         # Slash commands are text-only; if the client included images/resources,

@@ -844,6 +844,13 @@ def compress_context(
                         migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _goal_err:
                         logger.debug("Could not migrate goal on compression: %s", _goal_err)
+                    # Plan Mode is also session-scoped state. Keep the safety
+                    # boundary active when compression rotates to a child id.
+                    try:
+                        from hermes_cli.plan_mode import migrate_plan_mode_to_session
+                        migrate_plan_mode_to_session(old_session_id, agent.session_id, reason="compression")
+                    except Exception as _plan_err:
+                        logger.debug("Could not migrate Plan Mode on compression: %s", _plan_err)
                     # Auto-number the title for the continuation session
                     if old_title:
                         try:

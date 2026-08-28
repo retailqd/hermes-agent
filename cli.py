@@ -8789,6 +8789,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 # No active run — treat as a normal next-turn message.
                 self._pending_input.put(payload)
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+        elif canonical == "plan":
+            self._handle_plan_command(cmd_original)
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
         elif canonical == "moa":
@@ -9027,6 +9029,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
 
     # ────────────────────────────────────────────────────────────────
+    # /plan — native, runtime-enforced planning mode
+    # ──────────────────────────────────────────────────────────────────
+
+    def _handle_plan_command(self, raw_command: str) -> None:
+        parts = str(raw_command or "").strip().split(None, 1)
+        args = parts[1].strip() if len(parts) > 1 else ""
+        verb = args.lower().split(None, 1)[0] if args else ""
+
+        if self._agent_running and verb != "status":
+            _cprint("  Agent is running — wait or /stop first. Only /plan status is available mid-turn.")
+            return
+
+        try:
+            from hermes_cli.plan_mode import handle_plan_command
+
+            result = handle_plan_command(
+                self.session_id,
+                args,
+                task_id=self.session_id,
+            )
+        except Exception as exc:
+            _cprint(f"  Plan Mode error: {exc}")
+            return
+
+        _cprint(f"  {result.message}")
+        if result.prompt and hasattr(self, "_pending_input"):
+            self._pending_input.put(result.prompt)
+
     # /goal — persistent cross-turn goals (Ralph-style loop)
     # ────────────────────────────────────────────────────────────────
     def _get_goal_manager(self):

@@ -2280,10 +2280,31 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
+    def _guarded_execute(next_args: dict) -> Any:
+        effective_args = next_args if isinstance(next_args, dict) else function_args
+        try:
+            from agent.tool_executor import _apply_native_plan_guard
+
+            effective_args, plan_block, _plan_code = _apply_native_plan_guard(
+                agent,
+                function_name=function_name,
+                function_args=effective_args,
+                effective_task_id=effective_task_id,
+            )
+            if plan_block is not None:
+                return json.dumps({"error": plan_block}, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning("final native Plan Mode guard failed: %s", exc)
+            return json.dumps(
+                {"error": "Blocked because native Plan Mode safety could not be revalidated."},
+                ensure_ascii=False,
+            )
+        return _execute(effective_args)
+
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _guarded_execute,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",

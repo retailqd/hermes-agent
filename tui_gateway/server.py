@@ -11472,6 +11472,44 @@ def _(rid, params: dict) -> dict:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
 
+    if name == "plan":
+        if not session:
+            return _err(rid, 4001, "no active session")
+        verb = str(arg or "").strip().lower()
+        if session.get("running") and verb != "status":
+            return _err(
+                rid,
+                4009,
+                "session busy — wait or /interrupt first; only /plan status is available mid-turn",
+            )
+        try:
+            from hermes_cli.plan_mode import handle_plan_command
+
+            sid_key = session.get("session_key") or params.get("session_id", "")
+            result = handle_plan_command(sid_key, str(arg or ""), task_id=sid_key)
+        except Exception as exc:
+            return _err(rid, 5030, f"Plan Mode unavailable: {exc}")
+        if result.prompt:
+            return _ok(
+                rid,
+                {
+                    "type": "send",
+                    "message": result.prompt,
+                    "notice": result.message,
+                    "action": result.action,
+                    "plan_mode": result.plan_mode,
+                },
+            )
+        return _ok(
+            rid,
+            {
+                "type": "exec",
+                "output": result.message,
+                "action": result.action,
+                "plan_mode": result.plan_mode,
+            },
+        )
+
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]

@@ -196,3 +196,65 @@ async def test_acp_prompt_drains_queued_turns_after_current_run():
     assert state.queued_prompts == []
     agent_messages = [u for _sid, u in conn.updates if getattr(u, "session_update", None) == "agent_message_chunk"]
     assert len(agent_messages) >= 2
+
+
+@pytest.mark.asyncio
+async def test_acp_plan_enter_runs_expanded_cache_safe_prompt(monkeypatch):
+    acp_agent, state, fake, _conn = make_agent_and_state()
+
+    monkeypatch.setattr(
+        "hermes_cli.plan_mode.handle_plan_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            action="enter",
+            plan_mode="plan",
+            message="PLAN activated",
+            prompt="expanded native plan prompt",
+        ),
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/plan implement it")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == ["expanded native plan prompt"]
+
+
+@pytest.mark.asyncio
+async def test_acp_plan_exit_is_local_and_does_not_run_model(monkeypatch):
+    acp_agent, state, fake, conn = make_agent_and_state()
+
+    monkeypatch.setattr(
+        "hermes_cli.plan_mode.handle_plan_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            action="exit",
+            plan_mode="build",
+            message="Plan Mode exited.",
+            prompt=None,
+        ),
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/plan exit")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == []
+    assert any("Plan Mode exited." in str(update) for _sid, update in conn.updates)
+
+
+@pytest.mark.asyncio
+async def test_acp_plan_approval_is_rejected_mid_turn():
+    acp_agent, state, fake, conn = make_agent_and_state()
+    state.is_running = True
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/plan approve")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == []
+    assert any("Only /plan status" in str(update) for _sid, update in conn.updates)

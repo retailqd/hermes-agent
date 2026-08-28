@@ -2157,6 +2157,17 @@ class GatewaySlashCommandsMixin:
         # Let the normal message handler process it
         return await self._handle_message(retry_event)
 
+    async def _handle_plan_command(self, event: "MessageEvent"):
+        """Apply a native Plan Mode control transition for this chat lane."""
+        from hermes_cli.plan_mode import handle_plan_command
+
+        session_entry = self.session_store.get_or_create_session(event.source)
+        return handle_plan_command(
+            session_entry.session_id,
+            (event.get_command_args() or "").strip(),
+            task_id=session_entry.session_id,
+        )
+
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
 

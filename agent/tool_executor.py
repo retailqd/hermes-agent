@@ -271,6 +271,41 @@ def _apply_tool_request_middleware_for_agent(
         return function_args, []
 
 
+def _apply_native_plan_guard(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> tuple[dict, Optional[str], str]:
+    """Apply the session Plan Mode policy without changing tool schemas."""
+    try:
+        from hermes_cli.plan_mode import evaluate_plan_tool_call
+
+        decision = evaluate_plan_tool_call(
+            getattr(agent, "session_id", "") or "",
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+        )
+        effective_args = decision.args if isinstance(decision.args, dict) else function_args
+        return effective_args, (None if decision.allowed else decision.message), decision.code
+    except Exception as exc:
+        logger.warning("native Plan Mode guard failed closed for %s: %s", function_name, exc)
+        try:
+            from hermes_cli.plan_mode import PlanModeManager
+
+            if PlanModeManager(getattr(agent, "session_id", "") or "").active:
+                return (
+                    function_args,
+                    "Blocked by native Plan Mode because its safety policy could not be evaluated.",
+                    "plan_guard_error",
+                )
+        except Exception:
+            pass
+        return function_args, None, "allow"
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -285,6 +320,14 @@ def _run_agent_tool_execution_middleware(
     def _execute(next_args: dict) -> Any:
         nonlocal observed_args
         observed_args = next_args if isinstance(next_args, dict) else function_args
+        observed_args, plan_block, _plan_code = _apply_native_plan_guard(
+            agent,
+            function_name=function_name,
+            function_args=observed_args,
+            effective_task_id=effective_task_id,
+        )
+        if plan_block is not None:
+            return json.dumps({"error": plan_block}, ensure_ascii=False)
         return execute(observed_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
@@ -392,6 +435,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
+        function_args, _plan_block_msg, _plan_block_code = _apply_native_plan_guard(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+        )
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
@@ -411,6 +460,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type="tool_scope_block",
                 error_message=_ts_scope_block,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _plan_block_msg is not None:
+            block_result = json.dumps({"error": _plan_block_msg}, ensure_ascii=False)
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type=_plan_block_code,
+                error_message=_plan_block_msg,
                 middleware_trace=list(middleware_trace),
             )
         else:
@@ -1025,14 +1088,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
+        function_args, _plan_block_msg, _plan_block_code = _apply_native_plan_guard(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+        )
 
         # Check plugin hooks for a block directive before executing.
-        _block_msg: Optional[str] = None
-        _block_error_type = "plugin_block"
+        _block_msg: Optional[str] = _plan_block_msg
+        _block_error_type = _plan_block_code if _plan_block_msg is not None else "plugin_block"
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
-        else:
+        elif _block_msg is None:
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
                 _block_msg = resolve_pre_tool_block(

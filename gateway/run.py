@@ -9366,6 +9366,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_goal_command(event)
                 return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
+            # Plan state transitions must happen at a turn boundary. Disabling
+            # the guard during an in-flight planning turn would allow a later
+            # tool call from that same turn to mutate state unexpectedly.
+            if _cmd_def_inner and _cmd_def_inner.name == "plan":
+                _plan_arg = (event.get_command_args() or "").strip().lower()
+                if _plan_arg == "status":
+                    try:
+                        return (await self._handle_plan_command(event)).message
+                    except Exception as exc:
+                        return f"Plan Mode error: {exc}"
+                return "Agent is running — wait or /stop first. Only /plan status is available mid-turn."
+
             if _cmd_def_inner and _cmd_def_inner.name == "moa":
                 return "Agent is running — wait or /stop first, then run /moa."
 
@@ -9888,6 +9900,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "plan":
+            try:
+                _plan_result = await self._handle_plan_command(event)
+            except Exception as exc:
+                return f"Plan Mode error: {exc}"
+            if _plan_result.prompt:
+                _typed_plan = f"/{command}{(' ' + event.get_command_args().strip()) if event.get_command_args().strip() else ''}"
+                event.text = _plan_result.prompt
+                event._plan_persist_user_message = _typed_plan
+                command = None
+                # Fall through to the normal agent turn with the skill-expanded
+                # cache-safe user message.
+            else:
+                return _plan_result.message
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
@@ -11390,6 +11417,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+        # Native /plan sends an expanded skill prompt to the model but keeps
+        # the human command in the durable transcript and UI history.
+        _plan_visible_message = getattr(event, "_plan_persist_user_message", None)
+        if isinstance(_plan_visible_message, str) and _plan_visible_message.strip():
+            persist_user_message = _plan_visible_message.strip()
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
