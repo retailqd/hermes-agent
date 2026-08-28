@@ -3749,10 +3749,13 @@ class TestNewEndpoints:
         monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
 
         def fake_seed(profile_dir, quiet=False):
-            skill_dir = profile_dir / "skills" / "software-development" / "plan"
+            skill_dir = profile_dir / "skills" / "software-development" / "seeded-test-skill"
             skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text("---\nname: plan\n---\n", encoding="utf-8")
-            return {"copied": ["plan"]}
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: seeded-test-skill\n---\n",
+                encoding="utf-8",
+            )
+            return {"copied": ["seeded-test-skill"]}
 
         monkeypatch.setattr(profiles_mod, "seed_profile_skills", fake_seed)
 
@@ -3762,7 +3765,15 @@ class TestNewEndpoints:
         )
 
         assert resp.status_code == 200
-        seeded_skill = get_hermes_home() / "profiles" / "fresh" / "skills" / "software-development" / "plan" / "SKILL.md"
+        seeded_skill = (
+            get_hermes_home()
+            / "profiles"
+            / "fresh"
+            / "skills"
+            / "software-development"
+            / "seeded-test-skill"
+            / "SKILL.md"
+        )
         assert seeded_skill.exists()
         profiles = {p["name"]: p for p in self.client.get("/api/profiles").json()["profiles"]}
         assert profiles["fresh"]["skill_count"] == 1
