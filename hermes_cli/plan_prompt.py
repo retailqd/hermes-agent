@@ -18,6 +18,7 @@ Runtime boundary:
 - Save or revise the decision-complete plan only under the active workspace's `.hermes/plans/` directory.
 
 Plan requirements:
+- Write one actionable Markdown implementation plan that another agent can execute without guessing.
 - State the goal, current evidence, assumptions, proposed architecture, and acceptance criteria.
 - Evidence freshness: record the inspected commit SHA and dirty-tree status. Use symbol anchors instead of line numbers when the inspected tree does not exactly match the target ref.
 - Prior project knowledge: search project docs, runbooks, incident notes, previous plans, and relevant session history. State what was found or that nothing relevant was found.

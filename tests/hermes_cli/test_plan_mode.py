@@ -67,6 +67,7 @@ def test_build_plan_prompt_is_self_contained(monkeypatch):
     )
 
     assert "Native Plan Mode is active" in prompt
+    assert "Write one actionable Markdown implementation plan" in prompt
     assert "remove the duplicate planning skill" in prompt
     assert ".hermes/plans/" in prompt
     assert "/plan approve" in prompt
