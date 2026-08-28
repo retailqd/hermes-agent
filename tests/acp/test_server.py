@@ -1048,6 +1048,7 @@ class TestPrompt:
         assert state.agent.step_callback is not None
         assert state.agent.stream_delta_callback is not None
         assert state.agent.reasoning_callback is not None
+        assert state.agent.clarify_callback is not None
         assert state.agent.thinking_callback is None
 
     @pytest.mark.asyncio

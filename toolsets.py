@@ -376,7 +376,7 @@ TOOLSETS = {
     # ==========================================================================
 
     "hermes-acp": {
-        "description": "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without messaging, audio, or clarify UI",
+        "description": "Editor integration (VS Code, Zed, JetBrains) - coding-focused tools with native selectable clarification UI",
         "tools": [
             "web_search", "web_extract",
             "terminal", "process",
@@ -387,7 +387,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
+            "todo", "memory", "clarify",
             "session_search",
             "execute_code", "delegate_task",
         ],

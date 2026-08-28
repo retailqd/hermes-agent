@@ -1488,15 +1488,28 @@ class HermesACPAgent(acp.Agent):
                 )
             except Exception:
                 logger.debug("Could not create ACP edit approval requester", exc_info=True)
+            try:
+                from acp_adapter.clarify import make_acp_clarify_callback
+
+                clarify_callback = make_acp_clarify_callback(
+                    conn.request_permission,
+                    loop,
+                    session_id,
+                )
+            except Exception:
+                clarify_callback = None
+                logger.debug("Could not create ACP clarify callback", exc_info=True)
         else:
             tool_progress_cb = None
             reasoning_cb = None
             step_cb = None
             stream_delta_cb = None
             approval_cb = None
+            clarify_callback = None
 
         agent = state.agent
         agent.tool_progress_callback = tool_progress_cb
+        agent.clarify_callback = clarify_callback
         # ACP thought panes should not receive Hermes' local kawaii waiting/status
         # updates. Route provider/model reasoning deltas instead; if the provider
         # emits no reasoning, Zed should not get a fake "thinking" accordion.
