@@ -55,17 +55,12 @@ STATE_STALE = "stale"
 STATE_ARCHIVED = "archived"
 _VALID_STATES = {STATE_ACTIVE, STATE_STALE, STATE_ARCHIVED}
 
-# Load-bearing bundled built-ins the curator must NEVER archive or consolidate,
-# regardless of ``curator.prune_builtins``, pin state, or LLM judgment. These
-# back advertised UX paths (e.g. ``plan`` powers the ``/plan`` slash-command
-# flow and is referenced in tips/docs/fresh-profile seeding); silently archiving
-# one turns its slash command into "Unknown command" with no signal to the user.
+# Reserved bundled built-ins that the curator must never archive or consolidate,
+# regardless of ``curator.prune_builtins``, pin state, or LLM judgment.
 # Protection is by skill ``name`` (frontmatter ``name:``), matching the keys used
-# throughout this module. Keep this list tiny and intentional — it is not a
-# substitute for ``curator.prune_builtins: false``, which exempts ALL built-ins.
-PROTECTED_BUILTIN_SKILLS: Set[str] = {
-    "plan",
-}
+# throughout this module. Keep this list tiny and intentional. It is not a
+# substitute for ``curator.prune_builtins: false``, which exempts all built-ins.
+PROTECTED_BUILTIN_SKILLS: Set[str] = set()
 
 
 def is_protected_builtin(skill_name: str) -> bool:

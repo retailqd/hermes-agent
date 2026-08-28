@@ -493,14 +493,19 @@ def test_prune_builtins_restore_clears_suppression(curator_env, monkeypatch):
     assert "bundled" not in u.read_suppressed_names()
 
 
+def test_plan_is_not_a_protected_builtin(curator_env):
+    u = curator_env["usage"]
+    assert "plan" not in u.PROTECTED_BUILTIN_SKILLS
+    assert u.is_protected_builtin("plan") is False
+
+
 def test_protected_builtin_never_archived_even_when_stale(curator_env, monkeypatch):
-    """A protected built-in (e.g. `plan`) is never archived, even when it is a
-    stale bundled skill under prune_builtins — it backs a load-bearing slash
-    command and must survive every curator pass."""
+    """A protected built-in survives every curator pass."""
     u = curator_env["usage"]
     c = curator_env["curator"]
     skills_dir = curator_env["home"] / "skills"
-    name = next(iter(u.PROTECTED_BUILTIN_SKILLS))  # the real protected name(s)
+    name = "runtime-critical-test-skill"
+    monkeypatch.setattr(u, "PROTECTED_BUILTIN_SKILLS", {name})
     _write_skill(skills_dir, name)
     (skills_dir / ".bundled_manifest").write_text(f"{name}:abc\n", encoding="utf-8")
     _enable_prune_builtins(curator_env, monkeypatch)
@@ -525,7 +530,8 @@ def test_protected_builtin_is_not_curation_eligible(curator_env, monkeypatch):
     of prune_builtins, and archive_skill() refuses them directly."""
     u = curator_env["usage"]
     skills_dir = curator_env["home"] / "skills"
-    name = next(iter(u.PROTECTED_BUILTIN_SKILLS))
+    name = "runtime-critical-test-skill"
+    monkeypatch.setattr(u, "PROTECTED_BUILTIN_SKILLS", {name})
     _write_skill(skills_dir, name)
     (skills_dir / ".bundled_manifest").write_text(f"{name}:abc\n", encoding="utf-8")
     _enable_prune_builtins(curator_env, monkeypatch)
