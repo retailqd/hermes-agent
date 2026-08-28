@@ -2800,7 +2800,14 @@ def run_job(
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        _cfg_map: dict[str, Any] = _cfg if isinstance(_cfg, dict) else {}
+        _agent_cfg = _cfg_map.get("agent")
+        if isinstance(_agent_cfg, dict) and "max_turns" in _agent_cfg:
+            max_iterations = int(_agent_cfg["max_turns"])
+        elif "max_turns" in _cfg_map:
+            max_iterations = int(_cfg_map["max_turns"])
+        else:
+            max_iterations = 90
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}

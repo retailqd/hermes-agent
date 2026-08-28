@@ -695,7 +695,13 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (
+        (
+            (agent.max_iterations == 0 or api_call_count < agent.max_iterations)
+            and agent.iteration_budget.remaining > 0
+        )
+        or agent._budget_grace_call
+    ):
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 

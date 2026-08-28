@@ -4,6 +4,7 @@ The `used` property must acquire the lock before reading `_used` to prevent
 data races with concurrent `consume()` / `refund()` calls.
 """
 from concurrent.futures import ThreadPoolExecutor
+import math
 
 
 
@@ -104,3 +105,17 @@ def test_iteration_budget_remaining():
     assert budget.remaining == 2
     budget.refund()
     assert budget.remaining == 3
+
+
+def test_zero_iteration_budget_is_unlimited():
+    """A zero cap explicitly disables the iteration limit."""
+    from run_agent import IterationBudget
+
+    budget = IterationBudget(max_total=0)
+
+    assert budget.unlimited is True
+    assert math.isinf(budget.remaining)
+    for _ in range(1_000):
+        assert budget.consume() is True
+    assert budget.used == 1_000
+    assert math.isinf(budget.remaining)

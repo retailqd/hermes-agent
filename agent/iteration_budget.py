@@ -11,6 +11,7 @@ subagent) holds an :class:`IterationBudget`; the parent's cap comes from
 
 from __future__ import annotations
 
+import math
 import threading
 
 
@@ -37,10 +38,15 @@ class IterationBudget:
     def consume(self) -> bool:
         """Try to consume one iteration.  Returns True if allowed."""
         with self._lock:
-            if self._used >= self.max_total:
+            if not self.unlimited and self._used >= self.max_total:
                 return False
             self._used += 1
             return True
+
+    @property
+    def unlimited(self) -> bool:
+        """Whether a zero cap explicitly disables iteration exhaustion."""
+        return self.max_total == 0
 
     def refund(self) -> None:
         """Give back one iteration (e.g. for execute_code turns)."""
@@ -54,8 +60,10 @@ class IterationBudget:
             return self._used
 
     @property
-    def remaining(self) -> int:
+    def remaining(self) -> int | float:
         with self._lock:
+            if self.unlimited:
+                return math.inf
             return max(0, self.max_total - self._used)
 
 

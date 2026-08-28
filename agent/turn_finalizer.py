@@ -53,7 +53,7 @@ def finalize_turn(
     _budget_autocontinue_handoff = False
 
     if final_response is None and (
-        api_call_count >= agent.max_iterations
+        (agent.max_iterations > 0 and api_call_count >= agent.max_iterations)
         or agent.iteration_budget.remaining <= 0
     ):
         # Budget exhausted. The gateway may use the summary as an internal
