@@ -470,7 +470,7 @@ def load_cli_config() -> Dict[str, Any]:
             "skin": "default",
         },
         "clarify": {
-            "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
+            "timeout": 3600,  # Keep material decisions live; timeout never auto-decides
         },
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
@@ -11526,12 +11526,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         Sets up the interactive selection UI (or freetext prompt for open-ended
         questions), then blocks until the user responds via the prompt_toolkit
-        key bindings.  If no response arrives within the configured timeout the
-        question is dismissed and the agent is told to decide on its own.
+        key bindings. If no response arrives within the configured timeout the
+        question remains unanswered; the agent is never told to invent consent.
         """
         import time as _time
 
-        timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+        timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 3600)
         response_queue = queue.Queue()
         is_open_ended = not choices
 
@@ -11570,16 +11570,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     _last_countdown_refresh = now
                     self._paint_now()
 
-        # Timed out — tear down the UI and let the agent decide
+        # Timed out — tear down the UI but preserve the unanswered decision.
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
         self._paint_now()
-        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
-        return (
-            "The user did not provide a response within the time limit. "
-            "Use your best judgement to make the choice and proceed."
-        )
+        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — decision remains unanswered){_RST}")
+        return ""
 
     def _sudo_password_callback(self) -> str:
         """

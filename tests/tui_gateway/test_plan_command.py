@@ -83,10 +83,11 @@ def test_plan_approve_returns_execution_kickoff(server, session, monkeypatch):
     response = _call(server, "command.dispatch", name="plan", arg="approve", session_id=sid)
     result = response["result"]
     assert result["type"] == "send"
-    assert result["message"] == plan_mode.PLAN_EXECUTION_PROMPT
-    assert result["plan_mode"] == "build"
+    state = plan_mode.PlanModeManager(session_key).state
+    assert result["message"] == plan_mode.build_plan_execution_prompt(state.approval_id)
+    assert result["plan_mode"] == "plan"
     assert result["action"] == "approve"
-    assert not plan_mode.PlanModeManager(session_key).active
+    assert state.build_pending
 
 
 def test_busy_session_allows_status_but_not_transition(server, session, monkeypatch):

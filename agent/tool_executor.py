@@ -292,18 +292,11 @@ def _apply_native_plan_guard(
         return effective_args, (None if decision.allowed else decision.message), decision.code
     except Exception as exc:
         logger.warning("native Plan Mode guard failed closed for %s: %s", function_name, exc)
-        try:
-            from hermes_cli.plan_mode import PlanModeManager
-
-            if PlanModeManager(getattr(agent, "session_id", "") or "").active:
-                return (
-                    function_args,
-                    "Blocked by native Plan Mode because its safety policy could not be evaluated.",
-                    "plan_guard_error",
-                )
-        except Exception:
-            pass
-        return function_args, None, "allow"
+        return (
+            function_args,
+            "Blocked by native Plan Mode because its safety policy could not be evaluated.",
+            "plan_guard_error",
+        )
 
 
 def _run_agent_tool_execution_middleware(
@@ -1324,6 +1317,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return _clarify_tool(
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
+                    questions=next_args.get("questions"),
                     callback=agent.clarify_callback,
                 )
             function_result, function_args = _run_agent_tool_execution_middleware(

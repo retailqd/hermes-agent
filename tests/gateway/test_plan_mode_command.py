@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,15 @@ async def test_matrix_plan_command_binds_native_state_to_conversation(runner, mo
     assert "Mutating tools are blocked" in status.message
 
     approved = await GatewayRunner._handle_plan_command(runner, _event("/plan approve"))
-    assert approved.plan_mode == "build"
-    assert approved.prompt == plan_mode.PLAN_EXECUTION_PROMPT
-    assert not plan_mode.PlanModeManager(_SessionEntry.session_id).active
+    assert approved.plan_mode == "plan"
+    state = plan_mode.PlanModeManager(_SessionEntry.session_id).state
+    assert approved.prompt == plan_mode.build_plan_execution_prompt(state.approval_id)
+    assert state.build_pending
+
+
+def test_gateway_clarify_failures_cannot_become_owner_answers():
+    source = inspect.getsource(GatewayRunner._run_agent_inner)
+    assert "[clarify prompt could not be delivered]" not in source
+    assert "[user did not respond within" not in source
+    assert 'if not send_ok:' in source
+    assert 'return ""' in source

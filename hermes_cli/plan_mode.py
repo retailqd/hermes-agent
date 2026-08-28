@@ -13,6 +13,7 @@ import os
 import shlex
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -23,8 +24,8 @@ PLAN_STATE_SCHEMA_VERSION = 1
 PLAN_MODE_BUILD = "build"
 PLAN_MODE_PLAN = "plan"
 
-PLAN_EXECUTION_PROMPT = (
-    "[Native Plan Mode approval]\n"
+PLAN_EXECUTION_PROMPT_TEMPLATE = (
+    "[Native Plan Mode approval:{approval_id}]\n"
     "The user explicitly approved the current plan with `/plan approve`. "
     "Leave planning mode and execute the approved plan now. Reuse the plan "
     "and decisions already present in this conversation, verify the work, "
@@ -66,7 +67,7 @@ _READ_ONLY_TOOL_NAMES = frozenset(
 )
 
 _SAFE_GIT_SUBCOMMANDS = frozenset(
-    {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+    {"diff", "log", "show", "rev-parse"}
 )
 _UNSAFE_GIT_OPTIONS = frozenset(
     {
@@ -76,11 +77,32 @@ _UNSAFE_GIT_OPTIONS = frozenset(
         "--no-index",
         "--output",
         "--textconv",
+        "--show-signature",
+        "--show-signatures",
+        "--format",
+        "--pretty",
         "-c",
         "-o",
     }
 )
 _SHELL_CONTROL_CHARS = frozenset(";&|><`\n\r\x00")
+_TRUSTED_GIT_CANDIDATES = (Path("/usr/bin/git"), Path("/bin/git"))
+_TRUSTED_PWD_CANDIDATES = (Path("/usr/bin/pwd"), Path("/bin/pwd"))
+_TRUSTED_ENV_CANDIDATES = (Path("/usr/bin/env"), Path("/bin/env"))
+
+_DYNAMIC_LOADER_RESET = (
+    "LD_PRELOAD=",
+    "LD_AUDIT=",
+    "LD_LIBRARY_PATH=",
+    "LD_DEBUG=",
+    "LD_DEBUG_OUTPUT=",
+    "LD_PROFILE=",
+    "GCONV_PATH=",
+    "LOCPATH=",
+    "NLSPATH=",
+    "GLIBC_TUNABLES=",
+    "MALLOC_TRACE=",
+)
 
 _DB_CACHE: Dict[str, Any] = {}
 _DB_LOCK = threading.RLock()
@@ -88,6 +110,10 @@ _DB_LOCK = threading.RLock()
 
 class PlanModeUnavailable(RuntimeError):
     """Raised when a requested Plan Mode transition cannot be persisted."""
+
+
+class PlanModeStateUnavailable(RuntimeError):
+    """Raised when persisted mode state cannot be read safely."""
 
 
 @dataclass
@@ -100,10 +126,21 @@ class PlanModeState:
     entered_at: float = 0.0
     updated_at: float = 0.0
     last_action: str = ""
+    approval_id: str = ""
 
     @property
     def active(self) -> bool:
         return self.mode == PLAN_MODE_PLAN
+
+    @property
+    def planning(self) -> bool:
+        return self.mode == PLAN_MODE_PLAN
+
+    @property
+    def build_pending(self) -> bool:
+        # Keep approval pending inside the existing PLAN wire value. Older
+        # Hermes versions therefore remain fail-closed after a rollback.
+        return self.mode == PLAN_MODE_PLAN and bool(self.approval_id)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
@@ -115,14 +152,18 @@ class PlanModeState:
             raise ValueError("plan state must be a JSON object")
         mode = str(data.get("mode") or PLAN_MODE_BUILD).strip().lower()
         if mode not in {PLAN_MODE_BUILD, PLAN_MODE_PLAN}:
-            mode = PLAN_MODE_BUILD
+            raise ValueError(f"unsupported plan mode: {mode}")
+        schema_version = int(data.get("schema_version") or PLAN_STATE_SCHEMA_VERSION)
+        if schema_version != PLAN_STATE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported plan state schema: {schema_version}")
         return cls(
-            schema_version=int(data.get("schema_version") or PLAN_STATE_SCHEMA_VERSION),
+            schema_version=schema_version,
             mode=mode,
             request=str(data.get("request") or ""),
             entered_at=float(data.get("entered_at") or 0.0),
             updated_at=float(data.get("updated_at") or 0.0),
             last_action=str(data.get("last_action") or ""),
+            approval_id=str(data.get("approval_id") or ""),
         )
 
 
@@ -146,15 +187,14 @@ def _meta_key(session_id: str) -> str:
     return f"plan:{session_id}"
 
 
-def _get_session_db() -> Optional[Any]:
+def _get_session_db() -> Any:
     try:
         from hermes_constants import get_hermes_home
         from hermes_state import SessionDB
 
         home = str(get_hermes_home())
     except Exception as exc:  # pragma: no cover - defensive import path
-        logger.debug("PlanMode: SessionDB bootstrap failed: %s", exc)
-        return None
+        raise PlanModeStateUnavailable("Plan Mode state storage could not be loaded.") from exc
     with _DB_LOCK:
         cached = _DB_CACHE.get(home)
         if cached is not None:
@@ -162,8 +202,7 @@ def _get_session_db() -> Optional[Any]:
         try:
             db = SessionDB()
         except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("PlanMode: SessionDB() failed: %s", exc)
-            return None
+            raise PlanModeStateUnavailable("Plan Mode state storage could not be opened.") from exc
         _DB_CACHE[home] = db
         return db
 
@@ -172,13 +211,12 @@ def load_plan_mode(session_id: str) -> PlanModeState:
     if not session_id:
         return PlanModeState()
     db = _get_session_db()
-    if db is None:
-        return PlanModeState()
     try:
         raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
-        logger.debug("PlanMode: get_meta failed for %s: %s", session_id, exc)
-        return PlanModeState()
+        raise PlanModeStateUnavailable(
+            f"Plan Mode state could not be read for session {session_id}."
+        ) from exc
     if not raw:
         # Compression and branching create parent-linked session ids. If the
         # eager migration write is interrupted, inherit an ACTIVE boundary
@@ -204,27 +242,111 @@ def load_plan_mode(session_id: str) -> PlanModeState:
                     break
                 current = parent
         except Exception as exc:
-            logger.debug("PlanMode: parent-state lookup failed for %s: %s", session_id, exc)
+            raise PlanModeStateUnavailable(
+                f"Plan Mode parent state could not be read for session {session_id}."
+            ) from exc
         return PlanModeState()
     try:
         return PlanModeState.from_json(raw)
     except Exception as exc:
         logger.warning("PlanMode: invalid state for %s: %s", session_id, exc)
-        return PlanModeState()
+        raise PlanModeStateUnavailable(
+            f"Plan Mode state is invalid for session {session_id}."
+        ) from exc
 
 
 def save_plan_mode(session_id: str, state: PlanModeState) -> bool:
     if not session_id:
         return False
-    db = _get_session_db()
-    if db is None:
-        return False
     try:
+        db = _get_session_db()
         db.set_meta(_meta_key(session_id), state.to_json())
-        stored = db.get_meta(_meta_key(session_id))
-        return bool(stored and PlanModeState.from_json(stored).mode == state.mode)
+        # SessionDB.set_meta commits atomically or raises. A read-after-write
+        # can fail after a successful commit and must not misreport the write
+        # as absent, especially for safety-boundary transitions.
+        return True
     except Exception as exc:
         logger.warning("PlanMode: could not persist state for %s: %s", session_id, exc)
+        return False
+
+
+def _effective_state_in_transaction(conn: Any, session_id: str) -> PlanModeState:
+    """Read the direct or inherited state while holding SessionDB's write lock."""
+    row = conn.execute(
+        "SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)
+    ).fetchone()
+    if row is not None:
+        raw = row["value"] if hasattr(row, "keys") else row[0]
+        return PlanModeState.from_json(raw)
+
+    current = session_id
+    seen: set[str] = set()
+    for _ in range(32):
+        if not current or current in seen:
+            break
+        seen.add(current)
+        session_row = conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE id = ?", (current,)
+        ).fetchone()
+        if session_row is None:
+            break
+        parent = (
+            session_row["parent_session_id"]
+            if hasattr(session_row, "keys")
+            else session_row[0]
+        )
+        parent = str(parent or "")
+        if not parent:
+            break
+        parent_row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (_meta_key(parent),)
+        ).fetchone()
+        if parent_row is not None:
+            parent_raw = parent_row["value"] if hasattr(parent_row, "keys") else parent_row[0]
+            inherited = PlanModeState.from_json(parent_raw)
+            if inherited.active:
+                inherited.last_action = "inherited"
+                return inherited
+            break
+        current = parent
+    return PlanModeState()
+
+
+def _compare_and_set_plan_mode(
+    session_id: str,
+    expected: PlanModeState,
+    desired: PlanModeState,
+) -> bool:
+    """Persist a transition only if the effective state still equals expected."""
+    if not session_id:
+        return False
+    db = _get_session_db()
+
+    def _do(conn: Any) -> bool:
+        current = _effective_state_in_transaction(conn, session_id)
+        if current.to_json() != expected.to_json():
+            return False
+        conn.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_meta_key(session_id), desired.to_json()),
+        )
+        return True
+
+    try:
+        execute_write = getattr(db, "_execute_write", None)
+        if callable(execute_write):
+            return bool(execute_write(_do))
+        # Minimal compatibility path for test doubles. The real SessionDB path
+        # above is the atomic contract used by the runtime.
+        with _DB_LOCK:
+            current = load_plan_mode(session_id)
+            if current.to_json() != expected.to_json():
+                return False
+            db.set_meta(_meta_key(session_id), desired.to_json())
+            return True
+    except Exception as exc:
+        logger.warning("PlanMode: atomic transition failed for %s: %s", session_id, exc)
         return False
 
 
@@ -249,37 +371,69 @@ class PlanModeManager:
             entered_at=previous.entered_at if previous.active and previous.entered_at else now,
             updated_at=now,
             last_action="entered",
+            approval_id="",
         )
-        if not save_plan_mode(self.session_id, state):
+        if not _compare_and_set_plan_mode(self.session_id, previous, state):
             raise PlanModeUnavailable("Plan Mode could not be persisted; no planning turn was started.")
         return state
 
     def approve(self) -> PlanModeState:
         current = self.state
-        if not current.active:
+        if current.build_pending and current.approval_id:
+            return current
+        if not current.planning:
             raise ValueError("No active Plan Mode to approve.")
-        current.mode = PLAN_MODE_BUILD
-        current.updated_at = time.time()
-        current.last_action = "approved"
-        if not save_plan_mode(self.session_id, current):
+        desired = PlanModeState(**asdict(current))
+        desired.updated_at = time.time()
+        desired.last_action = "approval_pending"
+        desired.approval_id = uuid.uuid4().hex
+        if not _compare_and_set_plan_mode(self.session_id, current, desired):
+            latest = self.state
+            if latest.build_pending and latest.request == current.request:
+                return latest
             raise PlanModeUnavailable("Plan approval could not be persisted; execution remains blocked.")
-        return current
+        return desired
+
+    def begin_build(self, approval_id: str) -> PlanModeState:
+        """Atomically release the guard as the exact approved runtime turn starts."""
+        current = self.state
+        if not current.build_pending:
+            raise ValueError("No approved build kickoff is pending.")
+        if not approval_id or approval_id != current.approval_id:
+            raise ValueError("The build kickoff does not match the current approval.")
+        desired = PlanModeState(**asdict(current))
+        desired.mode = PLAN_MODE_BUILD
+        desired.updated_at = time.time()
+        desired.last_action = "build_started"
+        # Retain the consumed nonce so a transport retry of the hidden kickoff
+        # can be detected and rejected instead of executing the plan twice.
+        desired.approval_id = current.approval_id
+        if not _compare_and_set_plan_mode(self.session_id, current, desired):
+            raise PlanModeUnavailable("Build kickoff could not be persisted; execution remains blocked.")
+        return desired
 
     def exit(self) -> PlanModeState:
         current = self.state
         if not current.active:
             return current
-        current.mode = PLAN_MODE_BUILD
-        current.updated_at = time.time()
-        current.last_action = "exited"
-        if not save_plan_mode(self.session_id, current):
+        desired = PlanModeState(**asdict(current))
+        desired.mode = PLAN_MODE_BUILD
+        desired.updated_at = time.time()
+        desired.last_action = "exited"
+        desired.approval_id = ""
+        if not _compare_and_set_plan_mode(self.session_id, current, desired):
             raise PlanModeUnavailable("Plan Mode exit could not be persisted; execution remains blocked.")
-        return current
+        return desired
 
     def status_line(self) -> str:
         state = self.state
         if state.active:
             suffix = f" Request: {state.request}" if state.request else ""
+            if state.build_pending:
+                return (
+                    "PLAN approval is pending. Mutating tools remain blocked until "
+                    f"the exact approved execution turn begins.{suffix}"
+                )
             return f"PLAN mode is active. Mutating tools are blocked.{suffix}"
         return "BUILD mode is active. Tools follow the normal approval policy."
 
@@ -293,6 +447,26 @@ def build_plan_prompt(request: str, *, task_id: str = "") -> str:
     from hermes_cli.plan_prompt import render_native_plan_prompt
 
     return render_native_plan_prompt(request)
+
+
+def build_plan_execution_prompt(approval_id: str) -> str:
+    approval_id = str(approval_id or "").strip()
+    if not approval_id:
+        raise ValueError("Plan approval id is required.")
+    return PLAN_EXECUTION_PROMPT_TEMPLATE.format(approval_id=approval_id)
+
+
+def native_plan_execution_approval_id(prompt: Any) -> Optional[str]:
+    """Recognize the private approval envelope even when stale or malformed."""
+    if not isinstance(prompt, str):
+        return None
+    prefix = "[Native Plan Mode approval:"
+    if not prompt.startswith(prefix):
+        return None
+    closing = prompt.find("]", len(prefix))
+    if closing < 0:
+        return ""
+    return prompt[len(prefix):closing].strip()
 
 
 def handle_plan_command(session_id: str, args: str = "", *, task_id: str = "") -> PlanCommandResult:
@@ -310,12 +484,12 @@ def handle_plan_command(session_id: str, args: str = "", *, task_id: str = "") -
     if lower == "status" or (not raw and manager.active):
         return PlanCommandResult("status", manager.state.mode, manager.status_line())
     if lower == "approve":
-        manager.approve()
+        approved = manager.approve()
         return PlanCommandResult(
             "approve",
-            PLAN_MODE_BUILD,
-            "Plan approved. Switching to BUILD and starting execution.",
-            prompt=PLAN_EXECUTION_PROMPT,
+            PLAN_MODE_PLAN,
+            "Plan approved. Starting execution; mutations stay blocked until the exact approved turn begins.",
+            prompt=build_plan_execution_prompt(approved.approval_id),
         )
     if lower in {"exit", "cancel", "reject"}:
         manager.exit()
@@ -415,6 +589,18 @@ def _plan_file_allowed(path: Any, *, task_id: str) -> bool:
         return False
 
 
+def _trusted_executable(candidates: tuple[Path, ...]) -> Optional[str]:
+    """Resolve an OS-owned executable without consulting PATH or shell aliases."""
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return str(resolved)
+        except OSError:
+            continue
+    return None
+
+
 def _safe_terminal_args(args: Mapping[str, Any], *, task_id: str) -> Optional[Dict[str, Any]]:
     command = args.get("command")
     if not isinstance(command, str) or not command.strip():
@@ -440,9 +626,22 @@ def _safe_terminal_args(args: Mapping[str, Any], *, task_id: str) -> Optional[Di
     except ValueError:
         return None
     if tokens == ["pwd"]:
+        pwd_path = _trusted_executable(_TRUSTED_PWD_CANDIDATES)
+        env_path = _trusted_executable(_TRUSTED_ENV_CANDIDATES)
+        if pwd_path is None or env_path is None:
+            return None
         normalized = dict(args)
         normalized.update(
-            command="pwd",
+            command=shlex.join(
+                [
+                    *_DYNAMIC_LOADER_RESET,
+                    env_path,
+                    "-i",
+                    "PATH=/usr/bin:/bin",
+                    "LANG=C.UTF-8",
+                    pwd_path,
+                ]
+            ),
             background=False,
             pty=False,
             notify_on_complete=False,
@@ -453,23 +652,60 @@ def _safe_terminal_args(args: Mapping[str, Any], *, task_id: str) -> Optional[Di
         return None
     for token in tokens[2:]:
         option = token.split("=", 1)[0]
-        if option in _UNSAFE_GIT_OPTIONS:
+        if option in _UNSAFE_GIT_OPTIONS or "%G" in token:
             return None
+
+    git_path = _trusted_executable(_TRUSTED_GIT_CANDIDATES)
+    env_path = _trusted_executable(_TRUSTED_ENV_CANDIDATES)
+    if git_path is None or env_path is None:
+        return None
 
     # Disable pagers and external diff helpers before handing the normalized
     # argv back to the existing terminal implementation.
     subcommand = tokens[1]
+    # A worktree diff runs arbitrary `filter.<driver>.clean` commands selected
+    # by repository .gitattributes. Staged diffs compare stored blobs and do
+    # not invoke worktree conversion filters.
+    if subcommand == "diff" and not any(
+        token in {"--cached", "--staged"} for token in tokens[2:]
+    ):
+        return None
     safe_tokens = [
-        "git",
+        # These assignments are applied by the already-running shell before
+        # it execs `/usr/bin/env`, so the dynamic loader cannot act on values
+        # exported by an earlier BUILD turn. `env -i` then drops every other
+        # inherited variable, including all GIT_DIR/WORK_TREE/INDEX redirects.
+        *_DYNAMIC_LOADER_RESET,
+        env_path,
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "LANG=C.UTF-8",
+        "GIT_NO_LAZY_FETCH=1",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        git_path,
+        "--no-optional-locks",
+        "--no-replace-objects",
         "--no-pager",
         "-c",
         "core.pager=cat",
         "-c",
         "core.externalDiff=",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "log.showSignature=false",
+        "-c",
+        "gpg.program=/bin/false",
+        "-c",
+        "gpg.ssh.program=/bin/false",
         subcommand,
     ]
     if subcommand in {"diff", "log", "show"}:
         safe_tokens.append("--no-ext-diff")
+        safe_tokens.append("--no-textconv")
     safe_tokens.extend(tokens[2:])
     normalized = dict(args)
     normalized.update(
@@ -491,7 +727,13 @@ def evaluate_plan_tool_call(
 ) -> PlanToolDecision:
     """Return the effective arguments or a synthetic block decision."""
     payload = dict(args or {})
-    if not PlanModeManager(session_id).active:
+    state_unavailable = False
+    try:
+        active = PlanModeManager(session_id).active
+    except PlanModeStateUnavailable:
+        active = True
+        state_unavailable = True
+    if not active:
         return PlanToolDecision(True, payload)
 
     if tool_name in _READ_ONLY_TOOL_NAMES:
@@ -517,13 +759,18 @@ def evaluate_plan_tool_call(
         )
 
     if tool_name == "write_file":
-        if not payload.get("cross_profile") and _plan_file_allowed(payload.get("path"), task_id=task_id):
+        if (
+            not state_unavailable
+            and not payload.get("cross_profile")
+            and _plan_file_allowed(payload.get("path"), task_id=task_id)
+        ):
             return PlanToolDecision(True, payload, "plan_file_write")
         return _blocked(tool_name, payload, "write_outside_plan_dir", "writes are allowed only below the active workspace's `.hermes/plans` directory.")
 
     if tool_name == "patch":
         if (
-            payload.get("mode", "replace") == "replace"
+            not state_unavailable
+            and payload.get("mode", "replace") == "replace"
             and not payload.get("cross_profile")
             and _plan_file_allowed(payload.get("path"), task_id=task_id)
         ):

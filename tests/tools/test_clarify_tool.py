@@ -3,6 +3,7 @@
 import json
 from typing import List, Optional
 
+import pytest
 
 from tools.clarify_tool import (
     clarify_tool,
@@ -241,13 +242,16 @@ class TestClarifySchema:
         assert "description" in CLARIFY_SCHEMA
         assert len(CLARIFY_SCHEMA["description"]) > 50
 
-    def test_schema_question_required(self):
-        """Question parameter should be required."""
-        assert "question" in CLARIFY_SCHEMA["parameters"]["required"]
+    def test_schema_supports_legacy_or_structured_form(self):
+        """Runtime validates the mutually exclusive legacy and batch forms."""
+        properties = CLARIFY_SCHEMA["parameters"]["properties"]
+        assert "question" in properties
+        assert "questions" in properties
+        assert CLARIFY_SCHEMA["parameters"].get("required", []) == []
 
     def test_schema_choices_optional(self):
         """Choices parameter should be optional."""
-        assert "choices" not in CLARIFY_SCHEMA["parameters"]["required"]
+        assert "choices" not in CLARIFY_SCHEMA["parameters"].get("required", [])
 
     def test_schema_choices_max_items(self):
         """Schema should specify max items for choices."""
@@ -257,3 +261,126 @@ class TestClarifySchema:
     def test_max_choices_is_four(self):
         """MAX_CHOICES constant should be 4."""
         assert MAX_CHOICES == 4
+
+    def test_structured_schema_enforces_real_limits(self):
+        questions = CLARIFY_SCHEMA["parameters"]["properties"]["questions"]
+        assert questions["minItems"] == 1
+        assert questions["maxItems"] == 3
+        assert questions["items"]["properties"]["header"]["maxLength"] == 12
+        options = questions["items"]["properties"]["options"]
+        assert options["minItems"] == 2
+        assert options["maxItems"] == 3
+
+
+class TestStructuredClarify:
+    @staticmethod
+    def _question(question_id="deploy_target"):
+        return {
+            "id": question_id,
+            "header": "Destino",
+            "question": "Onde devemos publicar?",
+            "options": [
+                {
+                    "label": "Staging (Recommended)",
+                    "description": "Valida sem afetar produção.",
+                },
+                {
+                    "label": "Produção",
+                    "description": "Entrega direta com risco maior.",
+                },
+            ],
+        }
+
+    def test_batch_preserves_ids_recommendation_and_other_answer(self):
+        seen = []
+        questions = [self._question("deploy_target"), self._question("rollout")]
+
+        def callback(question, choices):
+            seen.append((question, choices))
+            return choices[0] if len(seen) == 1 else "Minha estratégia gradual"
+
+        result = json.loads(clarify_tool(questions=questions, callback=callback))
+
+        assert len(seen) == 2
+        assert "1/2" in seen[0][0]
+        assert "Valida sem afetar produção" in seen[0][0]
+        assert seen[0][1] == ["Staging (Recommended)", "Produção"]
+        assert result["answers"]["deploy_target"]["answers"] == ["Staging (Recommended)"]
+        assert result["responses"][0]["selected_label"] == "Staging (Recommended)"
+        assert result["responses"][1]["selected_label"] is None
+        assert result["responses"][1]["response"] == "Minha estratégia gradual"
+
+    def test_batch_validation_is_atomic_before_callback(self):
+        called = []
+        invalid = [self._question("valid"), self._question("Not-Snake")]
+        result = json.loads(
+            clarify_tool(
+                questions=invalid,
+                callback=lambda question, choices: called.append(question),
+            )
+        )
+        assert "error" in result
+        assert called == []
+
+    @pytest.mark.parametrize(
+        "mutate, error_fragment",
+        [
+            (lambda q: q.update(header="header longer"), "1 to 12"),
+            (lambda q: q.update(options=q["options"][:1]), "2 or 3"),
+            (
+                lambda q: q["options"][0].update(label="Staging"),
+                "first option",
+            ),
+            (
+                lambda q: q["options"][1].update(label="Other"),
+                "must not define Other",
+            ),
+            (
+                lambda q: q["options"][0].update(label="Other (Recommended)"),
+                "must not define Other",
+            ),
+            (
+                lambda q: q["options"][0].update(label="(Recommended)"),
+                "requires a label",
+            ),
+            (
+                lambda q: q["options"][0].update(
+                    label="Uma alternativa excessivamente longa demais agora (Recommended)"
+                ),
+                "at most 5 words",
+            ),
+        ],
+    )
+    def test_batch_rejects_contract_violations(self, mutate, error_fragment):
+        question = self._question()
+        mutate(question)
+        result = json.loads(
+            clarify_tool(questions=[question], callback=lambda question, choices: "x")
+        )
+        assert error_fragment in result["error"]
+
+    def test_batch_dismissal_aborts_remaining_questions(self):
+        called = []
+
+        def callback(question, choices):
+            called.append(question)
+            return ""
+
+        result = json.loads(
+            clarify_tool(
+                questions=[self._question("first"), self._question("second")],
+                callback=callback,
+            )
+        )
+        assert "dismissed or timed out" in result["error"]
+        assert len(called) == 1
+
+    def test_legacy_and_structured_forms_are_mutually_exclusive(self):
+        result = json.loads(
+            clarify_tool(
+                question="legacy",
+                questions=[self._question()],
+                callback=lambda question, choices: "x",
+            )
+        )
+        assert "either" in result["error"]

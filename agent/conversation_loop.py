@@ -520,6 +520,50 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _prepare_native_plan_turn(
+    agent,
+    user_message: str,
+    persist_user_message: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Apply the nonce-bound approval or reinject the full PLAN contract."""
+    from hermes_cli.plan_mode import (
+        PlanModeManager,
+        PlanModeUnavailable,
+        build_plan_execution_prompt,
+        native_plan_execution_approval_id,
+    )
+    from hermes_cli.plan_prompt import (
+        render_native_plan_prompt,
+        render_native_plan_turn_reminder,
+    )
+
+    manager = PlanModeManager(getattr(agent, "session_id", "") or "")
+    state = manager.state
+    raw_user_message = str(user_message or "")
+    envelope_approval_id = native_plan_execution_approval_id(raw_user_message)
+    approval_prompt = (
+        build_plan_execution_prompt(state.approval_id)
+        if state.build_pending
+        else ""
+    )
+    if approval_prompt and raw_user_message == approval_prompt:
+        manager.begin_build(state.approval_id)
+        return raw_user_message, persist_user_message
+    if envelope_approval_id is not None:
+        raise PlanModeUnavailable(
+            "This Plan Mode approval kickoff is stale, malformed, or already consumed; "
+            "refusing execution. Run `/plan approve` again from the current PLAN state."
+        )
+    if state.active and raw_user_message != render_native_plan_prompt(state.request):
+        if persist_user_message is None:
+            persist_user_message = user_message
+        return (
+            render_native_plan_turn_reminder(state.request, raw_user_message),
+            persist_user_message,
+        )
+    return raw_user_message, persist_user_message
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -564,6 +608,22 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # Bind approval to one exact, nonce-bearing runtime prompt and release the
+    # guard before the approved turn begins. All other active PLAN turns get
+    # the complete contract reinjected, including after resume/compression.
+    try:
+        user_message, persist_user_message = _prepare_native_plan_turn(
+            agent,
+            user_message,
+            persist_user_message,
+        )
+    except Exception:
+        # State/transition errors must never synthesize an unlocked turn. The
+        # dispatch guard remains fail-closed; a failed approval transition is
+        # surfaced rather than silently running a different turn.
+        logger.warning("native Plan Mode turn preparation unavailable", exc_info=True)
+        raise
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user

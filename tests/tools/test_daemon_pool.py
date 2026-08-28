@@ -45,6 +45,16 @@ def test_results_and_initializer_work_like_stdlib():
         pool.shutdown(wait=True)
 
 
+def test_worker_contract_matches_running_python():
+    """Regression guard for the Python 3.14 worker-context API change."""
+    pool = DaemonThreadPoolExecutor(max_workers=2)
+    try:
+        futures = [pool.submit(pow, value, 2) for value in range(6)]
+        assert [future.result(timeout=10) for future in futures] == [0, 1, 4, 9, 16, 25]
+    finally:
+        pool.shutdown(wait=True)
+
+
 def test_idle_worker_reuse():
     pool = DaemonThreadPoolExecutor(max_workers=4)
     try:

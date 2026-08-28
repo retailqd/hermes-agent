@@ -19,11 +19,11 @@ def clarify_callback(cli, question, choices):
     """Prompt for clarifying question through the TUI.
 
     Sets up the interactive selection UI, then blocks until the user
-    responds. Returns the user's choice or a timeout message.
+    responds. Returns the user's choice or an empty timeout sentinel.
     """
     from cli import CLI_CONFIG
 
-    timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+    timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 3600)
     response_queue = queue.Queue()
     is_open_ended = not choices
 
@@ -56,11 +56,8 @@ def clarify_callback(cli, question, choices):
     cli._clarify_deadline = 0
     if hasattr(cli, "_app") and cli._app:
         cli._app.invalidate()
-    cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
-    return (
-        "The user did not provide a response within the time limit. "
-        "Use your best judgement to make the choice and proceed."
-    )
+    cprint(f"\n{_DIM}(clarify timed out after {timeout}s — decision remains unanswered){_RST}")
+    return ""
 
 
 def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
