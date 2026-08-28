@@ -22,7 +22,7 @@ description: "为 NeurIPS/ICML/ICLR 撰写 ML 论文：设计→投稿"
 | 依赖项 | `semanticscholar`, `arxiv`, `habanero`, `requests`, `scipy`, `numpy`, `matplotlib`, `SciencePlots` |
 | 平台 | linux, macos |
 | 标签 | `Research`, `Paper Writing`, `Experiments`, `ML`, `AI`, `NeurIPS`, `ICML`, `ICLR`, `ACL`, `AAAI`, `COLM`, `LaTeX`, `Citations`, `Statistical Analysis` |
-| 相关 skill | [`arxiv`](/user-guide/skills/bundled/research/research-arxiv), `ml-paper-writing`, [`subagent-driven-development`](/user-guide/skills/bundled/software-development/software-development-subagent-driven-development), [`plan`](/user-guide/skills/bundled/software-development/software-development-plan) |
+| 相关 skill | [`arxiv`](/user-guide/skills/bundled/research/research-arxiv), `ml-paper-writing`, [`subagent-driven-development`](/user-guide/skills/bundled/software-development/software-development-subagent-driven-development) |
 
 ## 参考：完整 SKILL.md
 
@@ -2144,7 +2144,7 @@ ACL 系列会议有不同的投稿类型：
 |-------|----------|----------|
 | **arxiv** | 阶段 1（文献综述）：搜索 arXiv、生成 BibTeX、通过 Semantic Scholar 查找相关论文 | `skill_view("arxiv")` |
 | **subagent-driven-development** | 阶段 5（起草）：并行章节写作，含两阶段审阅（规范合规性，然后质量） | `skill_view("subagent-driven-development")` |
-| **plan** | 阶段 0（设置）：执行前创建结构化计划。写入 `.hermes/plans/` | `skill_view("plan")` |
+| **原生 Plan Mode** | 阶段 0（设置）：执行前创建由 runtime 强制的只读计划 | `/plan <规划请求>` |
 | **qmd** | 阶段 1（文献）：通过混合 BM25+向量搜索查询本地知识库（笔记、转录、文档） | 安装：`skill_manage("install", "qmd")` |
 | **diagramming** | 阶段 4-5：创建基于 Excalidraw 的图形和架构示意图 | `skill_view("diagramming")` |
 | **data-science** | 阶段 4（分析）：用于交互式分析和可视化的 Jupyter 实时内核 | `skill_view("data-science")` |
