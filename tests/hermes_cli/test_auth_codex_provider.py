@@ -1093,3 +1093,83 @@ def test_device_code_login_non_429_error_unchanged(monkeypatch):
         auth_mod._codex_device_code_login()
 
     assert exc_info.value.code == "device_code_request_error"
+
+
+def _setup_shared_codex_auth(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex"
+    hermes_home.mkdir()
+    codex_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "auth:\n  codex_shared_store: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    return hermes_home, codex_home
+
+
+def test_shared_codex_store_reads_codex_cli_as_canonical(tmp_path, monkeypatch):
+    hermes_home, codex_home = _setup_shared_codex_auth(tmp_path, monkeypatch)
+    _setup_hermes_auth(hermes_home, access_token="stale-hermes", refresh_token="stale-refresh")
+    (codex_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "canonical-access",
+                    "refresh_token": "canonical-refresh",
+                    "account_id": "account-1",
+                },
+                "last_refresh": "2026-08-28T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = _read_codex_tokens()
+
+    assert data["tokens"]["access_token"] == "canonical-access"
+    assert data["tokens"]["refresh_token"] == "canonical-refresh"
+    assert data["tokens"]["account_id"] == "account-1"
+
+
+def test_shared_codex_store_save_is_atomic_and_preserves_unknown_fields(tmp_path, monkeypatch):
+    hermes_home, codex_home = _setup_shared_codex_auth(tmp_path, monkeypatch)
+    hermes_auth = _setup_hermes_auth(
+        hermes_home,
+        access_token="unchanged-hermes",
+        refresh_token="unchanged-refresh",
+    )
+    before_hermes = hermes_auth.read_bytes()
+    codex_auth = codex_home / "auth.json"
+    codex_auth.write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "future_top_level": {"preserve": True},
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "account_id": "account-1",
+                    "future_token_field": "preserve-me",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _save_codex_tokens(
+        {"access_token": "new-access", "refresh_token": "new-refresh"},
+        last_refresh="2026-08-28T01:02:03Z",
+    )
+
+    payload = json.loads(codex_auth.read_text(encoding="utf-8"))
+    assert payload["tokens"]["access_token"] == "new-access"
+    assert payload["tokens"]["refresh_token"] == "new-refresh"
+    assert payload["tokens"]["account_id"] == "account-1"
+    assert payload["tokens"]["future_token_field"] == "preserve-me"
+    assert payload["future_top_level"] == {"preserve": True}
+    assert payload["last_refresh"] == "2026-08-28T01:02:03Z"
+    assert hermes_auth.read_bytes() == before_hermes
+    assert codex_auth.stat().st_mode & 0o777 == 0o600

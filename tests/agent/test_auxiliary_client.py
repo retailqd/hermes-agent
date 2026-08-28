@@ -516,6 +516,25 @@ class TestReadCodexAccessToken:
         result = _read_codex_access_token()
         assert result == valid_jwt
 
+    def test_shared_store_bypasses_stale_hermes_pool(self):
+        with patch(
+            "hermes_cli.auth._codex_shared_store_enabled", return_value=True
+        ), patch(
+            "hermes_cli.auth._read_codex_tokens",
+            return_value={
+                "tokens": {
+                    "access_token": "canonical-shared-token",
+                    "refresh_token": "canonical-refresh",
+                }
+            },
+        ), patch(
+            "agent.auxiliary_client._select_pool_entry"
+        ) as select_pool:
+            result = _read_codex_access_token()
+
+        assert result == "canonical-shared-token"
+        select_pool.assert_not_called()
+
     def test_non_jwt_token_passes_through(self, tmp_path, monkeypatch):
         """Non-JWT tokens (no dots) should be returned as-is."""
         hermes_home = tmp_path / "hermes"

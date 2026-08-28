@@ -1767,11 +1767,18 @@ def _read_codex_access_token() -> Optional[str]:
     fallback-to-Codex working when the pool state is stale but the stored OAuth
     token is still valid.
     """
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        token = _pool_runtime_api_key(entry)
-        if token:
-            return token
+    try:
+        from hermes_cli.auth import _codex_shared_store_enabled
+        shared_store = _codex_shared_store_enabled()
+    except Exception:
+        shared_store = False
+
+    if not shared_store:
+        pool_present, entry = _select_pool_entry("openai-codex")
+        if pool_present:
+            token = _pool_runtime_api_key(entry)
+            if token:
+                return token
 
     try:
         from hermes_cli.auth import _read_codex_tokens

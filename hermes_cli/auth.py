@@ -51,7 +51,7 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import atomic_json_write, atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -3186,25 +3186,116 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 
 
 # =============================================================================
-# OpenAI Codex auth — tokens stored in ~/.hermes/auth.json (not ~/.codex/)
+# OpenAI Codex auth
 #
-# Hermes maintains its own Codex OAuth session separate from the Codex CLI
-# and VS Code extension. This prevents refresh token rotation conflicts
-# where one app's refresh invalidates the other's session.
+# The default remains an isolated Hermes OAuth session in ~/.hermes/auth.json.
+# Operators may opt into a single canonical Codex CLI store by setting
+# ``auth.codex_shared_store: true``. In that mode reads and refresh writes use
+# ``$CODEX_HOME/auth.json`` (default ~/.codex/auth.json) atomically.
 # =============================================================================
 
+_codex_shared_lock_holder = threading.local()
+
+
+def _codex_shared_store_enabled() -> bool:
+    """Return whether Codex CLI auth.json is the configured canonical store."""
+    try:
+        cfg = read_raw_config() or {}
+        auth_cfg = cfg.get("auth") if isinstance(cfg, dict) else None
+        return bool(
+            isinstance(auth_cfg, dict)
+            and is_truthy_value(auth_cfg.get("codex_shared_store"))
+        )
+    except Exception:
+        return False
+
+
+def _codex_cli_auth_path() -> Path:
+    codex_home = os.getenv("CODEX_HOME", "").strip()
+    if not codex_home:
+        codex_home = str(Path.home() / ".codex")
+    return Path(codex_home).expanduser() / "auth.json"
+
+
+@contextmanager
+def _codex_shared_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    auth_path = _codex_cli_auth_path()
+    with _file_lock(
+        auth_path.with_suffix(".hermes.lock"),
+        _codex_shared_lock_holder,
+        timeout_seconds,
+        "Timed out waiting for shared Codex auth store lock",
+    ):
+        yield
+
+
+def _load_codex_cli_auth_payload() -> Dict[str, Any]:
+    auth_path = _codex_cli_auth_path()
+    if not auth_path.is_file():
+        raise AuthError(
+            "No shared Codex credentials stored. Run `codex login` to authenticate.",
+            provider="openai-codex",
+            code="codex_auth_missing",
+            relogin_required=True,
+        )
+    try:
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AuthError(
+            "Shared Codex auth.json is not valid JSON. Run `codex login` to repair it.",
+            provider="openai-codex",
+            code="codex_auth_invalid_shape",
+            relogin_required=True,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise AuthError(
+            "Shared Codex auth.json has an invalid shape. Run `codex login` to repair it.",
+            provider="openai-codex",
+            code="codex_auth_invalid_shape",
+            relogin_required=True,
+        )
+    return payload
+
+
+def _save_codex_cli_auth_tokens(tokens: Dict[str, str], last_refresh: str) -> None:
+    """Atomically merge refreshed tokens into Codex CLI's canonical auth file."""
+    with _codex_shared_store_lock():
+        try:
+            payload = _load_codex_cli_auth_payload()
+        except AuthError as exc:
+            if exc.code != "codex_auth_missing":
+                raise
+            payload = {}
+        previous_tokens = payload.get("tokens")
+        merged_tokens = dict(previous_tokens) if isinstance(previous_tokens, dict) else {}
+        merged_tokens.update(tokens)
+        payload["tokens"] = merged_tokens
+        payload["last_refresh"] = last_refresh
+        payload.setdefault("auth_mode", "chatgpt")
+        auth_path = _codex_cli_auth_path()
+        secure_parent_dir(auth_path)
+        atomic_json_write(auth_path, payload, indent=2, mode=0o600)
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
-    """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
-    
+    """Read Codex OAuth tokens from the configured canonical auth store.
+
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
-    if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+    if _codex_shared_store_enabled():
+        if _lock:
+            with _codex_shared_store_lock():
+                state = _load_codex_cli_auth_payload()
+        else:
+            state = _load_codex_cli_auth_payload()
     else:
-        auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+        if _lock:
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+        else:
+            auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3344,9 +3435,12 @@ def _sync_codex_pool_entries(
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+    """Save Codex OAuth tokens to the configured canonical auth store."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if _codex_shared_store_enabled():
+        _save_codex_cli_auth_tokens(tokens, last_refresh)
+        return
     with _auth_store_lock():
         auth_store = _load_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
@@ -3571,10 +3665,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
     """
-    codex_home = os.getenv("CODEX_HOME", "").strip()
-    if not codex_home:
-        codex_home = str(Path.home() / ".codex")
-    auth_path = Path(codex_home).expanduser() / "auth.json"
+    auth_path = _codex_cli_auth_path()
     if not auth_path.is_file():
         return None
     try:
