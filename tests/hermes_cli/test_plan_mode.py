@@ -52,6 +52,54 @@ def test_plan_command_requires_explicit_approval(isolated_plan_mode, monkeypatch
     assert approved.prompt == plan_mode.PLAN_EXECUTION_PROMPT
 
 
+def test_build_plan_prompt_is_self_contained(monkeypatch):
+    def forbidden_skill_loader(*args, **kwargs):
+        raise AssertionError("native Plan Mode must not load a skill")
+
+    monkeypatch.setattr(
+        "agent.skill_commands.build_skill_invocation_message",
+        forbidden_skill_loader,
+    )
+
+    prompt = plan_mode.build_plan_prompt(
+        "remove the duplicate planning skill",
+        task_id="session-native-plan",
+    )
+
+    assert "Native Plan Mode is active" in prompt
+    assert "remove the duplicate planning skill" in prompt
+    assert ".hermes/plans/" in prompt
+    assert "/plan approve" in prompt
+    assert "/plan exit" in prompt
+    assert "Evidence freshness" in prompt
+    assert "Prior project knowledge" in prompt
+    assert "Adversarial premises" in prompt
+    assert "user has invoked" not in prompt.lower()
+    assert "skill content" not in prompt.lower()
+
+
+def test_plan_command_enters_without_installed_plan_skill(isolated_plan_mode, monkeypatch):
+    def forbidden_skill_loader(*args, **kwargs):
+        raise AssertionError("native Plan Mode must not load a skill")
+
+    monkeypatch.setattr(
+        "agent.skill_commands.build_skill_invocation_message",
+        forbidden_skill_loader,
+    )
+
+    result = plan_mode.handle_plan_command(
+        "session-no-plan-skill",
+        "inspect without a skill",
+        task_id="session-no-plan-skill",
+    )
+
+    assert result.action == "enter"
+    assert result.plan_mode == plan_mode.PLAN_MODE_PLAN
+    assert result.prompt is not None
+    assert "Native Plan Mode is active" in result.prompt
+    assert plan_mode.PlanModeManager("session-no-plan-skill").active
+
+
 def test_bare_plan_reports_status_when_already_active(isolated_plan_mode, monkeypatch):
     monkeypatch.setattr(plan_mode, "build_plan_prompt", lambda request, **_: "prompt")
     plan_mode.handle_plan_command("session-3", "first request")

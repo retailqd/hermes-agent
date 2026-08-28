@@ -285,26 +285,14 @@ class PlanModeManager:
 
 
 def build_plan_prompt(request: str, *, task_id: str = "") -> str:
-    """Load the existing bundled plan skill as a cache-safe user message."""
-    from agent.skill_commands import build_skill_invocation_message
+    """Build the self-contained prompt for native runtime Plan Mode.
 
-    runtime_note = (
-        "Native Plan Mode is active for this session. Runtime enforcement blocks "
-        "mutating and unknown tools even in YOLO mode. Use clarify for material "
-        "questions. You may inspect with read-only tools and save or revise the "
-        "plan only under the active workspace's .hermes/plans directory. End with "
-        "a decision-complete plan and tell the user to run /plan approve to execute "
-        "or /plan exit to leave without execution."
-    )
-    message = build_skill_invocation_message(
-        "/plan",
-        str(request or "").strip(),
-        task_id=task_id,
-        runtime_note=runtime_note,
-    )
-    if not message:
-        raise PlanModeUnavailable("The bundled plan skill could not be loaded.")
-    return message
+    ``task_id`` remains accepted for compatibility with existing CLI, gateway,
+    TUI, and ACP call sites, but native prompt rendering does not need it.
+    """
+    from hermes_cli.plan_prompt import render_native_plan_prompt
+
+    return render_native_plan_prompt(request)
 
 
 def handle_plan_command(session_id: str, args: str = "", *, task_id: str = "") -> PlanCommandResult:
