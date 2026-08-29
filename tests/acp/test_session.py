@@ -17,6 +17,19 @@ def _mock_agent():
     return MagicMock(name="MockAIAgent")
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"agent": {"max_turns": 0}, "max_turns": 50}, 0),
+        ({"agent": None, "max_turns": 40}, 40),
+        ({}, 90),
+        ({"agent": {"max_turns": "invalid"}}, 90),
+    ],
+)
+def test_configured_max_iterations_preserves_unlimited_and_precedence(config, expected):
+    assert acp_session._configured_max_iterations(config) == expected
+
+
 @pytest.fixture()
 def manager():
     """SessionManager with a mock agent factory (avoids needing API keys)."""
@@ -103,6 +116,7 @@ class TestCreateSession:
                     "default": "fake-model",
                     "provider": "fake-provider",
                 },
+                "agent": {"max_turns": 0},
                 "mcp_servers": {},
             },
         )
@@ -120,6 +134,7 @@ class TestCreateSession:
         state = SessionManager(db=None).create_session(cwd="/tmp/project")
 
         assert state.agent.session_cwd == "/tmp/project"
+        assert state.agent.kwargs["max_iterations"] == 0
 
 
 

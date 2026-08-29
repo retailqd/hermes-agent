@@ -137,6 +137,25 @@ def _register_task_cwd(task_id: str, cwd: str) -> None:
         logger.debug("Failed to register ACP task cwd override", exc_info=True)
 
 
+def _configured_max_iterations(config: dict[str, Any], default: int = 90) -> int:
+    """Resolve the ACP turn budget with the same config precedence as Hermes.
+
+    ACP constructs :class:`AIAgent` directly instead of going through the CLI
+    or TUI factories.  Passing no value here silently restores AIAgent's
+    90-iteration default, even when ``agent.max_turns`` is explicitly ``0``
+    (the supported unlimited sentinel) in config.yaml.
+    """
+    agent_config = config.get("agent") or {}
+    raw = agent_config.get("max_turns") if isinstance(agent_config, dict) else None
+    if raw is None:
+        raw = config.get("max_turns", default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid ACP max_turns=%r; using %d", raw, default)
+        return default
+
+
 def _expand_acp_enabled_toolsets(
     toolsets: List[str] | None = None,
     mcp_server_names: List[str] | None = None,
@@ -647,6 +666,7 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "max_iterations": _configured_max_iterations(config),
         }
 
         try:
