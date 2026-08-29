@@ -40,19 +40,17 @@ PLAN_EXECUTION_PROMPT_TEMPLATE = (
     "evidence, commit, push, and safe staging step in scope is actually done. "
     "Do not stop with a progress report or a list of ordinary pending work. "
     "Only a genuine high-impact owner decision may pause execution. End the "
-    "final response with exactly `<approved_plan_execution status=\"complete\" "
+    'final response with exactly `<approved_plan_execution status="complete" '
     "/>` only when the approved plan and its acceptance criteria are complete. "
     "If and only if a genuine high-impact owner decision blocks further safe "
     "progress, explain the exact decision and end with exactly "
-    "`<approved_plan_execution status=\"blocked\" />`."
+    '`<approved_plan_execution status="blocked" />`.'
 )
 
 APPROVED_PLAN_EXECUTION_COMPLETE_MARKER = (
     '<approved_plan_execution status="complete" />'
 )
-APPROVED_PLAN_EXECUTION_BLOCKED_MARKER = (
-    '<approved_plan_execution status="blocked" />'
-)
+APPROVED_PLAN_EXECUTION_BLOCKED_MARKER = '<approved_plan_execution status="blocked" />'
 APPROVED_PLAN_AUTO_CONTINUE_PROMPT = (
     "[Native approved plan execution auto-continuation]\n"
     "The preceding response stopped while ordinary approved work remained or "
@@ -822,43 +820,86 @@ def _normalize_plan_text(content: Any) -> str:
     return str(content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
-def _approved_plan_forbids_history_integration(state: PlanModeState) -> bool:
-    """Recognize an explicit reference-only history constraint in the artifact."""
+def _approved_plan_reference_only_history_refs(
+    state: PlanModeState,
+) -> tuple[str, ...] | None:
+    """Return refs covered by an explicit reference-only history constraint.
+
+    ``None`` means that the approved artifact contains no such constraint. An
+    empty tuple preserves the conservative behavior for a generic constraint
+    that does not identify any historical commit. Explicit commit hashes scope
+    the guard to those hashes so commits produced by the current execution can
+    still be integrated.
+    """
     path = str(state.plan_artifact_path or "").strip()
     if not path:
-        return False
+        return None
     try:
-        normalized = _normalize_plan_text(Path(path).expanduser().read_text(encoding="utf-8"))
+        normalized = _normalize_plan_text(
+            Path(path).expanduser().read_text(encoding="utf-8")
+        )
     except OSError:
-        return False
+        return None
     if state.plan_artifact_sha256:
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         if digest != state.plan_artifact_sha256:
-            return False
-    folded = (
-        normalized.casefold()
-        .replace("ê", "e")
-        .replace("é", "e")
-        .replace("ã", "a")
-        .replace("ç", "c")
-    )
-    for line in folded.splitlines():
-        mentions_history_action = "cherry-pick" in line or "merge" in line
+            return None
+    constrained_refs: list[str] = []
+    found_generic_constraint = False
+    for original_line in normalized.splitlines():
+        folded_line = (
+            original_line
+            .casefold()
+            .replace("ê", "e")
+            .replace("é", "e")
+            .replace("ã", "a")
+            .replace("ç", "c")
+        )
+        mentions_history_action = "cherry-pick" in folded_line or "merge" in folded_line
         marks_reference_only = (
-            "reference-only" in line
-            or "referencia" in line
-            or "reference" in line
+            "reference-only" in folded_line
+            or "referencia" in folded_line
+            or "reference" in folded_line
         ) and (
-            "not authorization" in line
-            or "nao autorizacao" in line
-            or "not branch" in line
-            or "nao branch" in line
-            or "must not" in line
-            or "nao deve" in line
+            "not authorization" in folded_line
+            or "nao autorizacao" in folded_line
+            or "not branch" in folded_line
+            or "nao branch" in folded_line
+            or "must not" in folded_line
+            or "nao deve" in folded_line
         )
         if mentions_history_action and marks_reference_only:
-            return True
-    return False
+            refs = re.findall(
+                r"(?i)(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])", original_line
+            )
+            if refs:
+                constrained_refs.extend(ref.casefold() for ref in refs)
+            else:
+                found_generic_constraint = True
+    if found_generic_constraint:
+        return ()
+    if constrained_refs:
+        return tuple(dict.fromkeys(constrained_refs))
+    return None
+
+
+def _history_command_targets_reference_only_ref(
+    command: str,
+    constrained_refs: tuple[str, ...],
+) -> bool:
+    """Return whether a history integration command targets a constrained ref."""
+    if not constrained_refs:
+        return True
+    command_refs = re.findall(
+        r"(?i)(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])",
+        command,
+    )
+    return any(
+        command_ref.casefold().startswith(constrained_ref)
+        or constrained_ref.startswith(command_ref.casefold())
+        for command_ref in command_refs
+        for constrained_ref in constrained_refs
+    )
 
 
 def _codex_plan_contract_gaps(body: str) -> list[str]:
@@ -1164,11 +1205,16 @@ def evaluate_plan_tool_call(
         state_unavailable = True
     if state.approved_build:
         command = str(payload.get("command") or "") if tool_name == "terminal" else ""
-        if command and _approved_plan_forbids_history_integration(state):
-            if re.search(
+        constrained_refs = _approved_plan_reference_only_history_refs(state)
+        if command and constrained_refs is not None:
+            is_history_integration = re.search(
                 r"(?im)(?:^|[\n;&|])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
                 r"git(?:\s+-\S+)*\s+(?:cherry-pick|merge)\b",
                 command,
+            )
+            if is_history_integration and _history_command_targets_reference_only_ref(
+                command,
+                constrained_refs,
             ):
                 return PlanToolDecision(
                     False,

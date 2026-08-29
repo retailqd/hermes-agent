@@ -431,14 +431,20 @@ Out of scope for v1: billing migrations and unrelated redesigns.
 
     assert manager.state.plan_artifact_count == 1
     assert manager.state.plan_artifact_path == ".hermes/plans/launch.md"
-    assert plan_mode.build_plan_completion_nudge(
-        manager.session_id,
-        "The plan is ready.",
-    ) is not None
-    assert plan_mode.build_plan_completion_nudge(
-        manager.session_id,
-        f"<proposed_plan>\n{plan_body}\n</proposed_plan>",
-    ) is None
+    assert (
+        plan_mode.build_plan_completion_nudge(
+            manager.session_id,
+            "The plan is ready.",
+        )
+        is not None
+    )
+    assert (
+        plan_mode.build_plan_completion_nudge(
+            manager.session_id,
+            f"<proposed_plan>\n{plan_body}\n</proposed_plan>",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -629,14 +635,20 @@ def test_plan_completion_does_not_swallow_the_required_question(
     manager = plan_mode.PlanModeManager("session-plan-question")
     manager.activate("plan the launch")
 
-    assert plan_mode.build_plan_completion_nudge(
-        manager.session_id,
-        "Which launch scope should we use?",
-    ) is None
-    assert plan_mode.build_plan_completion_nudge(
-        manager.session_id,
-        "<proposed_plan># Premature plan</proposed_plan>",
-    ) is not None
+    assert (
+        plan_mode.build_plan_completion_nudge(
+            manager.session_id,
+            "Which launch scope should we use?",
+        )
+        is None
+    )
+    assert (
+        plan_mode.build_plan_completion_nudge(
+            manager.session_id,
+            "<proposed_plan># Premature plan</proposed_plan>",
+        )
+        is not None
+    )
 
 
 def test_successful_plan_write_marks_native_plan_artifact(
@@ -672,6 +684,7 @@ def test_successful_plan_write_marks_native_plan_artifact(
         task_id=Agent.session_id,
     )
     assert manager.state.plan_artifact_count == 1
+
 
 def test_approval_releases_guard(isolated_plan_mode):
     manager = plan_mode.PlanModeManager("session-release")
@@ -881,6 +894,48 @@ def test_approved_plan_constraint_blocks_reference_only_cherry_pick(
     assert blocked.code == "approved_plan_reference_only_history"
     assert "git show" in blocked.message
     assert inspection.allowed
+
+
+def test_reference_only_guard_allows_current_plan_commits(
+    isolated_plan_mode,
+):
+    workspace = isolated_plan_mode
+    artifact = workspace / ".hermes" / "plans" / "plan.md"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    forbidden_sha = "4536200bfc682ac1a2a5e2fa566674fd91ed3b86"
+    body = (
+        "# Plan\n\n"
+        f"The historical connector at `{forbidden_sha}` is reference-only, "
+        "not authorization for merge or whole cherry-pick.\n"
+    )
+    artifact.write_text(body, encoding="utf-8")
+
+    manager = plan_mode.PlanModeManager("session-scoped-history-guard")
+    manager.activate("implement selectively")
+    manager.mark_plan_artifact_saved(str(artifact), body)
+    approval = manager.approve()
+    manager.begin_build(approval.approval_id)
+
+    own_commit = plan_mode.evaluate_plan_tool_call(
+        "session-scoped-history-guard",
+        "terminal",
+        {"command": "git cherry-pick ab469d6"},
+    )
+    own_branch = plan_mode.evaluate_plan_tool_call(
+        "session-scoped-history-guard",
+        "terminal",
+        {"command": "git merge --ff-only feat/shipping-20260829"},
+    )
+    historical_commit = plan_mode.evaluate_plan_tool_call(
+        "session-scoped-history-guard",
+        "terminal",
+        {"command": "git cherry-pick 4536200b"},
+    )
+
+    assert own_commit.allowed
+    assert own_branch.allowed
+    assert not historical_commit.allowed
+    assert historical_commit.code == "approved_plan_reference_only_history"
 
 
 def test_plan_exit_revokes_interrupted_approved_build_grant(isolated_plan_mode):
