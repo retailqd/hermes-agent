@@ -876,10 +876,10 @@ def _approved_plan_reference_only_history_refs(
                 constrained_refs.extend(ref.casefold() for ref in refs)
             else:
                 found_generic_constraint = True
-    if found_generic_constraint:
-        return ()
     if constrained_refs:
         return tuple(dict.fromkeys(constrained_refs))
+    if found_generic_constraint:
+        return ()
     return None
 
 

@@ -906,7 +906,9 @@ def test_reference_only_guard_allows_current_plan_commits(
     body = (
         "# Plan\n\n"
         f"The historical connector at `{forbidden_sha}` is reference-only, "
-        "not authorization for merge or whole cherry-pick.\n"
+        "not authorization for merge or whole cherry-pick.\n\n"
+        "## Plan Integrity\n\n"
+        "Historical code is reference, not authorization for whole cherry-pick.\n"
     )
     artifact.write_text(body, encoding="utf-8")
 
