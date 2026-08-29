@@ -502,3 +502,52 @@ async def test_acp_approved_build_high_impact_block_preserves_grant():
     rendered = "\n".join(str(update) for _sid, update in conn.updates)
     assert "production database migration" in rendered
     assert "approved_plan_execution" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_acp_blocked_attestation_with_admitted_ordinary_work_auto_continues():
+    acp_agent, state, fake, conn = make_agent_and_state()
+    manager = __import__(
+        "hermes_cli.plan_mode", fromlist=["PlanModeManager"]
+    ).PlanModeManager(state.session_id)
+    manager.activate("implement the whole approved plan before any real owner gate")
+    pending = manager.approve()
+    manager.begin_build(pending.approval_id)
+    calls = 0
+
+    def run_plan(**kwargs):
+        nonlocal calls
+        calls += 1
+        fake.runs.append(kwargs["user_message"])
+        if calls == 1:
+            final = (
+                "The tool limit interrupted this pass before full completion.\n"
+                "A real production credential gate exists, but I also did not do "
+                "the final commits, independent review, or mobile evidence.\n"
+                '<approved_plan_execution status="blocked" />'
+            )
+        else:
+            final = (
+                "All safe ordinary work is complete; only the production database "
+                "migration approval remains.\n"
+                '<approved_plan_execution status="blocked" />'
+            )
+        return {
+            "final_response": final,
+            "messages": [{"role": "assistant", "content": final}],
+        }
+
+    fake.run_conversation = run_plan
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="continue the approved plan")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert calls == 2
+    assert manager.state.approved_build
+    rendered = "\n".join(str(update) for _sid, update in conn.updates)
+    assert "tool limit interrupted" not in rendered
+    assert "production database migration approval remains" in rendered
+    assert "approved_plan_execution" not in rendered

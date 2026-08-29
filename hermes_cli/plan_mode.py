@@ -58,13 +58,39 @@ APPROVED_PLAN_AUTO_CONTINUE_PROMPT = (
     "The preceding response stopped while ordinary approved work remained or "
     "did not provide the required terminal attestation. Continue executing the "
     "same approved plan now. Do not return another progress handoff. Finish all "
-    "ordinary work and verification, or pause only at a genuine high-impact "
-    "owner decision using the required blocked attestation."
+    "ordinary work and verification first. A high-impact gate that coexists with "
+    "unfinished safe work is not terminal: complete the safe work before using "
+    "the required blocked attestation."
 )
 MAX_APPROVED_PLAN_AUTO_CONTINUATIONS = 8
 
 _APPROVED_PLAN_EXECUTION_MARKER_RE = re.compile(
     r'<approved_plan_execution\s+status=["\'](complete|blocked)["\']\s*/>',
+    re.IGNORECASE,
+)
+
+# A blocked attestation is terminal only after all safe ordinary work is done.
+# Models can correctly notice a credential/deploy gate while still admitting that
+# commits, review, tests, or evidence were skipped because a turn budget expired.
+# In that mixed state the runtime must continue instead of exposing a premature
+# handoff.  These patterns intentionally target explicit self-admissions rather
+# than generic words such as "pending" or "blocked", which also occur in valid
+# descriptions of the one remaining high-impact gate.
+_UNFINISHED_ORDINARY_WORK_RE = re.compile(
+    r"(?:"
+    r"(?:tool|iteration|turn|budget|operational|ferramenta|itera(?:ç|c)[aã]o|"
+    r"rodada|limite)[^\n.]{0,120}(?:interrupted|exhausted|esgotad|atingiu|"
+    r"interrompeu)[^\n.]{0,120}(?:before|antes d[ae])[^\n.]{0,80}"
+    r"(?:completion|conclus[aã]o|complete|concluir)"
+    r"|(?:ordinary (?:approved )?work|trabalho ordin[aá]rio)"
+    r"(?![^\n.]{0,40}(?:complete|done|conclu[ií]d|finalizad))"
+    r"[^\n.]{0,100}"
+    r"(?:remain|remaining|pending|resta|pendente)"
+    r"|(?:did not|didn't|have not|haven't|n[aã]o (?:fiz|foi feita|foram feitos?|"
+    r"conclu[ií]|executei|realizei))[^\n.]{0,180}"
+    r"(?:commit|push|review|revis[aã]o|capture|captura|evidence|evid[eê]ncia|"
+    r"test|teste|lint|build|typecheck|desktop|mobile|diff)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -153,7 +179,14 @@ def approved_plan_execution_status(response: Any) -> Optional[str]:
     matches = list(_APPROVED_PLAN_EXECUTION_MARKER_RE.finditer(response))
     if not matches:
         return None
-    return matches[-1].group(1).lower()
+    status = matches[-1].group(1).lower()
+    if status == "blocked" and _UNFINISHED_ORDINARY_WORK_RE.search(response):
+        logger.warning(
+            "Rejected blocked approved-plan attestation that admitted unfinished "
+            "ordinary work"
+        )
+        return None
+    return status
 
 
 def strip_approved_plan_execution_marker(response: Any) -> str:

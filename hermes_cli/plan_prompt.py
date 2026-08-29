@@ -109,6 +109,9 @@ Authoritative plan:
   explain that exact gate and end with exactly
   `<approved_plan_execution status="blocked" />`. Do not use the blocked marker for
   missing ordinary work, a failed test that can be fixed, or a progress checkpoint.
+  If a real high-impact gate coexists with unfinished commits, review, tests, evidence,
+  pushes, or other safe work, finish that ordinary work first; the blocked attestation
+  is not valid until only the exact high-impact decision remains.
 
 Current owner guidance:
 <user_message>
