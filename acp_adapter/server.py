@@ -1442,6 +1442,16 @@ class HermesACPAgent(acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
+        try:
+            from hermes_cli.plan_mode import APPROVED_PLAN_AUTO_CONTINUE_PROMPT
+
+            internal_approved_build_continuation = (
+                user_text == APPROVED_PLAN_AUTO_CONTINUE_PROMPT
+            )
+        except Exception:
+            internal_approved_build_continuation = False
+        if not internal_approved_build_continuation:
+            state.approved_build_auto_continuations = 0
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
@@ -1601,10 +1611,22 @@ class HermesACPAgent(acp.Agent):
 
         approved_build_id_at_turn_start = ""
         try:
-            from hermes_cli.plan_mode import PlanModeManager
+            from hermes_cli.plan_mode import (
+                PlanModeManager,
+                native_plan_execution_approval_id,
+            )
 
             initial_plan_state = PlanModeManager(state.session_id).state
             if initial_plan_state.approved_build:
+                approved_build_id_at_turn_start = initial_plan_state.approval_id
+            elif (
+                initial_plan_state.build_pending
+                and native_plan_execution_approval_id(user_text)
+                == initial_plan_state.approval_id
+            ):
+                # The private `/plan approve` kickoff becomes approved_build
+                # inside conversation_loop. Buffer and supervise it from this
+                # first execution turn, not only after an interrupt/resume.
                 approved_build_id_at_turn_start = initial_plan_state.approval_id
         except Exception:
             logger.debug(
@@ -1636,10 +1658,12 @@ class HermesACPAgent(acp.Agent):
             )
             message_cb = make_message_cb(conn, session_id, loop)
 
-            if native_plan_turn:
+            if native_plan_turn or approved_build_id_at_turn_start:
                 # A completed native plan is wrapped in <proposed_plan> for the
                 # runtime validator. Buffer it so ACP receives the same plain
                 # Markdown plan that Codex presents, without leaking the tags.
+                # Approved execution is also buffered so a premature progress
+                # handoff can be auto-continued instead of shown as completion.
                 stream_delta_cb = None
             else:
                 def stream_delta_cb(text: str) -> None:
@@ -1885,6 +1909,80 @@ class HermesACPAgent(acp.Agent):
                 result["response_transformed"] = True
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
+        approved_build_terminal_status = None
+        if approved_build_id_at_turn_start and final_response:
+            try:
+                from hermes_cli.plan_mode import (
+                    approved_plan_execution_status,
+                    strip_approved_plan_execution_marker,
+                )
+
+                approved_build_terminal_status = approved_plan_execution_status(
+                    final_response
+                )
+                cleaned_final_response = strip_approved_plan_execution_marker(
+                    final_response
+                )
+                if cleaned_final_response != final_response:
+                    final_response = cleaned_final_response
+                    result["final_response"] = cleaned_final_response
+            except Exception:
+                logger.warning(
+                    "Could not parse approved Plan Mode execution attestation",
+                    exc_info=True,
+                )
+
+        if (
+            approved_build_id_at_turn_start
+            and not interrupted
+            and approved_build_terminal_status is None
+        ):
+            try:
+                from hermes_cli.plan_mode import (
+                    APPROVED_PLAN_AUTO_CONTINUE_PROMPT,
+                    MAX_APPROVED_PLAN_AUTO_CONTINUATIONS,
+                )
+
+                state.approved_build_auto_continuations += 1
+                continuation_count = state.approved_build_auto_continuations
+                if continuation_count <= MAX_APPROVED_PLAN_AUTO_CONTINUATIONS:
+                    next_prompt = APPROVED_PLAN_AUTO_CONTINUE_PROMPT
+                    with state.runtime_lock:
+                        state.is_running = False
+                        state.current_prompt_text = ""
+                        if state.queued_prompts:
+                            next_prompt = state.queued_prompts.pop(0)
+                    logger.info(
+                        "Approved Plan Mode execution returned without terminal "
+                        "attestation; auto-continuing pass %s/%s on %s",
+                        continuation_count,
+                        MAX_APPROVED_PLAN_AUTO_CONTINUATIONS,
+                        session_id,
+                    )
+                    await self._send_usage_update(state)
+                    return await self.prompt(
+                        prompt=[TextContentBlock(type="text", text=next_prompt)],
+                        session_id=session_id,
+                    )
+                final_response = (
+                    final_response.rstrip()
+                    + "\n\nRuntime safety pause: the approved plan returned "
+                    + f"without a terminal attestation after {continuation_count} "
+                    + "continuation passes. The ordinary-edit grant remains active; "
+                    + "resume this same plan after inspecting the repeated stall."
+                )
+                result["final_response"] = final_response
+                logger.error(
+                    "Approved Plan Mode auto-continuation limit reached on %s",
+                    session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not auto-continue unfinished approved Plan Mode execution",
+                    exc_info=True,
+                )
+        elif approved_build_terminal_status in {"complete", "blocked"}:
+            state.approved_build_auto_continuations = 0
         # Hermes' local "waiting for model response" interrupt status is metadata,
         # not assistant prose — clients get cancellation from stop_reason instead.
         from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
@@ -1946,32 +2044,10 @@ class HermesACPAgent(acp.Agent):
                     # owner explicitly selected "Implement plan". Cancellation
                     # preserves the grant for the next continuation turn.
                     await self._send_usage_update(state)
-                    approval_id = ""
-                    response = None
-                    try:
-                        response = await self.prompt(
-                            prompt=[TextContentBlock(type="text", text="/plan approve")],
-                            session_id=session_id,
-                        )
-                        return response
-                    finally:
-                        try:
-                            from hermes_cli.plan_mode import PlanModeManager
-
-                            manager = PlanModeManager(session_id)
-                            approved_state = manager.state
-                            if (
-                                approved_state.approved_build
-                                and response is not None
-                                and response.stop_reason != "cancelled"
-                            ):
-                                approval_id = approved_state.approval_id
-                                manager.complete_build(approval_id)
-                        except Exception:
-                            logger.warning(
-                                "Could not close approved Plan Mode edit grant",
-                                exc_info=True,
-                            )
+                    return await self.prompt(
+                        prompt=[TextContentBlock(type="text", text="/plan approve")],
+                        session_id=session_id,
+                    )
             except Exception:
                 logger.warning(
                     "Native plan review handoff failed; Plan Mode remains active",
@@ -2009,7 +2085,11 @@ class HermesACPAgent(acp.Agent):
         await self._send_usage_update(state)
 
         stop_reason = "cancelled" if cancelled else "end_turn"
-        if approved_build_id_at_turn_start and stop_reason != "cancelled":
+        if (
+            approved_build_id_at_turn_start
+            and stop_reason != "cancelled"
+            and approved_build_terminal_status == "complete"
+        ):
             try:
                 from hermes_cli.plan_mode import PlanModeManager
 

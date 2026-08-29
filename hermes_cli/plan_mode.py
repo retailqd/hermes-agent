@@ -35,8 +35,37 @@ PLAN_EXECUTION_PROMPT_TEMPLATE = (
     "mutating when it is not already in context. Historical code marked as "
     "reference-only must be inspected with read-only commands such as `git "
     "show`; never merge or cherry-pick it as an implementation shortcut. "
-    "Reuse the plan and decisions already present in this conversation, "
-    "verify the work, and report the concrete result."
+    "Reuse the plan and decisions already present in this conversation and "
+    "continue autonomously until every ordinary implementation, test, review, "
+    "evidence, commit, push, and safe staging step in scope is actually done. "
+    "Do not stop with a progress report or a list of ordinary pending work. "
+    "Only a genuine high-impact owner decision may pause execution. End the "
+    "final response with exactly `<approved_plan_execution status=\"complete\" "
+    "/>` only when the approved plan and its acceptance criteria are complete. "
+    "If and only if a genuine high-impact owner decision blocks further safe "
+    "progress, explain the exact decision and end with exactly "
+    "`<approved_plan_execution status=\"blocked\" />`."
+)
+
+APPROVED_PLAN_EXECUTION_COMPLETE_MARKER = (
+    '<approved_plan_execution status="complete" />'
+)
+APPROVED_PLAN_EXECUTION_BLOCKED_MARKER = (
+    '<approved_plan_execution status="blocked" />'
+)
+APPROVED_PLAN_AUTO_CONTINUE_PROMPT = (
+    "[Native approved plan execution auto-continuation]\n"
+    "The preceding response stopped while ordinary approved work remained or "
+    "did not provide the required terminal attestation. Continue executing the "
+    "same approved plan now. Do not return another progress handoff. Finish all "
+    "ordinary work and verification, or pause only at a genuine high-impact "
+    "owner decision using the required blocked attestation."
+)
+MAX_APPROVED_PLAN_AUTO_CONTINUATIONS = 8
+
+_APPROVED_PLAN_EXECUTION_MARKER_RE = re.compile(
+    r'<approved_plan_execution\s+status=["\'](complete|blocked)["\']\s*/>',
+    re.IGNORECASE,
 )
 
 _READ_ONLY_TOOL_NAMES = frozenset({
@@ -115,6 +144,24 @@ class PlanModeUnavailable(RuntimeError):
 
 class PlanModeStateUnavailable(RuntimeError):
     """Raised when persisted mode state cannot be read safely."""
+
+
+def approved_plan_execution_status(response: Any) -> Optional[str]:
+    """Return the explicit approved-build terminal attestation, if present."""
+    if not isinstance(response, str):
+        return None
+    matches = list(_APPROVED_PLAN_EXECUTION_MARKER_RE.finditer(response))
+    if not matches:
+        return None
+    return matches[-1].group(1).lower()
+
+
+def strip_approved_plan_execution_marker(response: Any) -> str:
+    """Remove private execution attestations before rendering owner-facing prose."""
+    if not isinstance(response, str):
+        return ""
+    cleaned = _APPROVED_PLAN_EXECUTION_MARKER_RE.sub("", response)
+    return cleaned.rstrip()
 
 
 @dataclass

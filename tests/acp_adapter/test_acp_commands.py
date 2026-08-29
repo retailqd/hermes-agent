@@ -383,7 +383,10 @@ async def test_acp_cancelled_approved_build_keeps_grant_for_next_continuation(
             state.cancel_event.set()
             final = "interrupted while adding owner guidance"
         else:
-            final = "execution continuation complete"
+            final = (
+                "execution continuation complete\n"
+                '<approved_plan_execution status="complete" />'
+            )
         return {
             "final_response": final,
             "messages": [{"role": "assistant", "content": final}],
@@ -419,3 +422,83 @@ async def test_acp_cancelled_approved_build_keeps_grant_for_next_continuation(
     assert resumed.stop_reason == "end_turn"
     assert manager.state.last_action == "build_completed"
     assert not manager.state.approved_build
+
+
+@pytest.mark.asyncio
+async def test_acp_approved_build_auto_continues_until_explicit_completion():
+    acp_agent, state, fake, conn = make_agent_and_state()
+    manager = __import__(
+        "hermes_cli.plan_mode", fromlist=["PlanModeManager"]
+    ).PlanModeManager(state.session_id)
+    manager.activate("implement every ordinary step in the approved plan")
+    pending = manager.approve()
+    manager.begin_build(pending.approval_id)
+    calls = 0
+
+    def run_plan(**kwargs):
+        nonlocal calls
+        calls += 1
+        fake.runs.append(kwargs["user_message"])
+        if calls == 1:
+            final = "## Pending\n\nOrdinary implementation and tests remain."
+        else:
+            final = (
+                "All approved ordinary work and verification are complete.\n"
+                '<approved_plan_execution status="complete" />'
+            )
+        return {
+            "final_response": final,
+            "messages": [{"role": "assistant", "content": final}],
+        }
+
+    fake.run_conversation = run_plan
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="continue the approved plan")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert calls == 2
+    assert manager.state.last_action == "build_completed"
+    assert not manager.state.approved_build
+    rendered = "\n".join(str(update) for _sid, update in conn.updates)
+    assert "All approved ordinary work" in rendered
+    assert "Ordinary implementation and tests remain" not in rendered
+    assert "approved_plan_execution" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_acp_approved_build_high_impact_block_preserves_grant():
+    acp_agent, state, fake, conn = make_agent_and_state()
+    manager = __import__(
+        "hermes_cli.plan_mode", fromlist=["PlanModeManager"]
+    ).PlanModeManager(state.session_id)
+    manager.activate("implement the approved plan until a real owner gate")
+    pending = manager.approve()
+    manager.begin_build(pending.approval_id)
+
+    def run_plan(**kwargs):
+        fake.runs.append(kwargs["user_message"])
+        final = (
+            "Blocked only on the production database migration approval.\n"
+            '<approved_plan_execution status="blocked" />'
+        )
+        return {
+            "final_response": final,
+            "messages": [{"role": "assistant", "content": final}],
+        }
+
+    fake.run_conversation = run_plan
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="continue the approved plan")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert len(fake.runs) == 1
+    assert manager.state.approved_build
+    rendered = "\n".join(str(update) for _sid, update in conn.updates)
+    assert "production database migration" in rendered
+    assert "approved_plan_execution" not in rendered

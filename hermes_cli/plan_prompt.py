@@ -99,6 +99,16 @@ Authoritative plan:
   `git show`; it must not be merged or cherry-picked as an implementation shortcut.
 - Continue validating and implementing the approved plan. Do not ask the owner to
   approve ordinary workspace edits again.
+- Do not stop with a progress report, handoff, or ordinary pending-work list. Continue
+  autonomously through implementation, tests, review, evidence, scoped commits,
+  pushes, and safe staging work until the approved acceptance criteria are complete.
+- End the final response with exactly
+  `<approved_plan_execution status="complete" />` only after every ordinary plan
+  step and acceptance criterion is actually complete.
+- If and only if a genuine high-impact owner decision prevents further safe progress,
+  explain that exact gate and end with exactly
+  `<approved_plan_execution status="blocked" />`. Do not use the blocked marker for
+  missing ordinary work, a failed test that can be fixed, or a progress checkpoint.
 
 Current owner guidance:
 <user_message>

@@ -181,6 +181,7 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    approved_build_auto_continuations: int = 0
 
 
 class SessionManager:
