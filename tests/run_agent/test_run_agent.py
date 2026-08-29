@@ -3941,6 +3941,48 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_native_plan_completion_guard_continues_after_acknowledgement(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        acknowledgement = _mock_response(
+            content="Scope confirmed: complete store.",
+            finish_reason="stop",
+        )
+        completed_plan = _mock_response(
+            content=(
+                "<proposed_plan>\n# Launch plan\n\n"
+                "Implement the confirmed complete-store scope.\n"
+                "</proposed_plan>"
+            ),
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            acknowledgement,
+            completed_plan,
+        ]
+
+        with (
+            patch(
+                "hermes_cli.plan_mode.build_plan_completion_nudge",
+                side_effect=["Continue and finish the plan now.", None],
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue planning")
+
+        assert result["final_response"].startswith("<proposed_plan>")
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert agent.client.chat.completions.create.call_count == 2
+        assert not any(
+            message.get("_native_plan_completion_synthetic")
+            for message in result["messages"]
+            if isinstance(message, dict)
+        )
+
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
         agent.model = "qwen3.5:9b"

@@ -44,8 +44,38 @@ def test_plan_state_is_opt_in_and_persisted(isolated_plan_mode):
     assert not plan_mode.PlanModeManager("session-1").active
 
 
+def test_plan_state_database_opens_runtime_hermes_home(isolated_plan_mode, monkeypatch):
+    opened_with = []
+    sentinel = object()
+
+    def fake_session_db(db_path, **kwargs):
+        opened_with.append((db_path, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "sessions": {
+                "fts_trigram_enabled": False,
+                "wal_size_limit_mb": 256,
+            }
+        },
+    )
+    monkeypatch.setattr("hermes_state.SessionDB", fake_session_db)
+
+    assert plan_mode._get_session_db() is sentinel
+    assert opened_with == [
+        (
+            Path(os.environ["HERMES_HOME"]) / "state.db",
+            {"fts_trigram_enabled": False, "wal_size_limit_mb": 256},
+        )
+    ]
+
+
 def test_plan_command_requires_explicit_approval(isolated_plan_mode, monkeypatch):
-    monkeypatch.setattr(plan_mode, "build_plan_prompt", lambda request, **_: f"PLAN:{request}")
+    monkeypatch.setattr(
+        plan_mode, "build_plan_prompt", lambda request, **_: f"PLAN:{request}"
+    )
 
     entered = plan_mode.handle_plan_command("session-2", "add native mode")
     assert entered.action == "enter"
@@ -91,13 +121,28 @@ def test_build_plan_prompt_is_self_contained(monkeypatch):
     assert "Explore first, ask second" in prompt
     assert "impact times uncertainty" in prompt
     assert "clarify(questions=[...])" in prompt
+    assert "at least one resolved `clarify`" in prompt
+    assert "Do not load generic brainstorming or writing-plans skills" in prompt
     assert "<proposed_plan>" in prompt
+    assert "Do not stop after acknowledging a clarification answer" in prompt
+    assert "One resolved clarification is a minimum, not a quota" in prompt
+    assert "decision-closure audit" in prompt
+    assert "Before every plan-file write" in prompt
+    assert "Codex executive-summary contract" in prompt
+    assert "Decisões travadas:" in prompt
+    assert "Ficam fora da v1:" in prompt
+    assert "byte-for-byte equivalent" in prompt
+    assert "external provider" in prompt
+    assert "payment processor" in prompt
+    assert "Do not defer that choice to an implementation or launch gate" in prompt
     assert "1,200-2,500 words" in prompt
     assert "user has invoked" not in prompt.lower()
     assert "skill content" not in prompt.lower()
 
 
-def test_plan_command_enters_without_installed_plan_skill(isolated_plan_mode, monkeypatch):
+def test_plan_command_enters_without_installed_plan_skill(
+    isolated_plan_mode, monkeypatch
+):
     def forbidden_skill_loader(*args, **kwargs):
         raise AssertionError("native Plan Mode must not load a skill")
 
@@ -137,15 +182,72 @@ def test_control_verbs_reject_extra_arguments(isolated_plan_mode):
 def test_guard_allows_only_audited_read_only_tools(isolated_plan_mode):
     plan_mode.PlanModeManager("session-guard").activate("inspect first")
 
-    assert plan_mode.evaluate_plan_tool_call("session-guard", "read_file", {"path": "README.md"}).allowed
-    assert plan_mode.evaluate_plan_tool_call("session-guard", "clarify", {"question": "Choose?"}).allowed
+    assert plan_mode.evaluate_plan_tool_call(
+        "session-guard", "read_file", {"path": "README.md"}
+    ).allowed
+    assert plan_mode.evaluate_plan_tool_call(
+        "session-guard", "clarify", {"question": "Choose?"}
+    ).allowed
 
-    unknown = plan_mode.evaluate_plan_tool_call("session-guard", "custom_plugin_tool", {})
+    unknown = plan_mode.evaluate_plan_tool_call(
+        "session-guard", "custom_plugin_tool", {}
+    )
     assert not unknown.allowed
     assert unknown.code == "tool_not_read_only"
 
-    mutation = plan_mode.evaluate_plan_tool_call("session-guard", "delegate_task", {"task": "edit"})
+    mutation = plan_mode.evaluate_plan_tool_call(
+        "session-guard", "delegate_task", {"task": "edit"}
+    )
     assert not mutation.allowed
+
+
+def test_plan_guard_requires_structured_batches_for_selectable_clarifications(
+    isolated_plan_mode,
+):
+    plan_mode.PlanModeManager("session-structured-clarify").activate("plan launch")
+
+    legacy = plan_mode.evaluate_plan_tool_call(
+        "session-structured-clarify",
+        "clarify",
+        {
+            "question": "Which launch scope?",
+            "choices": ["Full store", "Catalog"],
+        },
+    )
+    structured = plan_mode.evaluate_plan_tool_call(
+        "session-structured-clarify",
+        "clarify",
+        {
+            "questions": [
+                {
+                    "id": "launch_scope",
+                    "header": "Scope",
+                    "question": "Which launch scope?",
+                    "options": [
+                        {
+                            "label": "Full store (Recommended)",
+                            "description": "Launch transactional checkout.",
+                        },
+                        {
+                            "label": "Catalog",
+                            "description": "Defer checkout.",
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+    open_ended = plan_mode.evaluate_plan_tool_call(
+        "session-structured-clarify",
+        "clarify",
+        {"question": "What legal constraint is not represented by fixed choices?"},
+    )
+
+    assert not legacy.allowed
+    assert legacy.code == "plan_structured_clarify_required"
+    assert "questions" in legacy.message
+    assert structured.allowed
+    assert open_ended.allowed
 
 
 def test_guard_normalizes_safe_git_and_rejects_shell_composition(isolated_plan_mode):
@@ -175,13 +277,28 @@ def test_guard_normalizes_safe_git_and_rejects_shell_composition(isolated_plan_m
         "git ls-files -m",
         "git ls-files --modified",
     ):
-        blocked = plan_mode.evaluate_plan_tool_call("session-git", "terminal", {"command": command})
+        blocked = plan_mode.evaluate_plan_tool_call(
+            "session-git", "terminal", {"command": command}
+        )
         assert not blocked.allowed, command
         assert blocked.code == "terminal_not_read_only"
 
 
 def test_guard_limits_plan_file_writes_to_workspace(isolated_plan_mode):
-    plan_mode.PlanModeManager("session-files").activate("write plan")
+    manager = plan_mode.PlanModeManager("session-files")
+    manager.activate("write plan")
+
+    premature = plan_mode.evaluate_plan_tool_call(
+        "session-files",
+        "write_file",
+        {"path": ".hermes/plans/change.md", "content": "# Plan"},
+        task_id="session-files",
+    )
+    assert not premature.allowed
+    assert premature.code == "plan_clarification_required"
+
+    clarified = manager.mark_clarified()
+    assert clarified.clarification_count == 1
 
     allowed = plan_mode.evaluate_plan_tool_call(
         "session-files",
@@ -209,17 +326,368 @@ def test_guard_limits_plan_file_writes_to_workspace(isolated_plan_mode):
     assert not traversal.allowed
 
 
+def test_explicit_no_questions_request_can_save_plan_without_clarify(
+    isolated_plan_mode,
+):
+    plan_mode.PlanModeManager("session-no-questions").activate(
+        "Use the documented defaults and do not ask questions"
+    )
+
+    decision = plan_mode.evaluate_plan_tool_call(
+        "session-no-questions",
+        "write_file",
+        {"path": ".hermes/plans/explicit.md", "content": "# Plan"},
+        task_id="session-no-questions",
+    )
+
+    assert decision.allowed
+    assert decision.code == "plan_file_write"
+
+
+def test_new_plan_request_resets_clarification_checkpoint(isolated_plan_mode):
+    manager = plan_mode.PlanModeManager("session-reset-clarify")
+    manager.activate("first plan")
+    manager.mark_clarified()
+    assert manager.state.clarification_count == 1
+
+    manager.activate("second plan")
+
+    assert manager.state.clarification_count == 0
+
+
+def test_successful_clarify_result_marks_native_plan_state(isolated_plan_mode):
+    from agent.tool_executor import _record_native_plan_clarification
+
+    class Agent:
+        session_id = "session-clarify-result"
+
+    manager = plan_mode.PlanModeManager(Agent.session_id)
+    manager.activate("ask before saving")
+
+    assert _record_native_plan_clarification(
+        Agent(),
+        '{"answers":{"launch_scope":{"answers":["Etapas"]}}}',
+    )
+    assert manager.state.clarification_count == 1
+
+    assert not _record_native_plan_clarification(
+        Agent(),
+        '{"error":"Question was dismissed"}',
+    )
+    assert manager.state.clarification_count == 1
+
+
+def test_plan_completion_cannot_stop_at_post_clarify_acknowledgement(
+    isolated_plan_mode,
+):
+    manager = plan_mode.PlanModeManager("session-plan-completion")
+    manager.activate("plan the launch")
+    manager.mark_clarified()
+
+    nudge = plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        "Scope confirmed: complete store.",
+    )
+
+    assert nudge is not None
+    assert "do not stop at an acknowledgement" in nudge.lower()
+    assert "save" in nudge.lower()
+
+
+def test_plan_completion_requires_saved_artifact_and_exact_block(
+    isolated_plan_mode,
+):
+    manager = plan_mode.PlanModeManager("session-plan-artifact")
+    manager.activate("plan the launch")
+    manager.mark_clarified()
+
+    plan_body = """# Launch plan
+
+## Summary
+
+Ship the validated launch safely.
+
+Locked decisions:
+
+- Use the existing application stack.
+
+Out of scope for v1: billing migrations and unrelated redesigns.
+
+## Implementation plan
+
+1. Add the guarded launch path.
+
+## Tests and acceptance criteria
+
+- The production smoke test passes.
+
+## Alocação de modelos
+
+| Trabalho | Modelo | Esforço | Finalidade | Motivo de eficiência | Gatilho de escalada |
+|---|---|---|---|---|---|
+| Executar o plano | gpt-5.6-sol | xhigh | Implementação e validação | Um agente mantém o contexto | Escalar se houver bloqueio externo |
+"""
+    manager.mark_plan_artifact_saved(".hermes/plans/launch.md", plan_body)
+
+    assert manager.state.plan_artifact_count == 1
+    assert manager.state.plan_artifact_path == ".hermes/plans/launch.md"
+    assert plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        "The plan is ready.",
+    ) is not None
+    assert plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        f"<proposed_plan>\n{plan_body}\n</proposed_plan>",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            """# Launch plan
+
+Locked decisions:
+
+- Keep the current stack.
+
+Out of scope for v1: unrelated work.
+
+## Implementation plan
+
+1. Ship it.
+
+## Tests and acceptance criteria
+
+- Smoke test passes.
+""",
+            "summary",
+        ),
+        (
+            """# Launch plan
+
+## Summary
+
+Ship it safely.
+
+Out of scope for v1: unrelated work.
+
+## Implementation plan
+
+1. Ship it.
+
+## Tests and acceptance criteria
+
+- Smoke test passes.
+""",
+            "locked decisions",
+        ),
+        (
+            """# Launch plan
+
+## Summary
+
+Ship it safely.
+
+Locked decisions:
+
+- Keep the current stack.
+
+## Implementation plan
+
+1. Ship it.
+
+## Tests and acceptance criteria
+
+- Smoke test passes.
+""",
+            "out-of-scope",
+        ),
+        (
+            """# Launch plan
+
+## Summary
+
+Ship it safely.
+
+Locked decisions:
+
+- Keep the current stack.
+
+Out of scope for v1: unrelated work.
+
+## Tests and acceptance criteria
+
+- Smoke test passes.
+""",
+            "implementation",
+        ),
+        (
+            """# Launch plan
+
+## Summary
+
+Ship it safely.
+
+Locked decisions:
+
+- Keep the current stack.
+
+Out of scope for v1: unrelated work.
+
+## Implementation plan
+
+1. Ship it.
+""",
+            "acceptance",
+        ),
+        (
+            """# Launch plan
+
+## Summary
+
+Ship it safely.
+
+Locked decisions:
+
+- Keep the current stack.
+
+Out of scope for v1: unrelated work.
+
+## Implementation plan
+
+1. Ship it.
+
+## Tests and acceptance criteria
+
+- Smoke test passes.
+""",
+            "alocação de modelos",
+        ),
+    ],
+)
+def test_plan_completion_enforces_codex_executive_summary_contract(
+    isolated_plan_mode,
+    body,
+    expected,
+):
+    manager = plan_mode.PlanModeManager(f"session-missing-{expected}")
+    manager.activate("plan the launch")
+    manager.mark_clarified()
+    manager.mark_plan_artifact_saved(".hermes/plans/launch.md", body)
+
+    nudge = plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        f"<proposed_plan>\n{body}\n</proposed_plan>",
+    )
+
+    assert nudge is not None
+    assert expected in nudge.lower()
+
+
+def test_plan_completion_requires_the_rendered_plan_to_match_saved_artifact(
+    isolated_plan_mode,
+):
+    manager = plan_mode.PlanModeManager("session-plan-mismatch")
+    manager.activate("plan the launch")
+    manager.mark_clarified()
+    saved = """# Launch plan
+
+## Summary
+
+Ship version A.
+
+Locked decisions:
+
+- Keep the current stack.
+
+Out of scope for v1: unrelated work.
+
+## Implementation plan
+
+1. Ship A.
+
+## Tests and acceptance criteria
+
+- Smoke test passes.
+"""
+    rendered = saved.replace("Ship version A.", "Ship version B.")
+    manager.mark_plan_artifact_saved(".hermes/plans/launch.md", saved)
+
+    nudge = plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        f"<proposed_plan>\n{rendered}\n</proposed_plan>",
+    )
+
+    assert nudge is not None
+    assert "match the saved plan" in nudge.lower()
+
+
+def test_plan_completion_does_not_swallow_the_required_question(
+    isolated_plan_mode,
+):
+    manager = plan_mode.PlanModeManager("session-plan-question")
+    manager.activate("plan the launch")
+
+    assert plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        "Which launch scope should we use?",
+    ) is None
+    assert plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        "<proposed_plan># Premature plan</proposed_plan>",
+    ) is not None
+
+
+def test_successful_plan_write_marks_native_plan_artifact(
+    isolated_plan_mode,
+):
+    from agent.tool_executor import _record_native_plan_artifact
+
+    class Agent:
+        session_id = "session-plan-write"
+
+    plan_dir = isolated_plan_mode / ".hermes" / "plans"
+    plan_dir.mkdir(parents=True)
+    manager = plan_mode.PlanModeManager(Agent.session_id)
+    manager.activate("plan the launch")
+    manager.mark_clarified()
+
+    assert _record_native_plan_artifact(
+        Agent(),
+        function_name="write_file",
+        function_args={"path": ".hermes/plans/launch.md", "content": "# Plan"},
+        function_result="Successfully wrote plan.",
+        is_error=False,
+        task_id=Agent.session_id,
+    )
+    assert manager.state.plan_artifact_count == 1
+
+    assert not _record_native_plan_artifact(
+        Agent(),
+        function_name="patch",
+        function_args={"path": ".hermes/plans/launch.md", "mode": "replace"},
+        function_result="Error applying patch",
+        is_error=True,
+        task_id=Agent.session_id,
+    )
+    assert manager.state.plan_artifact_count == 1
+
 def test_approval_releases_guard(isolated_plan_mode):
     manager = plan_mode.PlanModeManager("session-release")
     manager.activate("then execute")
-    assert not plan_mode.evaluate_plan_tool_call("session-release", "terminal", {"command": "make build"}).allowed
+    assert not plan_mode.evaluate_plan_tool_call(
+        "session-release", "terminal", {"command": "make build"}
+    ).allowed
 
     approved = manager.approve()
     assert not plan_mode.evaluate_plan_tool_call(
         "session-release", "terminal", {"command": "make build"}
     ).allowed
     manager.begin_build(approved.approval_id)
-    assert plan_mode.evaluate_plan_tool_call("session-release", "terminal", {"command": "make build"}).allowed
+    assert plan_mode.evaluate_plan_tool_call(
+        "session-release", "terminal", {"command": "make build"}
+    ).allowed
 
 
 def test_runtime_consumes_only_exact_nonce_bound_approval_turn(isolated_plan_mode):
@@ -282,6 +750,51 @@ def test_later_plan_turn_reinjects_full_contract(isolated_plan_mode):
     assert persisted == "Prefer option B"
 
 
+def test_inactive_plan_preserves_multimodal_user_message(isolated_plan_mode):
+    """Normal image turns must not be flattened by the Plan Mode prologue."""
+    from agent.conversation_loop import _prepare_native_plan_turn
+
+    class Agent:
+        session_id = "session-normal-multimodal"
+
+    original = [
+        {"type": "text", "text": "Read this screenshot"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,VALIDIMAGE"},
+        },
+    ]
+
+    prepared, persisted = _prepare_native_plan_turn(Agent(), original, None)
+
+    assert prepared is original
+    assert persisted is None
+
+
+def test_later_plan_turn_preserves_multimodal_parts(isolated_plan_mode):
+    from agent.conversation_loop import _prepare_native_plan_turn
+
+    class Agent:
+        session_id = "session-multimodal-reminder"
+
+    data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
+    original = [
+        {"type": "text", "text": "Use this screenshot"},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    plan_mode.PlanModeManager(Agent.session_id).activate("audit the screenshot")
+
+    prepared, persisted = _prepare_native_plan_turn(Agent(), original, None)
+
+    assert isinstance(prepared, list)
+    assert prepared[0]["type"] == "text"
+    assert "Use this screenshot" in prepared[0]["text"]
+    assert "Explore first, ask second" in prepared[0]["text"]
+    assert prepared[1] == original[1]
+    assert data_url not in prepared[0]["text"]
+    assert persisted is original
+
+
 def test_repeated_approval_is_idempotent_while_kickoff_pending(isolated_plan_mode):
     manager = plan_mode.PlanModeManager("session-approval-retry")
     manager.activate("retry safely")
@@ -289,6 +802,23 @@ def test_repeated_approval_is_idempotent_while_kickoff_pending(isolated_plan_mod
     second = manager.approve()
     assert second.approval_id == first.approval_id
     assert second.build_pending
+
+
+def test_approved_build_grant_is_scoped_to_the_exact_execution_turn(
+    isolated_plan_mode,
+):
+    manager = plan_mode.PlanModeManager("session-approved-build")
+    manager.activate("build safely")
+    approval = manager.approve()
+
+    started = manager.begin_build(approval.approval_id)
+    assert started.approved_build
+
+    completed = manager.complete_build(approval.approval_id)
+    assert completed.mode == plan_mode.PLAN_MODE_BUILD
+    assert not completed.approved_build
+    assert completed.approval_id == ""
+    assert completed.last_action == "build_completed"
 
 
 def test_concurrent_approvals_converge_on_one_nonce(isolated_plan_mode):
@@ -385,7 +915,9 @@ def test_agent_executor_dispatch_guard_uses_session_state(isolated_plan_mode):
 def test_plan_state_migrates_across_session_rotation(isolated_plan_mode):
     plan_mode.PlanModeManager("old-session").activate("long plan")
 
-    assert plan_mode.migrate_plan_mode_to_session("old-session", "new-session", reason="compression")
+    assert plan_mode.migrate_plan_mode_to_session(
+        "old-session", "new-session", reason="compression"
+    )
     assert plan_mode.PlanModeManager("new-session").active
     assert plan_mode.PlanModeManager("new-session").state.request == "long plan"
     assert not plan_mode.PlanModeManager("old-session").active
@@ -445,7 +977,9 @@ def test_corrupt_persisted_state_fails_closed(isolated_plan_mode):
     assert not decision.allowed
 
 
-def test_executor_guard_unexpected_error_is_never_fail_open(isolated_plan_mode, monkeypatch):
+def test_executor_guard_unexpected_error_is_never_fail_open(
+    isolated_plan_mode, monkeypatch
+):
     from agent.tool_executor import _apply_native_plan_guard
 
     class Agent:
@@ -486,16 +1020,26 @@ def test_audited_git_diff_never_executes_textconv(isolated_plan_mode):
     workspace = isolated_plan_mode
     marker = workspace / "textconv-executed"
     driver = workspace / "evil-textconv.sh"
-    driver.write_text(f"#!/bin/sh\ntouch {marker}\ncat \"$1\"\n", encoding="utf-8")
+    driver.write_text(f'#!/bin/sh\ntouch {marker}\ncat "$1"\n', encoding="utf-8")
     driver.chmod(0o755)
     (workspace / ".gitattributes").write_text("*.bin diff=evil\n", encoding="utf-8")
     target = workspace / "sample.bin"
     target.write_text("before\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=workspace, check=True)
-    subprocess.run(["git", "config", "user.name", "Plan Test"], cwd=workspace, check=True)
-    subprocess.run(["git", "config", "diff.evil.textconv", str(driver)], cwd=workspace, check=True)
-    subprocess.run(["git", "add", ".gitattributes", "sample.bin"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=workspace,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Plan Test"], cwd=workspace, check=True
+    )
+    subprocess.run(
+        ["git", "config", "diff.evil.textconv", str(driver)], cwd=workspace, check=True
+    )
+    subprocess.run(
+        ["git", "add", ".gitattributes", "sample.bin"], cwd=workspace, check=True
+    )
     subprocess.run(["git", "commit", "-qm", "fixture"], cwd=workspace, check=True)
     target.write_text("after\n", encoding="utf-8")
     subprocess.run(["/usr/bin/git", "add", "sample.bin"], cwd=workspace, check=True)
@@ -540,11 +1084,27 @@ def test_audited_git_diff_never_executes_clean_filter(isolated_plan_mode):
     target = workspace / "sample.txt"
     target.write_text("before\n", encoding="utf-8")
     subprocess.run(["/usr/bin/git", "init", "-q"], cwd=workspace, check=True)
-    subprocess.run(["/usr/bin/git", "config", "user.email", "test@example.invalid"], cwd=workspace, check=True)
-    subprocess.run(["/usr/bin/git", "config", "user.name", "Plan Test"], cwd=workspace, check=True)
-    subprocess.run(["/usr/bin/git", "config", "filter.evil.clean", str(driver)], cwd=workspace, check=True)
-    subprocess.run(["/usr/bin/git", "add", ".gitattributes", "sample.txt"], cwd=workspace, check=True)
-    subprocess.run(["/usr/bin/git", "commit", "-qm", "fixture"], cwd=workspace, check=True)
+    subprocess.run(
+        ["/usr/bin/git", "config", "user.email", "test@example.invalid"],
+        cwd=workspace,
+        check=True,
+    )
+    subprocess.run(
+        ["/usr/bin/git", "config", "user.name", "Plan Test"], cwd=workspace, check=True
+    )
+    subprocess.run(
+        ["/usr/bin/git", "config", "filter.evil.clean", str(driver)],
+        cwd=workspace,
+        check=True,
+    )
+    subprocess.run(
+        ["/usr/bin/git", "add", ".gitattributes", "sample.txt"],
+        cwd=workspace,
+        check=True,
+    )
+    subprocess.run(
+        ["/usr/bin/git", "commit", "-qm", "fixture"], cwd=workspace, check=True
+    )
     marker.unlink(missing_ok=True)
     target.write_text("after\n", encoding="utf-8")
     subprocess.run(["/usr/bin/git", "add", "sample.txt"], cwd=workspace, check=True)
@@ -577,7 +1137,9 @@ def test_audited_git_diff_never_executes_clean_filter(isolated_plan_mode):
     assert not worktree_diff.allowed
 
 
-def test_audited_terminal_ignores_hostile_path_wrappers(isolated_plan_mode, monkeypatch):
+def test_audited_terminal_ignores_hostile_path_wrappers(
+    isolated_plan_mode, monkeypatch
+):
     workspace = isolated_plan_mode
     marker = workspace / "hostile-git-ran"
     hostile_bin = workspace / "hostile-bin"
@@ -662,8 +1224,7 @@ def test_audited_terminal_clears_inherited_dynamic_loader_hooks(isolated_plan_mo
     )
     assert decision.allowed
     command = (
-        f"export LD_PRELOAD={shlex.quote(str(library))}; "
-        f"{decision.args['command']}"
+        f"export LD_PRELOAD={shlex.quote(str(library))}; {decision.args['command']}"
     )
     completed = subprocess.run(
         ["/bin/bash", "-c", command],

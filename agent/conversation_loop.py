@@ -32,6 +32,7 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.message_content import flatten_message_text, replace_message_text
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
@@ -522,9 +523,9 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
 
 def _prepare_native_plan_turn(
     agent,
-    user_message: str,
-    persist_user_message: Optional[str],
-) -> tuple[str, Optional[str]]:
+    user_message: Any,
+    persist_user_message: Optional[Any],
+) -> tuple[Any, Optional[Any]]:
     """Apply the nonce-bound approval or reinject the full PLAN contract."""
     from hermes_cli.plan_mode import (
         PlanModeManager,
@@ -539,7 +540,7 @@ def _prepare_native_plan_turn(
 
     manager = PlanModeManager(getattr(agent, "session_id", "") or "")
     state = manager.state
-    raw_user_message = str(user_message or "")
+    raw_user_message = flatten_message_text(user_message)
     envelope_approval_id = native_plan_execution_approval_id(raw_user_message)
     approval_prompt = (
         build_plan_execution_prompt(state.approval_id)
@@ -557,21 +558,22 @@ def _prepare_native_plan_turn(
     if state.active and raw_user_message != render_native_plan_prompt(state.request):
         if persist_user_message is None:
             persist_user_message = user_message
-        return (
-            render_native_plan_turn_reminder(state.request, raw_user_message),
-            persist_user_message,
-        )
-    return raw_user_message, persist_user_message
+        reminder = render_native_plan_turn_reminder(state.request, raw_user_message)
+        return replace_message_text(user_message, reminder), persist_user_message
+    # Outside an active Plan Mode turn, this prologue must be a true no-op.
+    # Returning the flattened text here silently discarded image/audio parts
+    # from every normal multimodal message before the provider request.
+    return user_message, persist_user_message
 
 
 def run_conversation(
     agent,
-    user_message: str,
+    user_message: Any,
     system_message: str = None,
     conversation_history: List[Dict[str, Any]] = None,
     task_id: str = None,
     stream_callback: Optional[callable] = None,
-    persist_user_message: Optional[str] = None,
+    persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -579,7 +581,7 @@ def run_conversation(
     Run a complete conversation with tool calling until completion.
 
     Args:
-        user_message (str): The user's message/question
+        user_message: The user's text or structured multimodal message.
         system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
         conversation_history (List[Dict]): Previous conversation messages (optional)
         task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
@@ -668,6 +670,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    native_plan_completion_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -5198,9 +5201,69 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_native_plan_completion_synthetic")
                     )
                 ):
                     messages.pop()
+
+                try:
+                    from hermes_cli.plan_mode import build_plan_completion_nudge
+
+                    _plan_completion_nudge = build_plan_completion_nudge(
+                        getattr(agent, "session_id", "") or "",
+                        final_response,
+                    )
+                except Exception:
+                    logger.warning(
+                        "native Plan Mode completion validation unavailable",
+                        exc_info=True,
+                    )
+                    _plan_completion_nudge = None
+
+                if _plan_completion_nudge and native_plan_completion_continuations < 3:
+                    native_plan_completion_continuations += 1
+                    final_msg["finish_reason"] = "plan_completion_required"
+                    final_msg["_native_plan_completion_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _plan_completion_nudge,
+                        "_native_plan_completion_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.warning(
+                        "native Plan Mode blocked an incomplete final response "
+                        "and requested continuation (%d/3)",
+                        native_plan_completion_continuations,
+                    )
+                    continue
+
+                if _plan_completion_nudge:
+                    messages[:] = [
+                        message
+                        for message in messages
+                        if not (
+                            isinstance(message, dict)
+                            and message.get("_native_plan_completion_synthetic")
+                        )
+                    ]
+                    final_response = (
+                        "Plan Mode could not produce a valid saved plan after "
+                        "3 automatic continuation attempts. Nothing was executed; "
+                        "the session remains in PLAN mode."
+                    )
+                    final_msg["content"] = final_response
+                    final_msg["finish_reason"] = "plan_completion_failed"
+                else:
+                    native_plan_completion_continuations = 0
+                    messages[:] = [
+                        message
+                        for message in messages
+                        if not (
+                            isinstance(message, dict)
+                            and message.get("_native_plan_completion_synthetic")
+                        )
+                    ]
 
                 try:
                     from agent.verification_stop import (

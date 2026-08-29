@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import os
 import re
 from dataclasses import dataclass
@@ -335,4 +336,15 @@ def _finalize(data: bytes, declared_mime: str, origin: str, src: str) -> Resolve
             # only ingest raster images).
             return ResolvedImage(data=data, mime="image/svg+xml", origin=origin)
         raise NotAnImage("source is not a recognized image", src=src, origin=origin)
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+    except Exception as exc:
+        raise NotAnImage(
+            f"source is an incomplete or corrupt image: {exc}",
+            src=src,
+            origin=origin,
+        ) from exc
     return ResolvedImage(data=data, mime=sniffed, origin=origin)

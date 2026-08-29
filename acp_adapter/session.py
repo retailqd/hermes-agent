@@ -413,8 +413,19 @@ class SessionManager:
             return self._db_instance
         try:
             from hermes_state import SessionDB
+            from hermes_cli.config import load_config
+
             hermes_home = get_hermes_home()
-            self._db_instance = SessionDB(db_path=hermes_home / "state.db")
+            sessions_config = load_config().get("sessions") or {}
+            self._db_instance = SessionDB(
+                db_path=hermes_home / "state.db",
+                fts_trigram_enabled=bool(
+                    sessions_config.get("fts_trigram_enabled", True)
+                ),
+                wal_size_limit_mb=int(
+                    sessions_config.get("wal_size_limit_mb", 0) or 0
+                ),
+            )
             return self._db_instance
         except Exception:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)

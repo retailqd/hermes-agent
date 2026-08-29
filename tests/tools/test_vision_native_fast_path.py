@@ -132,6 +132,17 @@ class TestVisionAnalyzeNative:
         assert parsed.get("success") is False
         assert "image_url is required" in parsed.get("error", "")
 
+    def test_truncated_png_data_url_is_rejected_before_provider_history(self):
+        truncated = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAACyAAAAaaCAYAAACI2viZ"
+        result = asyncio.get_event_loop().run_until_complete(
+            _vision_analyze_native(truncated, "read it")
+        )
+
+        assert isinstance(result, str)
+        parsed = json.loads(result)
+        assert parsed.get("success") is False
+        assert "incomplete or corrupt image" in parsed.get("error", "")
+
     def test_file_url_scheme_resolves(self, tmp_path):
         img = tmp_path / "t.png"
         img.write_bytes(_TINY_PNG)

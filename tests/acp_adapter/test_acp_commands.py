@@ -258,3 +258,103 @@ async def test_acp_plan_approval_is_rejected_mid_turn():
     assert response.stop_reason == "end_turn"
     assert fake.runs == []
     assert any("Only /plan status" in str(update) for _sid, update in conn.updates)
+
+
+@pytest.mark.asyncio
+async def test_acp_completed_plan_matches_codex_plain_markdown_and_opens_review(
+    monkeypatch,
+):
+    acp_agent, state, fake, conn = make_agent_and_state()
+    plan = """# Launch plan
+
+## Summary
+
+Ship the launch safely.
+"""
+
+    def run_plan(**kwargs):
+        fake.runs.append(kwargs["user_message"])
+        final = f"<proposed_plan>\n{plan}\n</proposed_plan>"
+        return {
+            "final_response": final,
+            "messages": [{"role": "assistant", "content": final}],
+        }
+
+    fake.run_conversation = run_plan
+    captured = []
+
+    async def reject_review(_conn, session_id, plan_text):
+        captured.append((session_id, plan_text))
+        return False
+
+    monkeypatch.setattr(
+        "acp_adapter.plan_review.native_plan_is_active",
+        lambda _session_id: True,
+    )
+    monkeypatch.setattr(
+        "acp_adapter.plan_review.request_plan_review",
+        reject_review,
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="continue the plan")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert captured == [(state.session_id, plan.strip())]
+    rendered = "\n".join(str(update) for _sid, update in conn.updates)
+    assert "# Launch plan" in rendered
+    assert "<proposed_plan>" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_acp_plan_review_approval_executes_through_nonce_bound_plan_command(
+    monkeypatch,
+):
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    calls = 0
+
+    def run_plan(**kwargs):
+        nonlocal calls
+        calls += 1
+        fake.runs.append(kwargs["user_message"])
+        if calls == 1:
+            final = "<proposed_plan>\n# Approved plan\n</proposed_plan>"
+        else:
+            final = "execution complete"
+        return {
+            "final_response": final,
+            "messages": [{"role": "assistant", "content": final}],
+        }
+
+    fake.run_conversation = run_plan
+
+    async def approve_review(_conn, _session_id, _plan_text):
+        return True
+
+    monkeypatch.setattr(
+        "acp_adapter.plan_review.native_plan_is_active",
+        lambda _session_id: calls == 0,
+    )
+    monkeypatch.setattr(
+        "acp_adapter.plan_review.request_plan_review",
+        approve_review,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plan_mode.handle_plan_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            action="approve",
+            plan_mode="plan",
+            message="Plan approved.",
+            prompt="hidden nonce-bound execution prompt",
+        ),
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="continue the plan")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == ["continue the plan", "hidden nonce-bound execution prompt"]

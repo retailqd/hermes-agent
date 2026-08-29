@@ -31,7 +31,7 @@ def make_acp_clarify_callback(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 300.0,
+    timeout: float | None = None,
 ) -> Callable[[str, Sequence[str] | None], str]:
     """Return a synchronous clarify callback backed by ACP request_permission.
 

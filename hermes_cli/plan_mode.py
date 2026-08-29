@@ -8,8 +8,10 @@ entering or leaving the mode never invalidates provider prompt caches.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import re
 import shlex
 import threading
 import time
@@ -32,59 +34,53 @@ PLAN_EXECUTION_PROMPT_TEMPLATE = (
     "and report the concrete result."
 )
 
-_READ_ONLY_TOOL_NAMES = frozenset(
-    {
-        "browser_get_images",
-        "browser_snapshot",
-        "browser_vision",
-        "clarify",
-        "ha_get_state",
-        "ha_list_entities",
-        "ha_list_services",
-        "mcp_filesystem_directory_tree",
-        "mcp_filesystem_get_file_info",
-        "mcp_filesystem_list_directory",
-        "mcp_filesystem_list_directory_with_sizes",
-        "mcp_filesystem_read_file",
-        "mcp_filesystem_read_multiple_files",
-        "mcp_filesystem_read_text_file",
-        "mcp_filesystem_search_files",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_grep",
-        "read_file",
-        "read_terminal",
-        "search_files",
-        "session_search",
-        "skill_view",
-        "skills_list",
-        "tool_describe",
-        "tool_search",
-        "vision_analyze",
-        "web_extract",
-        "web_search",
-    }
-)
+_READ_ONLY_TOOL_NAMES = frozenset({
+    "browser_get_images",
+    "browser_snapshot",
+    "browser_vision",
+    "clarify",
+    "ha_get_state",
+    "ha_list_entities",
+    "ha_list_services",
+    "mcp_filesystem_directory_tree",
+    "mcp_filesystem_get_file_info",
+    "mcp_filesystem_list_directory",
+    "mcp_filesystem_list_directory_with_sizes",
+    "mcp_filesystem_read_file",
+    "mcp_filesystem_read_multiple_files",
+    "mcp_filesystem_read_text_file",
+    "mcp_filesystem_search_files",
+    "lcm_describe",
+    "lcm_expand",
+    "lcm_grep",
+    "read_file",
+    "read_terminal",
+    "search_files",
+    "session_search",
+    "skill_view",
+    "skills_list",
+    "tool_describe",
+    "tool_search",
+    "vision_analyze",
+    "web_extract",
+    "web_search",
+})
 
-_SAFE_GIT_SUBCOMMANDS = frozenset(
-    {"diff", "log", "show", "rev-parse"}
-)
-_UNSAFE_GIT_OPTIONS = frozenset(
-    {
-        "--config-env",
-        "--exec-path",
-        "--ext-diff",
-        "--no-index",
-        "--output",
-        "--textconv",
-        "--show-signature",
-        "--show-signatures",
-        "--format",
-        "--pretty",
-        "-c",
-        "-o",
-    }
-)
+_SAFE_GIT_SUBCOMMANDS = frozenset({"diff", "log", "show", "rev-parse"})
+_UNSAFE_GIT_OPTIONS = frozenset({
+    "--config-env",
+    "--exec-path",
+    "--ext-diff",
+    "--no-index",
+    "--output",
+    "--textconv",
+    "--show-signature",
+    "--show-signatures",
+    "--format",
+    "--pretty",
+    "-c",
+    "-o",
+})
 _SHELL_CONTROL_CHARS = frozenset(";&|><`\n\r\x00")
 _TRUSTED_GIT_CANDIDATES = (Path("/usr/bin/git"), Path("/bin/git"))
 _TRUSTED_PWD_CANDIDATES = (Path("/usr/bin/pwd"), Path("/bin/pwd"))
@@ -127,6 +123,10 @@ class PlanModeState:
     updated_at: float = 0.0
     last_action: str = ""
     approval_id: str = ""
+    clarification_count: int = 0
+    plan_artifact_count: int = 0
+    plan_artifact_path: str = ""
+    plan_artifact_sha256: str = ""
 
     @property
     def active(self) -> bool:
@@ -141,6 +141,15 @@ class PlanModeState:
         # Keep approval pending inside the existing PLAN wire value. Older
         # Hermes versions therefore remain fail-closed after a rollback.
         return self.mode == PLAN_MODE_PLAN and bool(self.approval_id)
+
+    @property
+    def approved_build(self) -> bool:
+        """Whether the exact approved execution turn is currently in flight."""
+        return (
+            self.mode == PLAN_MODE_BUILD
+            and self.last_action == "build_started"
+            and bool(self.approval_id)
+        )
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
@@ -164,6 +173,10 @@ class PlanModeState:
             updated_at=float(data.get("updated_at") or 0.0),
             last_action=str(data.get("last_action") or ""),
             approval_id=str(data.get("approval_id") or ""),
+            clarification_count=max(0, int(data.get("clarification_count") or 0)),
+            plan_artifact_count=max(0, int(data.get("plan_artifact_count") or 0)),
+            plan_artifact_path=str(data.get("plan_artifact_path") or ""),
+            plan_artifact_sha256=str(data.get("plan_artifact_sha256") or ""),
         )
 
 
@@ -194,15 +207,33 @@ def _get_session_db() -> Any:
 
         home = str(get_hermes_home())
     except Exception as exc:  # pragma: no cover - defensive import path
-        raise PlanModeStateUnavailable("Plan Mode state storage could not be loaded.") from exc
+        raise PlanModeStateUnavailable(
+            "Plan Mode state storage could not be loaded."
+        ) from exc
     with _DB_LOCK:
         cached = _DB_CACHE.get(home)
         if cached is not None:
             return cached
         try:
-            db = SessionDB()
+            from hermes_cli.config import load_config
+
+            sessions_config = load_config().get("sessions") or {}
+            # SessionDB's default path is frozen when hermes_state is imported.
+            # Pass the runtime-resolved home explicitly so profile switches and
+            # hermetic tests cannot open the owner's live state database. Keep
+            # the live storage policy too: notably, re-enabling the optional
+            # trigram index here can trigger a multi-GB rebuild on first /plan.
+            db = SessionDB(
+                Path(home) / "state.db",
+                fts_trigram_enabled=bool(
+                    sessions_config.get("fts_trigram_enabled", True)
+                ),
+                wal_size_limit_mb=int(sessions_config.get("wal_size_limit_mb", 0) or 0),
+            )
         except Exception as exc:  # pragma: no cover - defensive
-            raise PlanModeStateUnavailable("Plan Mode state storage could not be opened.") from exc
+            raise PlanModeStateUnavailable(
+                "Plan Mode state storage could not be opened."
+            ) from exc
         _DB_CACHE[home] = db
         return db
 
@@ -302,7 +333,9 @@ def _effective_state_in_transaction(conn: Any, session_id: str) -> PlanModeState
             "SELECT value FROM state_meta WHERE key = ?", (_meta_key(parent),)
         ).fetchone()
         if parent_row is not None:
-            parent_raw = parent_row["value"] if hasattr(parent_row, "keys") else parent_row[0]
+            parent_raw = (
+                parent_row["value"] if hasattr(parent_row, "keys") else parent_row[0]
+            )
             inherited = PlanModeState.from_json(parent_raw)
             if inherited.active:
                 inherited.last_action = "inherited"
@@ -368,13 +401,21 @@ class PlanModeManager:
         state = PlanModeState(
             mode=PLAN_MODE_PLAN,
             request=str(request or "").strip(),
-            entered_at=previous.entered_at if previous.active and previous.entered_at else now,
+            entered_at=previous.entered_at
+            if previous.active and previous.entered_at
+            else now,
             updated_at=now,
             last_action="entered",
             approval_id="",
+            clarification_count=0,
+            plan_artifact_count=0,
+            plan_artifact_path="",
+            plan_artifact_sha256="",
         )
         if not _compare_and_set_plan_mode(self.session_id, previous, state):
-            raise PlanModeUnavailable("Plan Mode could not be persisted; no planning turn was started.")
+            raise PlanModeUnavailable(
+                "Plan Mode could not be persisted; no planning turn was started."
+            )
         return state
 
     def approve(self) -> PlanModeState:
@@ -391,8 +432,57 @@ class PlanModeManager:
             latest = self.state
             if latest.build_pending and latest.request == current.request:
                 return latest
-            raise PlanModeUnavailable("Plan approval could not be persisted; execution remains blocked.")
+            raise PlanModeUnavailable(
+                "Plan approval could not be persisted; execution remains blocked."
+            )
         return desired
+
+    def mark_clarified(self) -> PlanModeState:
+        """Persist one completed user clarification for the active plan."""
+        for _ in range(4):
+            current = self.state
+            if not current.planning:
+                raise ValueError("No active Plan Mode to mark as clarified.")
+            desired = PlanModeState(**asdict(current))
+            desired.updated_at = time.time()
+            desired.last_action = "clarified"
+            desired.clarification_count = current.clarification_count + 1
+            if _compare_and_set_plan_mode(self.session_id, current, desired):
+                return desired
+        raise PlanModeUnavailable(
+            "Plan clarification could not be persisted; plan saving remains blocked."
+        )
+
+    def mark_plan_artifact_saved(
+        self,
+        path: str,
+        content: str = "",
+    ) -> PlanModeState:
+        """Persist a successful plan-artifact write for completion validation."""
+        normalized_path = str(path or "").strip()
+        if not normalized_path:
+            raise ValueError("Plan artifact path is required.")
+        normalized_content = _normalize_plan_text(content)
+        content_sha256 = (
+            hashlib.sha256(normalized_content.encode("utf-8")).hexdigest()
+            if normalized_content
+            else ""
+        )
+        for _ in range(4):
+            current = self.state
+            if not current.planning:
+                raise ValueError("No active Plan Mode to mark as saved.")
+            desired = PlanModeState(**asdict(current))
+            desired.updated_at = time.time()
+            desired.last_action = "plan_saved"
+            desired.plan_artifact_count = current.plan_artifact_count + 1
+            desired.plan_artifact_path = normalized_path
+            desired.plan_artifact_sha256 = content_sha256
+            if _compare_and_set_plan_mode(self.session_id, current, desired):
+                return desired
+        raise PlanModeUnavailable(
+            "Plan artifact checkpoint could not be persisted; completion remains blocked."
+        )
 
     def begin_build(self, approval_id: str) -> PlanModeState:
         """Atomically release the guard as the exact approved runtime turn starts."""
@@ -409,7 +499,26 @@ class PlanModeManager:
         # can be detected and rejected instead of executing the plan twice.
         desired.approval_id = current.approval_id
         if not _compare_and_set_plan_mode(self.session_id, current, desired):
-            raise PlanModeUnavailable("Build kickoff could not be persisted; execution remains blocked.")
+            raise PlanModeUnavailable(
+                "Build kickoff could not be persisted; execution remains blocked."
+            )
+        return desired
+
+    def complete_build(self, approval_id: str) -> PlanModeState:
+        """Close the temporary workspace-edit grant after an approved turn."""
+        current = self.state
+        if not current.approved_build:
+            return current
+        if not approval_id or approval_id != current.approval_id:
+            raise ValueError("The completed build does not match the current approval.")
+        desired = PlanModeState(**asdict(current))
+        desired.updated_at = time.time()
+        desired.last_action = "build_completed"
+        desired.approval_id = ""
+        if not _compare_and_set_plan_mode(self.session_id, current, desired):
+            raise PlanModeUnavailable(
+                "Approved build completion could not be persisted; edit approval remains fail-closed."
+            )
         return desired
 
     def exit(self) -> PlanModeState:
@@ -422,7 +531,9 @@ class PlanModeManager:
         desired.last_action = "exited"
         desired.approval_id = ""
         if not _compare_and_set_plan_mode(self.session_id, current, desired):
-            raise PlanModeUnavailable("Plan Mode exit could not be persisted; execution remains blocked.")
+            raise PlanModeUnavailable(
+                "Plan Mode exit could not be persisted; execution remains blocked."
+            )
         return desired
 
     def status_line(self) -> str:
@@ -466,16 +577,21 @@ def native_plan_execution_approval_id(prompt: Any) -> Optional[str]:
     closing = prompt.find("]", len(prefix))
     if closing < 0:
         return ""
-    return prompt[len(prefix):closing].strip()
+    return prompt[len(prefix) : closing].strip()
 
 
-def handle_plan_command(session_id: str, args: str = "", *, task_id: str = "") -> PlanCommandResult:
+def handle_plan_command(
+    session_id: str, args: str = "", *, task_id: str = ""
+) -> PlanCommandResult:
     manager = PlanModeManager(session_id)
     raw = str(args or "").strip()
     lower = raw.lower()
 
     verb = lower.split(None, 1)[0] if lower else ""
-    if verb in {"status", "approve", "exit", "cancel", "reject", "help"} and lower != verb:
+    if (
+        verb in {"status", "approve", "exit", "cancel", "reject", "help"}
+        and lower != verb
+    ):
         return PlanCommandResult(
             "help",
             manager.state.mode,
@@ -521,7 +637,9 @@ def handle_plan_command(session_id: str, args: str = "", *, task_id: str = "") -
     )
 
 
-def migrate_plan_mode_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
+def migrate_plan_mode_to_session(
+    old_session_id: str, new_session_id: str, *, reason: str = ""
+) -> bool:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
@@ -546,7 +664,9 @@ def migrate_plan_mode_to_session(old_session_id: str, new_session_id: str, *, re
         return False
 
 
-def _blocked(tool_name: str, args: Mapping[str, Any], code: str, detail: str) -> PlanToolDecision:
+def _blocked(
+    tool_name: str, args: Mapping[str, Any], code: str, detail: str
+) -> PlanToolDecision:
     return PlanToolDecision(
         False,
         dict(args or {}),
@@ -555,6 +675,180 @@ def _blocked(tool_name: str, args: Mapping[str, Any], code: str, detail: str) ->
             f"Blocked by native Plan Mode: {detail} "
             "Continue planning with read-only tools, or ask the user to run "
             "`/plan approve` before execution."
+        ),
+    )
+
+
+_NO_CLARIFICATION_MARKERS = (
+    "do not ask questions",
+    "don't ask questions",
+    "no questions",
+    "without questions",
+    "não faça perguntas",
+    "nao faca perguntas",
+    "sem perguntas",
+    "use documented defaults",
+    "use os padrões",
+    "use os padroes",
+)
+
+
+def _plan_requires_clarification(state: PlanModeState) -> bool:
+    request = str(state.request or "").strip().casefold()
+    return not any(marker in request for marker in _NO_CLARIFICATION_MARKERS)
+
+
+_PROPOSED_PLAN_BLOCK_RE = re.compile(
+    r"\A\s*<proposed_plan>\s*(?P<body>.+?)\s*</proposed_plan>\s*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_PLAN_H1_RE = re.compile(r"(?m)^#\s+\S.+$")
+_PLAN_SUMMARY_HEADING_RE = re.compile(
+    r"(?im)^##\s+(?:resumo(?:\s+executivo)?|executive\s+summary|summary)\s*$"
+)
+_PLAN_LOCKED_DECISIONS_RE = re.compile(
+    r"(?im)^(?:decisões\s+travadas|decisoes\s+travadas|locked\s+decisions|"
+    r"key\s+decisions|decisions\s+locked)\s*:\s*$"
+)
+_PLAN_OUT_OF_SCOPE_RE = re.compile(
+    r"(?im)(?:ficam\s+fora\s+(?:da|de)\s+v1|fora\s+do\s+escopo(?:\s+da\s+v1)?|"
+    r"out[ -]of[ -]scope(?:\s+for\s+v1)?|excluded\s+from\s+v1)\s*:"
+)
+_PLAN_IMPLEMENTATION_HEADING_RE = re.compile(
+    r"(?im)^##\s+.*(?:plano|implementa(?:ção|cao)|implementation|execu(?:ção|cao)|changes).*$"
+)
+_PLAN_ACCEPTANCE_HEADING_RE = re.compile(
+    r"(?im)^##\s+.*(?:testes?|tests?|aceite|acceptance|validation|verifica(?:ção|cao)).*$"
+)
+_PLAN_MODEL_ALLOCATION_HEADING_RE = re.compile(
+    r"(?im)^##\s+aloca(?:ção|cao)\s+de\s+modelos\s*$"
+)
+_PLAN_MODEL_ALLOCATION_HEADER_RE = re.compile(
+    r"(?im)^\|\s*Trabalho\s*\|\s*Modelo\s*\|\s*Esforço\s*\|\s*Finalidade\s*\|"
+    r"\s*Motivo de eficiência\s*\|\s*Gatilho de escalada\s*\|\s*$"
+)
+_PLAN_MODEL_ALLOCATION_ROW_RE = re.compile(
+    r"(?im)^\|(?!\s*[-:]+\s*\|)(?=.*\bgpt-5\.6-sol\b)(?=.*\bxhigh\b).+\|\s*$"
+)
+
+
+def _normalize_plan_text(content: Any) -> str:
+    return str(content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _codex_plan_contract_gaps(body: str) -> list[str]:
+    """Return missing pieces from the observed Codex Plan Mode final shape."""
+    normalized = _normalize_plan_text(body)
+    gaps: list[str] = []
+    if not _PLAN_H1_RE.search(normalized):
+        gaps.append("a single H1 plan title")
+    if not _PLAN_SUMMARY_HEADING_RE.search(normalized):
+        gaps.append("a `## Summary`/`## Resumo` executive summary")
+    locked = _PLAN_LOCKED_DECISIONS_RE.search(normalized)
+    if not locked:
+        gaps.append("a `Locked decisions:`/`Decisões travadas:` list")
+    else:
+        following = normalized[locked.end() :]
+        following = following.split("\n## ", 1)[0]
+        if not re.search(r"(?m)^\s*[-*]\s+\S", following):
+            gaps.append("at least one bullet under locked decisions")
+    if not _PLAN_OUT_OF_SCOPE_RE.search(normalized):
+        gaps.append("an explicit out-of-scope for v1 statement")
+    if not _PLAN_IMPLEMENTATION_HEADING_RE.search(normalized):
+        gaps.append("an implementation plan section")
+    if not _PLAN_ACCEPTANCE_HEADING_RE.search(normalized):
+        gaps.append("a tests and acceptance section")
+    if not _PLAN_MODEL_ALLOCATION_HEADING_RE.search(normalized):
+        gaps.append("the required `## Alocação de modelos` section")
+    elif not _PLAN_MODEL_ALLOCATION_HEADER_RE.search(normalized):
+        gaps.append("the exact six-column model-allocation table header")
+    elif not _PLAN_MODEL_ALLOCATION_ROW_RE.search(normalized):
+        gaps.append("an execution row allocating `gpt-5.6-sol` at `xhigh`")
+    return gaps
+
+
+def build_plan_completion_nudge(
+    session_id: str,
+    response_text: str,
+) -> Optional[str]:
+    """Return a bounded-loop nudge when an active PLAN response is incomplete.
+
+    The model remains responsible for planning. This validator only enforces
+    observable workflow invariants: a required clarification was resolved, a
+    plan artifact was successfully written in this activation, and the final
+    answer is exactly one non-empty ``proposed_plan`` block.
+    """
+    state = PlanModeManager(session_id).state
+    if not state.planning or state.build_pending:
+        return None
+
+    rendered = str(response_text or "").strip()
+    match = _PROPOSED_PLAN_BLOCK_RE.fullmatch(rendered)
+    plan_body = _normalize_plan_text(match.group("body")) if match else ""
+    has_complete_block = bool(plan_body)
+
+    if _plan_requires_clarification(state) and state.clarification_count < 1:
+        if has_complete_block or "<proposed_plan" in rendered.casefold():
+            return (
+                "[Native Plan Mode completion guard] The required material "
+                "clarification has not been resolved. Do not finalize the plan. "
+                "Use `clarify` for the smallest material decision and wait for "
+                "the user's answer."
+            )
+        # A normal text response may itself be the required question. Let it
+        # reach the user instead of turning Plan Mode into an internal loop.
+        return None
+
+    missing = []
+    if state.plan_artifact_count < 1 or not state.plan_artifact_path:
+        missing.append(
+            "save the decision-complete Markdown plan under the active "
+            "workspace's `.hermes/plans/` directory"
+        )
+    if not has_complete_block:
+        missing.append(
+            "return exactly one non-empty `<proposed_plan>...</proposed_plan>` "
+            "block containing that plan"
+        )
+    elif state.plan_artifact_sha256:
+        rendered_sha256 = hashlib.sha256(plan_body.encode("utf-8")).hexdigest()
+        if rendered_sha256 != state.plan_artifact_sha256:
+            missing.append(
+                "make the `<proposed_plan>` body match the saved plan artifact exactly"
+            )
+    else:
+        missing.append(
+            "save the final artifact again so its exact content can be verified"
+        )
+    if has_complete_block:
+        missing.extend(_codex_plan_contract_gaps(plan_body))
+    if not missing:
+        return None
+
+    requirements = "; then ".join(missing)
+    return (
+        "[Native Plan Mode completion guard] A clarification answer was "
+        "resolved, so do not stop at an acknowledgement or scope confirmation. "
+        f"Continue the same planning workflow now: {requirements}. Do not ask "
+        "the resolved question again and do not implement the plan."
+    )
+
+
+def _clarification_required_block(
+    tool_name: str,
+    args: Mapping[str, Any],
+) -> PlanToolDecision:
+    return PlanToolDecision(
+        False,
+        dict(args or {}),
+        "plan_clarification_required",
+        (
+            "Blocked by native Plan Mode: the first plan artifact cannot be saved "
+            "until at least one material user decision has been answered through "
+            "`clarify`. Ask the smallest useful structured question now, wait for "
+            "the answer, incorporate it, and then retry the plan-file write. This "
+            "is not an execution approval; do not ask the user to run `/plan approve`."
         ),
     )
 
@@ -601,13 +895,24 @@ def _trusted_executable(candidates: tuple[Path, ...]) -> Optional[str]:
     return None
 
 
-def _safe_terminal_args(args: Mapping[str, Any], *, task_id: str) -> Optional[Dict[str, Any]]:
+def _safe_terminal_args(
+    args: Mapping[str, Any], *, task_id: str
+) -> Optional[Dict[str, Any]]:
     command = args.get("command")
     if not isinstance(command, str) or not command.strip():
         return None
-    if any(char in command for char in _SHELL_CONTROL_CHARS) or "$(" in command or "${" in command:
+    if (
+        any(char in command for char in _SHELL_CONTROL_CHARS)
+        or "$(" in command
+        or "${" in command
+    ):
         return None
-    if args.get("background") or args.get("pty") or args.get("notify_on_complete") or args.get("watch_patterns"):
+    if (
+        args.get("background")
+        or args.get("pty")
+        or args.get("notify_on_complete")
+        or args.get("watch_patterns")
+    ):
         return None
 
     workdir = args.get("workdir")
@@ -632,16 +937,14 @@ def _safe_terminal_args(args: Mapping[str, Any], *, task_id: str) -> Optional[Di
             return None
         normalized = dict(args)
         normalized.update(
-            command=shlex.join(
-                [
-                    *_DYNAMIC_LOADER_RESET,
-                    env_path,
-                    "-i",
-                    "PATH=/usr/bin:/bin",
-                    "LANG=C.UTF-8",
-                    pwd_path,
-                ]
-            ),
+            command=shlex.join([
+                *_DYNAMIC_LOADER_RESET,
+                env_path,
+                "-i",
+                "PATH=/usr/bin:/bin",
+                "LANG=C.UTF-8",
+                pwd_path,
+            ]),
             background=False,
             pty=False,
             notify_on_complete=False,
@@ -729,23 +1032,49 @@ def evaluate_plan_tool_call(
     payload = dict(args or {})
     state_unavailable = False
     try:
-        active = PlanModeManager(session_id).active
+        state = PlanModeManager(session_id).state
+        active = state.active
     except PlanModeStateUnavailable:
+        state = PlanModeState(mode=PLAN_MODE_PLAN)
         active = True
         state_unavailable = True
     if not active:
         return PlanToolDecision(True, payload)
 
+    if tool_name == "clarify" and payload.get("choices") is not None:
+        return PlanToolDecision(
+            False,
+            payload,
+            "plan_structured_clarify_required",
+            (
+                "Blocked by native Plan Mode: selectable planning decisions must "
+                "use `clarify(questions=[...])`, with one to three structured "
+                "questions and consequence descriptions. Retry now with the "
+                "structured batch; use legacy `question` only for a genuinely "
+                "open-ended answer with no selectable choices."
+            ),
+        )
+
     if tool_name in _READ_ONLY_TOOL_NAMES:
         if tool_name == "browser_console":
             if payload.get("expression") is not None or payload.get("clear"):
-                return _blocked(tool_name, payload, "browser_console_mutation", "browser console evaluation/clear is not read-only.")
+                return _blocked(
+                    tool_name,
+                    payload,
+                    "browser_console_mutation",
+                    "browser console evaluation/clear is not read-only.",
+                )
         return PlanToolDecision(True, payload, "read_only")
 
     if tool_name == "browser_console":
         if payload.get("expression") is None and not payload.get("clear"):
             return PlanToolDecision(True, payload, "read_only")
-        return _blocked(tool_name, payload, "browser_console_mutation", "browser console evaluation/clear is not read-only.")
+        return _blocked(
+            tool_name,
+            payload,
+            "browser_console_mutation",
+            "browser console evaluation/clear is not read-only.",
+        )
 
     if tool_name == "terminal":
         normalized = _safe_terminal_args(payload, task_id=task_id)
@@ -764,8 +1093,15 @@ def evaluate_plan_tool_call(
             and not payload.get("cross_profile")
             and _plan_file_allowed(payload.get("path"), task_id=task_id)
         ):
+            if _plan_requires_clarification(state) and state.clarification_count < 1:
+                return _clarification_required_block(tool_name, payload)
             return PlanToolDecision(True, payload, "plan_file_write")
-        return _blocked(tool_name, payload, "write_outside_plan_dir", "writes are allowed only below the active workspace's `.hermes/plans` directory.")
+        return _blocked(
+            tool_name,
+            payload,
+            "write_outside_plan_dir",
+            "writes are allowed only below the active workspace's `.hermes/plans` directory.",
+        )
 
     if tool_name == "patch":
         if (
@@ -774,7 +1110,19 @@ def evaluate_plan_tool_call(
             and not payload.get("cross_profile")
             and _plan_file_allowed(payload.get("path"), task_id=task_id)
         ):
+            if _plan_requires_clarification(state) and state.clarification_count < 1:
+                return _clarification_required_block(tool_name, payload)
             return PlanToolDecision(True, payload, "plan_file_patch")
-        return _blocked(tool_name, payload, "patch_outside_plan_dir", "only replace-mode patches inside `.hermes/plans` are allowed.")
+        return _blocked(
+            tool_name,
+            payload,
+            "patch_outside_plan_dir",
+            "only replace-mode patches inside `.hermes/plans` are allowed.",
+        )
 
-    return _blocked(tool_name, payload, "tool_not_read_only", f"tool `{tool_name}` is not on the audited read-only allowlist.")
+    return _blocked(
+        tool_name,
+        payload,
+        "tool_not_read_only",
+        f"tool `{tool_name}` is not on the audited read-only allowlist.",
+    )

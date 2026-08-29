@@ -94,3 +94,13 @@ def test_timeout_cancels_future_and_fails_closed():
             callback("Choose", ["A", "B"])
     scheduled["coro"].close()
     future.cancel.assert_called_once()
+
+
+def test_default_clarification_wait_has_no_deadline():
+    callback, _, scheduled, future, _, schedule = _callback_for(
+        AllowedOutcome(option_id="choice_0", outcome="selected")
+    )
+    with patch("agent.async_utils.asyncio.run_coroutine_threadsafe", side_effect=schedule):
+        assert callback("Choose", ["A", "B"]) == "A"
+    scheduled["coro"].close()
+    future.result.assert_called_once_with(timeout=None)

@@ -403,6 +403,32 @@ class TestListAndCleanup:
 class TestPersistence:
     """Verify that sessions are persisted to SessionDB and can be restored."""
 
+    def test_lazy_default_db_applies_host_storage_config(self, tmp_path, monkeypatch):
+        """ACP must not silently re-enable storage-heavy indexes.
+
+        Passing an explicit profile-aware ``state.db`` path used to bypass the
+        host ``sessions`` settings, so opening ACP could rebuild the disabled
+        trigram FTS index and grow the WAL by several gigabytes.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "sessions:\n"
+            "  fts_trigram_enabled: false\n"
+            "  wal_size_limit_mb: 17\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(acp_session, "get_hermes_home", lambda: hermes_home)
+
+        lazy_manager = SessionManager(agent_factory=_mock_agent)
+        db = lazy_manager._get_db()
+
+        assert db is not None
+        assert db.db_path == hermes_home / "state.db"
+        assert db._fts_trigram_enabled is False
+        assert db._wal_size_limit_bytes == 17 * 1024 * 1024
+
     def test_create_session_includes_registered_mcp_toolsets(self, tmp_path, monkeypatch):
         captured = {}
 
