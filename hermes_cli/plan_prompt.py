@@ -83,6 +83,29 @@ The complete contract above remains authoritative for this turn. Incorporate the
 </user_message>
 """
 
+NATIVE_APPROVED_BUILD_CONTINUATION_TEMPLATE = """\
+[Native approved plan execution continuation]
+The owner already approved the saved plan and this turn continues that exact
+execution after an interruption or follow-up.
+
+Authoritative plan:
+- Request: {request}
+- Saved artifact: {plan_artifact_path}
+- Read the saved artifact before further mutation when it is not already in context.
+- Its resolved decisions, exclusions, Plan Integrity rules, and acceptance criteria
+  remain mandatory. Current guidance may refine execution but must not silently
+  contradict them.
+- Reference-only historical code must be inspected with read-only commands such as
+  `git show`; it must not be merged or cherry-picked as an implementation shortcut.
+- Continue validating and implementing the approved plan. Do not ask the owner to
+  approve ordinary workspace edits again.
+
+Current owner guidance:
+<user_message>
+{user_message}
+</user_message>
+"""
+
 
 def render_native_plan_prompt(request: str) -> str:
     """Render the native planning instructions around the current request."""
@@ -97,5 +120,20 @@ def render_native_plan_turn_reminder(request: str, user_message: str) -> str:
     """Reinject the full contract after resume/compression on every later turn."""
     return NATIVE_PLAN_TURN_REMINDER_TEMPLATE.format(
         full_contract=render_native_plan_prompt(request),
+        user_message=str(user_message or "").strip(),
+    )
+
+
+def render_native_approved_build_continuation(
+    request: str,
+    plan_artifact_path: str,
+    user_message: str,
+) -> str:
+    """Rebind a resumed build turn to the exact already-approved plan."""
+    return NATIVE_APPROVED_BUILD_CONTINUATION_TEMPLATE.format(
+        request=str(request or "").strip()
+        or "Infer the approved task from the current conversation context.",
+        plan_artifact_path=str(plan_artifact_path or "").strip()
+        or "the plan artifact already present in this conversation",
         user_message=str(user_message or "").strip(),
     )

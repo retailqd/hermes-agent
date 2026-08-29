@@ -29,9 +29,14 @@ PLAN_MODE_PLAN = "plan"
 PLAN_EXECUTION_PROMPT_TEMPLATE = (
     "[Native Plan Mode approval:{approval_id}]\n"
     "The user explicitly approved the current plan with `/plan approve`. "
-    "Leave planning mode and execute the approved plan now. Reuse the plan "
-    "and decisions already present in this conversation, verify the work, "
-    "and report the concrete result."
+    "Leave planning mode and execute the approved plan now. The saved plan "
+    "artifact and every resolved decision, exclusion, Plan Integrity rule, "
+    "and acceptance criterion are authoritative. Read the artifact before "
+    "mutating when it is not already in context. Historical code marked as "
+    "reference-only must be inspected with read-only commands such as `git "
+    "show`; never merge or cherry-pick it as an implementation shortcut. "
+    "Reuse the plan and decisions already present in this conversation, "
+    "verify the work, and report the concrete result."
 )
 
 _READ_ONLY_TOOL_NAMES = frozenset({
@@ -144,7 +149,7 @@ class PlanModeState:
 
     @property
     def approved_build(self) -> bool:
-        """Whether the exact approved execution turn is currently in flight."""
+        """Whether the approved execution is live, including interrupted resumes."""
         return (
             self.mode == PLAN_MODE_BUILD
             and self.last_action == "build_started"
@@ -505,7 +510,7 @@ class PlanModeManager:
         return desired
 
     def complete_build(self, approval_id: str) -> PlanModeState:
-        """Close the temporary workspace-edit grant after an approved turn."""
+        """Close the workspace-edit grant after an approved execution completes."""
         current = self.state
         if not current.approved_build:
             return current
@@ -523,7 +528,7 @@ class PlanModeManager:
 
     def exit(self) -> PlanModeState:
         current = self.state
-        if not current.active:
+        if not current.active and not current.approved_build:
             return current
         desired = PlanModeState(**asdict(current))
         desired.mode = PLAN_MODE_BUILD
@@ -735,6 +740,45 @@ _PLAN_MODEL_ALLOCATION_ROW_RE = re.compile(
 
 def _normalize_plan_text(content: Any) -> str:
     return str(content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _approved_plan_forbids_history_integration(state: PlanModeState) -> bool:
+    """Recognize an explicit reference-only history constraint in the artifact."""
+    path = str(state.plan_artifact_path or "").strip()
+    if not path:
+        return False
+    try:
+        normalized = _normalize_plan_text(Path(path).expanduser().read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    if state.plan_artifact_sha256:
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        if digest != state.plan_artifact_sha256:
+            return False
+    folded = (
+        normalized.casefold()
+        .replace("ê", "e")
+        .replace("é", "e")
+        .replace("ã", "a")
+        .replace("ç", "c")
+    )
+    for line in folded.splitlines():
+        mentions_history_action = "cherry-pick" in line or "merge" in line
+        marks_reference_only = (
+            "reference-only" in line
+            or "referencia" in line
+            or "reference" in line
+        ) and (
+            "not authorization" in line
+            or "nao autorizacao" in line
+            or "not branch" in line
+            or "nao branch" in line
+            or "must not" in line
+            or "nao deve" in line
+        )
+        if mentions_history_action and marks_reference_only:
+            return True
+    return False
 
 
 def _codex_plan_contract_gaps(body: str) -> list[str]:
@@ -1038,6 +1082,26 @@ def evaluate_plan_tool_call(
         state = PlanModeState(mode=PLAN_MODE_PLAN)
         active = True
         state_unavailable = True
+    if state.approved_build:
+        command = str(payload.get("command") or "") if tool_name == "terminal" else ""
+        if command and _approved_plan_forbids_history_integration(state):
+            if re.search(
+                r"(?im)(?:^|[\n;&|])\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+                r"git(?:\s+-\S+)*\s+(?:cherry-pick|merge)\b",
+                command,
+            ):
+                return PlanToolDecision(
+                    False,
+                    payload,
+                    "approved_plan_reference_only_history",
+                    (
+                        "Blocked by the approved plan: historical code is "
+                        "reference-only and cannot be merged or cherry-picked. "
+                        "Inspect the relevant commit with `git show`, then "
+                        "implement only the required behavior against the current baseline."
+                    ),
+                )
+        return PlanToolDecision(True, payload, "approved_build")
     if not active:
         return PlanToolDecision(True, payload)
 

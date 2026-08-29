@@ -358,3 +358,64 @@ async def test_acp_plan_review_approval_executes_through_nonce_bound_plan_comman
 
     assert response.stop_reason == "end_turn"
     assert fake.runs == ["continue the plan", "hidden nonce-bound execution prompt"]
+
+
+@pytest.mark.asyncio
+async def test_acp_cancelled_approved_build_keeps_grant_for_next_continuation(
+    monkeypatch,
+):
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    manager = __import__(
+        "hermes_cli.plan_mode", fromlist=["PlanModeManager"]
+    ).PlanModeManager(state.session_id)
+    manager.activate("implement the approved plan")
+    calls = 0
+
+    def run_plan(**kwargs):
+        nonlocal calls
+        calls += 1
+        fake.runs.append(kwargs["user_message"])
+        if calls == 1:
+            final = "<proposed_plan>\n# Approved plan\n</proposed_plan>"
+        elif calls == 2:
+            pending = manager.state
+            manager.begin_build(pending.approval_id)
+            state.cancel_event.set()
+            final = "interrupted while adding owner guidance"
+        else:
+            final = "execution continuation complete"
+        return {
+            "final_response": final,
+            "messages": [{"role": "assistant", "content": final}],
+        }
+
+    fake.run_conversation = run_plan
+
+    async def approve_review(_conn, _session_id, _plan_text):
+        return True
+
+    monkeypatch.setattr(
+        "acp_adapter.plan_review.native_plan_is_active",
+        lambda _session_id: calls == 0,
+    )
+    monkeypatch.setattr(
+        "acp_adapter.plan_review.request_plan_review",
+        approve_review,
+    )
+
+    interrupted = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="continue the plan")],
+    )
+
+    assert interrupted.stop_reason == "cancelled"
+    assert manager.state.approved_build
+
+    resumed = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="use Open Design and continue")],
+    )
+
+    assert resumed.stop_reason == "end_turn"
+    assert manager.state.last_action == "build_completed"
+    assert not manager.state.approved_build

@@ -633,9 +633,10 @@ class HermesACPAgent(acp.Agent):
         self, state: SessionState
     ) -> tuple[str, str | None]:
         # Planning itself only permits the guarded `.hermes/plans` artifact.
-        # Once the owner approves "Implement this plan?", the exact execution
-        # turn receives a temporary workspace-scoped edit grant. Sensitive and
-        # out-of-workspace paths remain protected by the edit policy.
+        # Once the owner approves "Implement this plan?", the execution keeps a
+        # workspace-scoped edit grant across interrupted continuation turns and
+        # closes it after a normal completion. Sensitive and out-of-workspace
+        # paths remain protected by the edit policy.
         try:
             from hermes_cli.plan_mode import PlanModeManager
 
@@ -1598,6 +1599,19 @@ class HermesACPAgent(acp.Agent):
         except Exception:
             native_plan_turn = False
 
+        approved_build_id_at_turn_start = ""
+        try:
+            from hermes_cli.plan_mode import PlanModeManager
+
+            initial_plan_state = PlanModeManager(state.session_id).state
+            if initial_plan_state.approved_build:
+                approved_build_id_at_turn_start = initial_plan_state.approval_id
+        except Exception:
+            logger.debug(
+                "Could not inspect approved Plan Mode continuation",
+                exc_info=True,
+            )
+
         tool_call_ids: dict[str, Deque[str]] = defaultdict(deque)
         tool_call_meta: dict[str, dict[str, Any]] = {}
         previous_approval_cb = None
@@ -1929,9 +1943,11 @@ class HermesACPAgent(acp.Agent):
                     # Re-enter through the same nonce-bound command path used by
                     # `/plan approve`; the recursive prompt remains invisible
                     # user-interface plumbing and executes only after the ACP
-                    # owner explicitly selected "Implement plan".
+                    # owner explicitly selected "Implement plan". Cancellation
+                    # preserves the grant for the next continuation turn.
                     await self._send_usage_update(state)
                     approval_id = ""
+                    response = None
                     try:
                         response = await self.prompt(
                             prompt=[TextContentBlock(type="text", text="/plan approve")],
@@ -1944,7 +1960,11 @@ class HermesACPAgent(acp.Agent):
 
                             manager = PlanModeManager(session_id)
                             approved_state = manager.state
-                            if approved_state.approved_build:
+                            if (
+                                approved_state.approved_build
+                                and response is not None
+                                and response.stop_reason != "cancelled"
+                            ):
                                 approval_id = approved_state.approval_id
                                 manager.complete_build(approval_id)
                         except Exception:
@@ -1989,6 +2009,17 @@ class HermesACPAgent(acp.Agent):
         await self._send_usage_update(state)
 
         stop_reason = "cancelled" if cancelled else "end_turn"
+        if approved_build_id_at_turn_start and stop_reason != "cancelled":
+            try:
+                from hermes_cli.plan_mode import PlanModeManager
+
+                manager = PlanModeManager(session_id)
+                manager.complete_build(approved_build_id_at_turn_start)
+            except Exception:
+                logger.warning(
+                    "Could not close resumed approved Plan Mode edit grant",
+                    exc_info=True,
+                )
         return PromptResponse(stop_reason=stop_reason, usage=usage)
 
     # ---- Slash commands (headless) -------------------------------------------

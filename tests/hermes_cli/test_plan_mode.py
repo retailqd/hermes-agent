@@ -821,6 +821,82 @@ def test_approved_build_grant_is_scoped_to_the_exact_execution_turn(
     assert completed.last_action == "build_completed"
 
 
+def test_interrupted_approved_build_continuation_reinjects_plan_constraints(
+    isolated_plan_mode,
+):
+    from agent.conversation_loop import _prepare_native_plan_turn
+
+    class Agent:
+        session_id = "session-approved-build-continuation"
+
+    manager = plan_mode.PlanModeManager(Agent.session_id)
+    manager.activate("build safely")
+    approval = manager.approve()
+    manager.begin_build(approval.approval_id)
+
+    prepared, persisted = _prepare_native_plan_turn(
+        Agent(),
+        "Continue, but use Open Design.",
+        None,
+    )
+
+    assert "approved plan execution continuation" in prepared.lower()
+    assert "reference-only historical code" in prepared.lower()
+    assert "Continue, but use Open Design." in prepared
+    assert persisted == "Continue, but use Open Design."
+    assert manager.state.approved_build
+
+
+def test_approved_plan_constraint_blocks_reference_only_cherry_pick(
+    isolated_plan_mode,
+):
+    workspace = isolated_plan_mode
+    artifact = workspace / ".hermes" / "plans" / "plan.md"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    body = (
+        "# Plan\n\n"
+        "The historical connector is reference-only, not authorization for "
+        "merge or whole cherry-pick.\n"
+    )
+    artifact.write_text(body, encoding="utf-8")
+
+    manager = plan_mode.PlanModeManager("session-no-whole-cherry-pick")
+    manager.activate("implement selectively")
+    manager.mark_plan_artifact_saved(str(artifact), body)
+    approval = manager.approve()
+    manager.begin_build(approval.approval_id)
+
+    blocked = plan_mode.evaluate_plan_tool_call(
+        "session-no-whole-cherry-pick",
+        "terminal",
+        {"command": "set -euo pipefail\ngit cherry-pick abc123 def456"},
+    )
+    inspection = plan_mode.evaluate_plan_tool_call(
+        "session-no-whole-cherry-pick",
+        "terminal",
+        {"command": "git show abc123 -- src/integration.py"},
+    )
+
+    assert not blocked.allowed
+    assert blocked.code == "approved_plan_reference_only_history"
+    assert "git show" in blocked.message
+    assert inspection.allowed
+
+
+def test_plan_exit_revokes_interrupted_approved_build_grant(isolated_plan_mode):
+    manager = plan_mode.PlanModeManager("session-exit-approved-build")
+    manager.activate("build safely")
+    approval = manager.approve()
+    manager.begin_build(approval.approval_id)
+
+    exited = manager.exit()
+
+    assert exited.mode == plan_mode.PLAN_MODE_BUILD
+    assert exited.last_action == "exited"
+    assert exited.approval_id == ""
+    assert not exited.approved_build
+
+
 def test_concurrent_approvals_converge_on_one_nonce(isolated_plan_mode):
     manager = plan_mode.PlanModeManager("session-approval-race")
     manager.activate("race safely")

@@ -534,6 +534,7 @@ def _prepare_native_plan_turn(
         native_plan_execution_approval_id,
     )
     from hermes_cli.plan_prompt import (
+        render_native_approved_build_continuation,
         render_native_plan_prompt,
         render_native_plan_turn_reminder,
     )
@@ -555,6 +556,15 @@ def _prepare_native_plan_turn(
             "This Plan Mode approval kickoff is stale, malformed, or already consumed; "
             "refusing execution. Run `/plan approve` again from the current PLAN state."
         )
+    if state.approved_build:
+        if persist_user_message is None:
+            persist_user_message = user_message
+        reminder = render_native_approved_build_continuation(
+            state.request,
+            state.plan_artifact_path,
+            raw_user_message,
+        )
+        return replace_message_text(user_message, reminder), persist_user_message
     if state.active and raw_user_message != render_native_plan_prompt(state.request):
         if persist_user_message is None:
             persist_user_message = user_message
