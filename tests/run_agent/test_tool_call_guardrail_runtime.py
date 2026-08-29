@@ -306,6 +306,37 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         assert len(following_results) == len(call_ids)
 
 
+def test_unlimited_iterations_still_halt_a_repeated_failed_tool_loop():
+    agent = _make_agent("web_search", max_iterations=0, config=_hard_stop_config())
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+        )
+        for i in range(1, 20)
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search forever unless a circuit breaker stops it")
+
+    assert agent.iteration_budget.unlimited is True
+    assert mock_hfc.call_count == 2
+    assert result["api_calls"] == 3
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
+    # A circuit-breaker halt is not a false task-completion signal. Gateway
+    # and Plan Mode callers may recover automatically or surface a real blocker.
+    assert result["completed"] is False
+
+
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     """Regression for #30770: when the guardrail halts the loop, the
     synthesized halt message must be pushed through ``stream_delta_callback``
