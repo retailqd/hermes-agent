@@ -422,6 +422,29 @@ def test_run_agent_dispatch_forces_background():
         assert captured["background"] is False
 
 
+def test_run_agent_dispatch_forces_sync_when_surface_cannot_drain_async_results():
+    """ACP owns no completion-queue watcher, so its top-level delegations must
+    finish inside the current turn instead of becoming orphaned background
+    results that require a user follow-up."""
+    from unittest.mock import patch
+    import run_agent
+
+    class _FakeAgent:
+        _delegate_depth = 0
+        _force_sync_top_level_delegation = True
+
+    captured = {}
+
+    def _fake_delegate(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    with patch("tools.delegate_tool.delegate_task", _fake_delegate):
+        run_agent.AIAgent._dispatch_delegate_task(_FakeAgent(), {"goal": "review"})
+
+    assert captured["background"] is False
+
+
 def test_dispatch_never_forwards_model_toolsets():
     """The model has no toolsets argument — subagents always inherit the
     parent's toolsets. Even if a model smuggles a `toolsets` key into the
@@ -611,5 +634,4 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 

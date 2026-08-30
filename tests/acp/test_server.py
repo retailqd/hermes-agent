@@ -1287,6 +1287,28 @@ class TestPrompt:
         assert state.agent.thinking_callback is None
 
     @pytest.mark.asyncio
+    async def test_prompt_scopes_top_level_delegation_to_sync_and_restores_agent(self, agent):
+        """ACP has no gateway completion watcher: detached review results must
+        remain part of this prompt, while the agent attribute is restored after
+        the executor call so other surfaces keep their native behavior."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent._force_sync_top_level_delegation = "previous"
+        observed = []
+
+        def mock_run(*args, **kwargs):
+            observed.append(state.agent._force_sync_top_level_delegation)
+            return {"final_response": "review complete", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        prompt = [TextContentBlock(type="text", text="review this")]
+        response = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert response.stop_reason == "end_turn"
+        assert observed == [True]
+        assert state.agent._force_sync_top_level_delegation == "previous"
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")

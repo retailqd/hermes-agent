@@ -1814,6 +1814,18 @@ class HermesACPAgent(acp.Agent):
             # never leaks one session's id into the next session's tools.
             previous_session_id = os.environ.get("HERMES_SESSION_ID")
             os.environ["HERMES_SESSION_ID"] = session_id
+            _missing_delegation_mode = object()
+            previous_delegation_mode = getattr(
+                agent,
+                "_force_sync_top_level_delegation",
+                _missing_delegation_mode,
+            )
+            # ACP does not run the gateway/CLI completion-queue watcher that
+            # turns background delegate results into a fresh agent turn. Keep
+            # top-level delegations synchronous on this surface so a required
+            # review cannot leave the session Idle at 8/9 awaiting a result
+            # that only a manual user follow-up would make visible.
+            agent._force_sync_top_level_delegation = True
             try:
                 result = agent.run_conversation(
                     user_message=user_content,
@@ -1826,6 +1838,15 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                if previous_delegation_mode is _missing_delegation_mode:
+                    try:
+                        delattr(agent, "_force_sync_top_level_delegation")
+                    except AttributeError:
+                        pass
+                else:
+                    agent._force_sync_top_level_delegation = (
+                        previous_delegation_mode
+                    )
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)

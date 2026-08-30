@@ -5677,13 +5677,21 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        # Gateway/CLI surfaces drain async-delegation completion events and
+        # forge a follow-up turn. ACP currently owns no such completion-queue
+        # watcher, so its adapter scopes this flag around run_conversation:
+        # the review/result must land inside the originating turn rather than
+        # being orphaned until the user manually prompts again.
+        _force_sync = (
+            getattr(self, "_force_sync_top_level_delegation", False) is True
+        )
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=(not _is_subagent and not _force_sync),
             parent_agent=self,
         )
 
