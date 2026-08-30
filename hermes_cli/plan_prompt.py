@@ -50,7 +50,9 @@ Plan requirements:
 - Order tasks by the first observable owner value, then the next thin slice.
 - For code work, include exact paths, target symbols, failing tests, minimal implementation, exact verification commands, expected outcomes, and scoped commits.
 - Adversarial premises: explain what breaks if each external assumption changes, how the change is detected, and the cost to undo it.
-- Include risks, tradeoffs, rollback, open questions, and a Plan Integrity section.
+- Include a dedicated risks/rollback section, followed by `## Plan Integrity` and `## Handoff`.
+- `## Plan Integrity` must list the authoritative scope, confirmed decisions, evidence revision, clean-worktree or dirty-worktree boundary, and invariants execution must preserve.
+- `## Handoff` must state that `/plan approve` executes this exact plan revision and `/plan exit` leaves planning without execution.
 - Honor every mandatory plan section in the active `AGENTS.md`, including any required model-allocation contract.
 - On this host, every official plan must include this exact heading and table header, followed by at least one real execution row using model `gpt-5.6-sol` and effort `xhigh`:
   `## Alocação de modelos`
@@ -64,7 +66,7 @@ Codex executive-summary contract:
 - In that summary, state the objective and outcome in one compact paragraph.
 - Then write `Decisões travadas:` or `Locked decisions:` and list every material decision already fixed as bullets. Do not hide unresolved choices in this list.
 - Then write `Ficam fora da v1:` or `Out of scope for v1:` and state explicit exclusions.
-- After the executive summary, include the ordered implementation plan and a dedicated tests/acceptance section. Add interfaces/data/operation, rollout, budget, assumptions, risks, rollback, and the mandatory model-allocation table.
+- After the executive summary, include the ordered implementation plan and a dedicated tests/acceptance section. Add interfaces/data/operation, rollout, budget, assumptions, a dedicated risks/rollback section, the mandatory model-allocation table, `## Plan Integrity`, and finish with `## Handoff`.
 - This is a structural contract enforced by the runtime, not optional style guidance.
 
 Final response contract:

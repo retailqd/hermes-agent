@@ -23,7 +23,9 @@ class FakeAgent:
         self.steers.append(text)
         return True
 
-    def run_conversation(self, *, user_message, conversation_history, task_id, **kwargs):
+    def run_conversation(
+        self, *, user_message, conversation_history, task_id, **kwargs
+    ):
         self.runs.append(user_message)
         messages = list(conversation_history or [])
         messages.append({"role": "user", "content": user_message})
@@ -83,11 +85,16 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
             setattr(module, key, value)
         return module
 
-    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=CapturingAgent))
+    monkeypatch.setitem(
+        sys.modules, "run_agent", mod("run_agent", AIAgent=CapturingAgent)
+    )
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
-        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m", "provider": "p"}}),
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {"model": {"default": "m", "provider": "p"}},
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -194,7 +201,11 @@ async def test_acp_prompt_drains_queued_turns_after_current_run():
     assert response.stop_reason == "end_turn"
     assert fake.runs == ["make the change", "then run tests"]
     assert state.queued_prompts == []
-    agent_messages = [u for _sid, u in conn.updates if getattr(u, "session_update", None) == "agent_message_chunk"]
+    agent_messages = [
+        u
+        for _sid, u in conn.updates
+        if getattr(u, "session_update", None) == "agent_message_chunk"
+    ]
     assert len(agent_messages) >= 2
 
 
@@ -466,6 +477,46 @@ async def test_acp_approved_build_auto_continues_until_explicit_completion():
     assert "All approved ordinary work" in rendered
     assert "Ordinary implementation and tests remain" not in rendered
     assert "approved_plan_execution" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_acp_never_delivers_false_complete_when_evidence_gate_rejects(
+    monkeypatch,
+):
+    acp_agent, state, fake, conn = make_agent_and_state()
+    plan_module = __import__("hermes_cli.plan_mode", fromlist=["PlanModeManager"])
+    manager = plan_module.PlanModeManager(state.session_id)
+    manager.activate("implement and verify the approved plan")
+    pending = manager.approve()
+    manager.begin_build(pending.approval_id)
+
+    final = 'Everything is complete.\n<approved_plan_execution status="complete" />'
+    fake.run_conversation = lambda **_kwargs: {
+        "final_response": final,
+        "messages": [{"role": "assistant", "content": final}],
+    }
+
+    original_complete = plan_module.PlanModeManager.complete_build
+
+    def reject_completion(self, approval_id, **kwargs):
+        if self.session_id == state.session_id:
+            raise RuntimeError("stale verification")
+        return original_complete(self, approval_id, **kwargs)
+
+    monkeypatch.setattr(
+        plan_module.PlanModeManager, "complete_build", reject_completion
+    )
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="continue the approved plan")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert manager.state.approved_build
+    rendered = "\n".join(str(update) for _sid, update in conn.updates)
+    assert "Runtime verification gate did not accept" in rendered
+    assert "Everything is complete" not in rendered
 
 
 @pytest.mark.asyncio

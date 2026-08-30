@@ -1892,9 +1892,7 @@ class HermesACPAgent(acp.Agent):
                     except AttributeError:
                         pass
                 else:
-                    agent._force_sync_top_level_delegation = (
-                        previous_delegation_mode
-                    )
+                    agent._force_sync_top_level_delegation = previous_delegation_mode
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
@@ -2074,6 +2072,40 @@ class HermesACPAgent(acp.Agent):
                 )
         elif approved_build_terminal_status in {"complete", "blocked"}:
             state.approved_build_auto_continuations = 0
+
+        # Close an attested completion before any owner-visible final response
+        # is emitted.  With the verified owner contract active,
+        # ``complete_build`` constructs the evidence manifest and can reject a
+        # stale plan or stale verification.  Delivering the model's "complete"
+        # prose first would create a false-green UI even though the grant stayed
+        # active, so replace that claim with an explicit safety pause on error.
+        if (
+            approved_build_id_at_turn_start
+            and not interrupted
+            and approved_build_terminal_status == "complete"
+        ):
+            try:
+                from hermes_cli.plan_mode import PlanModeManager
+
+                manager = PlanModeManager(session_id)
+                manager.complete_build(
+                    approved_build_id_at_turn_start,
+                    cwd=state.cwd,
+                    final_response=final_response,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not verify and close resumed approved Plan Mode edit grant",
+                    exc_info=True,
+                )
+                final_response = (
+                    "Runtime verification gate did not accept the completion claim. "
+                    "The approved-plan grant remains active; run fresh scoped "
+                    "verification and continue this same plan."
+                )
+                result["final_response"] = final_response
+                result["response_transformed"] = True
+                approved_build_terminal_status = "blocked"
         # Hermes' local "waiting for model response" interrupt status is metadata,
         # not assistant prose — clients get cancellation from stop_reason instead.
         from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
@@ -2176,21 +2208,6 @@ class HermesACPAgent(acp.Agent):
         await self._send_usage_update(state)
 
         stop_reason = "cancelled" if cancelled else "end_turn"
-        if (
-            approved_build_id_at_turn_start
-            and stop_reason != "cancelled"
-            and approved_build_terminal_status == "complete"
-        ):
-            try:
-                from hermes_cli.plan_mode import PlanModeManager
-
-                manager = PlanModeManager(session_id)
-                manager.complete_build(approved_build_id_at_turn_start)
-            except Exception:
-                logger.warning(
-                    "Could not close resumed approved Plan Mode edit grant",
-                    exc_info=True,
-                )
         return PromptResponse(stop_reason=stop_reason, usage=usage)
 
     # ---- Slash commands (headless) -------------------------------------------

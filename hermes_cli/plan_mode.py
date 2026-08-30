@@ -210,6 +210,8 @@ class PlanModeState:
     plan_artifact_count: int = 0
     plan_artifact_path: str = ""
     plan_artifact_sha256: str = ""
+    completion_manifest_path: str = ""
+    completion_manifest_sha256: str = ""
 
     @property
     def active(self) -> bool:
@@ -260,6 +262,10 @@ class PlanModeState:
             plan_artifact_count=max(0, int(data.get("plan_artifact_count") or 0)),
             plan_artifact_path=str(data.get("plan_artifact_path") or ""),
             plan_artifact_sha256=str(data.get("plan_artifact_sha256") or ""),
+            completion_manifest_path=str(data.get("completion_manifest_path") or ""),
+            completion_manifest_sha256=str(
+                data.get("completion_manifest_sha256") or ""
+            ),
         )
 
 
@@ -587,17 +593,47 @@ class PlanModeManager:
             )
         return desired
 
-    def complete_build(self, approval_id: str) -> PlanModeState:
+    def complete_build(
+        self,
+        approval_id: str,
+        *,
+        cwd: str = "",
+        final_response: str = "",
+    ) -> PlanModeState:
         """Close the workspace-edit grant after an approved execution completes."""
         current = self.state
         if not current.approved_build:
             return current
         if not approval_id or approval_id != current.approval_id:
             raise ValueError("The completed build does not match the current approval.")
+        completion_manifest_path = ""
+        completion_manifest_sha256 = ""
+        if cwd:
+            from agent.owner_contract import active_owner_contract_id
+
+            contract_id = active_owner_contract_id()
+        else:
+            contract_id = None
+        if cwd and contract_id:
+            from agent.completion_evidence import create_plan_completion_manifest
+
+            manifest_path, manifest_sha256 = create_plan_completion_manifest(
+                session_id=self.session_id,
+                cwd=cwd,
+                objective=current.request,
+                approval_id=approval_id,
+                plan_artifact_path=current.plan_artifact_path,
+                plan_artifact_sha256=current.plan_artifact_sha256,
+                final_response=final_response,
+            )
+            completion_manifest_path = str(manifest_path)
+            completion_manifest_sha256 = manifest_sha256
         desired = PlanModeState(**asdict(current))
         desired.updated_at = time.time()
         desired.last_action = "build_completed"
         desired.approval_id = ""
+        desired.completion_manifest_path = completion_manifest_path
+        desired.completion_manifest_sha256 = completion_manifest_sha256
         if not _compare_and_set_plan_mode(self.session_id, current, desired):
             raise PlanModeUnavailable(
                 "Approved build completion could not be persisted; edit approval remains fail-closed."
@@ -804,6 +840,14 @@ _PLAN_IMPLEMENTATION_HEADING_RE = re.compile(
 _PLAN_ACCEPTANCE_HEADING_RE = re.compile(
     r"(?im)^##\s+.*(?:testes?|tests?|aceite|acceptance|validation|verifica(?:ção|cao)).*$"
 )
+_PLAN_RISK_ROLLBACK_HEADING_RE = re.compile(
+    r"(?im)^##\s+.*(?:riscos?|risks?).*(?:rollback|revers[aã]o)|"
+    r"^##\s+.*(?:rollback|revers[aã]o).*(?:riscos?|risks?).*$"
+)
+_PLAN_INTEGRITY_HEADING_RE = re.compile(
+    r"(?im)^##\s+(?:Plan Integrity|Integridade do plano)\s*$"
+)
+_PLAN_HANDOFF_HEADING_RE = re.compile(r"(?im)^##\s+Handoff\s*$")
 _PLAN_MODEL_ALLOCATION_HEADING_RE = re.compile(
     r"(?im)^##\s+aloca(?:ção|cao)\s+de\s+modelos\s*$"
 )
@@ -924,12 +968,30 @@ def _codex_plan_contract_gaps(body: str) -> list[str]:
         gaps.append("an implementation plan section")
     if not _PLAN_ACCEPTANCE_HEADING_RE.search(normalized):
         gaps.append("a tests and acceptance section")
+    if not _PLAN_RISK_ROLLBACK_HEADING_RE.search(normalized):
+        gaps.append("a dedicated risks and rollback section")
     if not _PLAN_MODEL_ALLOCATION_HEADING_RE.search(normalized):
         gaps.append("the required `## Alocação de modelos` section")
     elif not _PLAN_MODEL_ALLOCATION_HEADER_RE.search(normalized):
         gaps.append("the exact six-column model-allocation table header")
     elif not _PLAN_MODEL_ALLOCATION_ROW_RE.search(normalized):
         gaps.append("an execution row allocating `gpt-5.6-sol` at `xhigh`")
+    integrity = _PLAN_INTEGRITY_HEADING_RE.search(normalized)
+    if not integrity:
+        gaps.append("the required `## Plan Integrity` section")
+    else:
+        following = normalized[integrity.end() :].split("\n## ", 1)[0]
+        if not re.search(r"(?m)^\s*[-*]\s+\S", following):
+            gaps.append("at least one invariant bullet under `## Plan Integrity`")
+    handoff = _PLAN_HANDOFF_HEADING_RE.search(normalized)
+    if not handoff:
+        gaps.append("the final `## Handoff` section")
+    else:
+        following = normalized[handoff.end() :]
+        if "/plan approve" not in following or "/plan exit" not in following:
+            gaps.append(
+                "both `/plan approve` and `/plan exit` commands under `## Handoff`"
+            )
     return gaps
 
 

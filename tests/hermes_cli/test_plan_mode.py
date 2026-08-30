@@ -421,11 +421,24 @@ Out of scope for v1: billing migrations and unrelated redesigns.
 
 - The production smoke test passes.
 
+## Risks and rollback
+
+- Roll back to the captured release if the smoke test fails.
+
 ## Alocação de modelos
 
 | Trabalho | Modelo | Esforço | Finalidade | Motivo de eficiência | Gatilho de escalada |
 |---|---|---|---|---|---|
 | Executar o plano | gpt-5.6-sol | xhigh | Implementação e validação | Um agente mantém o contexto | Escalar se houver bloqueio externo |
+
+## Plan Integrity
+
+- Execute only the confirmed scope from the inspected revision.
+
+## Handoff
+
+- `/plan approve` executes this exact plan.
+- `/plan exit` leaves without execution.
 """
     manager.mark_plan_artifact_saved(".hermes/plans/launch.md", plan_body)
 
@@ -578,6 +591,67 @@ def test_plan_completion_enforces_codex_executive_summary_contract(
     expected,
 ):
     manager = plan_mode.PlanModeManager(f"session-missing-{expected}")
+    manager.activate("plan the launch")
+    manager.mark_clarified()
+    manager.mark_plan_artifact_saved(".hermes/plans/launch.md", body)
+
+    nudge = plan_mode.build_plan_completion_nudge(
+        manager.session_id,
+        f"<proposed_plan>\n{body}\n</proposed_plan>",
+    )
+
+    assert nudge is not None
+    assert expected in nudge.lower()
+
+
+@pytest.mark.parametrize(
+    ("missing_section", "expected"),
+    [
+        ("risks", "risks and rollback"),
+        ("integrity", "plan integrity"),
+        ("handoff", "handoff"),
+    ],
+)
+def test_plan_completion_requires_codex_integrity_and_handoff_sections(
+    isolated_plan_mode,
+    missing_section,
+    expected,
+):
+    sections = {
+        "risks": "## Risks and rollback\n\n- Revert the scoped commit.",
+        "integrity": "## Plan Integrity\n\n- Preserve the confirmed scope.",
+        "handoff": "## Handoff\n\n- `/plan approve` executes.\n- `/plan exit` leaves.",
+    }
+    body = """# Launch plan
+
+## Summary
+
+Ship safely.
+
+Locked decisions:
+
+- Keep the stack.
+
+Out of scope for v1: unrelated work.
+
+## Implementation plan
+
+1. Ship.
+
+## Tests and acceptance criteria
+
+- Smoke test passes.
+
+## Alocação de modelos
+
+| Trabalho | Modelo | Esforço | Finalidade | Motivo de eficiência | Gatilho de escalada |
+|---|---|---|---|---|---|
+| Executar | gpt-5.6-sol | xhigh | Implementar | Mantém contexto | Bloqueio externo |
+"""
+    body += "\n\n" + "\n\n".join(
+        text for name, text in sections.items() if name != missing_section
+    )
+    manager = plan_mode.PlanModeManager(f"session-missing-{missing_section}")
     manager.activate("plan the launch")
     manager.mark_clarified()
     manager.mark_plan_artifact_saved(".hermes/plans/launch.md", body)
