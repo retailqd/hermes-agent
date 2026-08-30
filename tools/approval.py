@@ -1568,6 +1568,50 @@ _OWNER_DATABASE_MUTATION_RE = re.compile(
 )
 
 
+_OWNER_MKTEMP_ASSIGNMENT_RE = re.compile(
+    r"(?m)(?:^|[;\n])\s*"
+    r"(?P<var>(?:TMP|TEMP)_[A-Za-z0-9_]+)\s*=\s*"
+    r"\$\(\s*mktemp\s+-d(?:\s+[^;)\n]+)?\s*\)\s*(?=;|$)"
+)
+
+
+def _mask_verified_mktemp_exit_cleanup(command: str) -> str:
+    """Mask fail-closed cleanup traps for a directory created by ``mktemp``.
+
+    Owner YOLO keeps ordinary test/build cleanup autonomous, but a generic
+    ``rm -rf`` remains high impact. The only exception accepted here is the
+    narrow shell idiom produced by well-behaved smoke tests::
+
+        TMP_DIR=$(mktemp -d)
+        trap 'rm -rf "$TMP_DIR"' EXIT
+
+    The variable must be task-specific (``TMP_*``/``TEMP_*``), assigned
+    exactly once in the command, created by ``mktemp -d``, double-quoted at
+    deletion time, and deleted only inside a single-quoted EXIT trap. Any
+    reassignment, unquoted expansion, direct recursive delete, or additional
+    dangerous operation remains visible to the normal classifier.
+    """
+    masked = str(command or "")
+    assignments = list(_OWNER_MKTEMP_ASSIGNMENT_RE.finditer(masked))
+    for assignment in assignments:
+        variable = assignment.group("var")
+        if len(re.findall(rf"(?m)(?:^|[;\n])\s*{re.escape(variable)}\s*=", masked)) != 1:
+            continue
+        target = rf'"\$(?:{re.escape(variable)}|\{{{re.escape(variable)}\}})"'
+        trap_re = re.compile(
+            rf"\btrap\s+'\s*rm\s+"
+            rf"-(?=[A-Za-z]*r)(?=[A-Za-z]*f)[A-Za-z]+\s+"
+            rf"(?:--\s+)?{target}\s*'\s+(?:EXIT|0)\b",
+            re.IGNORECASE,
+        )
+        matches = list(trap_re.finditer(masked))
+        if len(matches) != 1:
+            continue
+        match = matches[0]
+        masked = masked[: match.start()] + "true" + masked[match.end() :]
+    return masked
+
+
 def detect_owner_high_impact_command(command: str) -> tuple[bool, str | None]:
     """Classify actions that retain an approval gate under owner YOLO mode.
 
@@ -1584,13 +1628,16 @@ def detect_owner_high_impact_command(command: str) -> tuple[bool, str | None]:
     except ImportError:
         return False, None
 
-    is_dangerous, _pattern_key, description = detect_dangerous_command(command)
+    owner_policy_command = _mask_verified_mktemp_exit_cleanup(command)
+    is_dangerous, _pattern_key, description = detect_dangerous_command(
+        owner_policy_command
+    )
     normalized_description = str(description or "").lower()
     if is_dangerous and any(
         term in normalized_description for term in _OWNER_HIGH_IMPACT_DESCRIPTION_TERMS
     ):
         return True, f"owner high-impact gate: {description}"
-    for variant in _command_detection_variants(command):
+    for variant in _command_detection_variants(owner_policy_command):
         if _OWNER_DATABASE_MUTATION_RE.search(variant):
             return (
                 True,

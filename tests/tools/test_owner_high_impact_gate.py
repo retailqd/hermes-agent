@@ -40,6 +40,29 @@ def _activate_contract(home: Path) -> None:
         ("git commit -m safe", False),
         ("systemctl --user restart one-scoped-service.service", False),
         ("rm -rf /tmp/task-artifacts", True),
+        (
+            "TMP_DIR=$(mktemp -d)\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\n"
+            "python -m unittest",
+            False,
+        ),
+        (
+            "TMP_DIR=$(mktemp -d)\nTMP_DIR=/tmp/not-minted\n"
+            "trap 'rm -rf \"$TMP_DIR\"' EXIT",
+            True,
+        ),
+        (
+            "TMP_DIR=$(mktemp -d)\nrm -rf \"$TMP_DIR\"",
+            True,
+        ),
+        (
+            "TMP_DIR=$(mktemp -d)\ntrap 'rm -rf $TMP_DIR' EXIT",
+            True,
+        ),
+        (
+            "TMP_DIR=$(mktemp -d)\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\n"
+            "git reset --hard HEAD~1",
+            True,
+        ),
         ("git reset --hard HEAD~1", True),
         ("printf x > .env.production", True),
         ("alembic upgrade head", True),
