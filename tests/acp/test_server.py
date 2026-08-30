@@ -1287,6 +1287,73 @@ class TestPrompt:
         assert state.agent.thinking_callback is None
 
     @pytest.mark.asyncio
+    async def test_prompt_bridges_compaction_lifecycle_and_restores_callbacks(
+        self, agent
+    ):
+        """ACP must expose long compression work and close its lifecycle latch."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        prior_status = MagicMock()
+        prior_event = MagicMock()
+        state.agent.status_callback = prior_status
+        state.agent.event_callback = prior_event
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        def lifecycle_texts():
+            updates = [
+                call.kwargs.get("update") or call.args[1]
+                for call in mock_conn.session_update.call_args_list
+            ]
+            return [
+                update.content.text
+                for update in updates
+                if update.session_update == "agent_message_chunk"
+                and update.content.text.startswith(("Compacting", "\n\nCompacting"))
+            ]
+
+        def completed_run(*args, **kwargs):
+            state.agent.status_callback(
+                "lifecycle",
+                "🗜️ Compacting context — summarizing earlier conversation",
+            )
+            state.agent.event_callback("session:compress", {"in_place": True})
+            return {"final_response": "done", "messages": []}
+
+        state.agent.run_conversation = completed_run
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="compress")],
+            session_id=new_resp.session_id,
+        )
+
+        assert lifecycle_texts() == ["Compacting...", "\n\nCompacting completed."]
+        prior_status.assert_called_once()
+        prior_event.assert_called_once_with("session:compress", {"in_place": True})
+        assert state.agent.status_callback is prior_status
+        assert state.agent.event_callback is prior_event
+
+        mock_conn.session_update.reset_mock()
+
+        def failed_run(*args, **kwargs):
+            state.agent.status_callback(
+                "lifecycle",
+                "🗜️ Compacting context — summarizing earlier conversation",
+            )
+            return {"final_response": "continued without compression", "messages": []}
+
+        state.agent.run_conversation = failed_run
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="try again")],
+            session_id=new_resp.session_id,
+        )
+
+        assert lifecycle_texts() == ["Compacting...", "\n\nCompacting failed."]
+        assert state.agent.status_callback is prior_status
+        assert state.agent.event_callback is prior_event
+
+    @pytest.mark.asyncio
     async def test_prompt_scopes_top_level_delegation_to_sync_and_restores_agent(self, agent):
         """ACP has no gateway completion watcher: detached review results must
         remain part of this prompt, while the agent attribute is restored after

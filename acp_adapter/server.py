@@ -1659,6 +1659,7 @@ class HermesACPAgent(acp.Agent):
         tool_call_meta: dict[str, dict[str, Any]] = {}
         previous_approval_cb = None
         edit_approval_requester = None
+        message_cb = None
 
         streamed_message = False
 
@@ -1766,6 +1767,49 @@ class HermesACPAgent(acp.Agent):
                 interactive_token, \
                 edit_approval_token, \
                 previous_session_id
+            previous_status_callback = getattr(agent, "status_callback", None)
+            previous_event_callback = getattr(agent, "event_callback", None)
+            compression_in_progress = False
+
+            if message_cb is not None:
+                from agent.conversation_compression import (
+                    COMPACTION_STATUS_MARKER,
+                )
+
+                def _acp_status_callback(kind: str, message: str) -> None:
+                    nonlocal compression_in_progress
+                    if previous_status_callback is not None:
+                        try:
+                            previous_status_callback(kind, message)
+                        except Exception:
+                            logger.debug(
+                                "Prior ACP agent status callback failed",
+                                exc_info=True,
+                            )
+                    if (
+                        kind == "lifecycle"
+                        and COMPACTION_STATUS_MARKER in str(message)
+                        and not compression_in_progress
+                    ):
+                        compression_in_progress = True
+                        message_cb("Compacting...")
+
+                def _acp_event_callback(event: str, payload: dict) -> None:
+                    nonlocal compression_in_progress
+                    if previous_event_callback is not None:
+                        try:
+                            previous_event_callback(event, payload)
+                        except Exception:
+                            logger.debug(
+                                "Prior ACP agent event callback failed",
+                                exc_info=True,
+                            )
+                    if event == "session:compress" and compression_in_progress:
+                        compression_in_progress = False
+                        message_cb("\n\nCompacting completed.")
+
+                agent.status_callback = _acp_status_callback
+                agent.event_callback = _acp_event_callback
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1838,6 +1882,10 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                if compression_in_progress and message_cb is not None:
+                    message_cb("\n\nCompacting failed.")
+                agent.status_callback = previous_status_callback
+                agent.event_callback = previous_event_callback
                 if previous_delegation_mode is _missing_delegation_mode:
                     try:
                         delattr(agent, "_force_sync_top_level_delegation")
