@@ -2156,27 +2156,6 @@ class HermesACPAgent(acp.Agent):
             state.is_running = False
             state.current_prompt_text = ""
 
-        if plan_review_text and conn and not interrupted:
-            try:
-                from acp_adapter.plan_review import request_plan_review
-
-                if await request_plan_review(conn, session_id, plan_review_text):
-                    # Re-enter through the same nonce-bound command path used by
-                    # `/plan approve`; the recursive prompt remains invisible
-                    # user-interface plumbing and executes only after the ACP
-                    # owner explicitly selected "Implement plan". Cancellation
-                    # preserves the grant for the next continuation turn.
-                    await self._send_usage_update(state)
-                    return await self.prompt(
-                        prompt=[TextContentBlock(type="text", text="/plan approve")],
-                        session_id=session_id,
-                    )
-            except Exception:
-                logger.warning(
-                    "Native plan review handoff failed; Plan Mode remains active",
-                    exc_info=True,
-                )
-
         while True:
             with state.runtime_lock:
                 if not state.queued_prompts:

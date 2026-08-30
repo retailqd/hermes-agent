@@ -37,6 +37,7 @@ class FakeAgent:
 class CaptureConn:
     def __init__(self):
         self.updates = []
+        self.permission_requests = []
 
     async def session_update(self, *args, **kwargs):
         if kwargs:
@@ -45,6 +46,7 @@ class CaptureConn:
             self.updates.append((args[0], args[1]))
 
     async def request_permission(self, *args, **kwargs):
+        self.permission_requests.append((args, kwargs))
         return SimpleNamespace(outcome="allow")
 
 
@@ -272,7 +274,7 @@ async def test_acp_plan_approval_is_rejected_mid_turn():
 
 
 @pytest.mark.asyncio
-async def test_acp_completed_plan_matches_codex_plain_markdown_and_opens_review(
+async def test_acp_completed_plan_matches_codex_plain_markdown_without_duplicate_review(
     monkeypatch,
 ):
     acp_agent, state, fake, conn = make_agent_and_state()
@@ -292,20 +294,10 @@ Ship the launch safely.
         }
 
     fake.run_conversation = run_plan
-    captured = []
-
-    async def reject_review(_conn, session_id, plan_text):
-        captured.append((session_id, plan_text))
-        return False
-
     monkeypatch.setattr(
         "acp_adapter.plan_review.native_plan_is_active",
         lambda _session_id: True,
     )
-    monkeypatch.setattr(
-        "acp_adapter.plan_review.request_plan_review",
-        reject_review,
-    )
 
     response = await acp_agent.prompt(
         session_id=state.session_id,
@@ -313,62 +305,11 @@ Ship the launch safely.
     )
 
     assert response.stop_reason == "end_turn"
-    assert captured == [(state.session_id, plan.strip())]
+    assert conn.permission_requests == []
+    assert fake.runs == ["continue the plan"]
     rendered = "\n".join(str(update) for _sid, update in conn.updates)
     assert "# Launch plan" in rendered
     assert "<proposed_plan>" not in rendered
-
-
-@pytest.mark.asyncio
-async def test_acp_plan_review_approval_executes_through_nonce_bound_plan_command(
-    monkeypatch,
-):
-    acp_agent, state, fake, _conn = make_agent_and_state()
-    calls = 0
-
-    def run_plan(**kwargs):
-        nonlocal calls
-        calls += 1
-        fake.runs.append(kwargs["user_message"])
-        if calls == 1:
-            final = "<proposed_plan>\n# Approved plan\n</proposed_plan>"
-        else:
-            final = "execution complete"
-        return {
-            "final_response": final,
-            "messages": [{"role": "assistant", "content": final}],
-        }
-
-    fake.run_conversation = run_plan
-
-    async def approve_review(_conn, _session_id, _plan_text):
-        return True
-
-    monkeypatch.setattr(
-        "acp_adapter.plan_review.native_plan_is_active",
-        lambda _session_id: calls == 0,
-    )
-    monkeypatch.setattr(
-        "acp_adapter.plan_review.request_plan_review",
-        approve_review,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.plan_mode.handle_plan_command",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            action="approve",
-            plan_mode="plan",
-            message="Plan approved.",
-            prompt="hidden nonce-bound execution prompt",
-        ),
-    )
-
-    response = await acp_agent.prompt(
-        session_id=state.session_id,
-        prompt=[TextContentBlock(type="text", text="continue the plan")],
-    )
-
-    assert response.stop_reason == "end_turn"
-    assert fake.runs == ["continue the plan", "hidden nonce-bound execution prompt"]
 
 
 @pytest.mark.asyncio
@@ -380,6 +321,8 @@ async def test_acp_cancelled_approved_build_keeps_grant_for_next_continuation(
         "hermes_cli.plan_mode", fromlist=["PlanModeManager"]
     ).PlanModeManager(state.session_id)
     manager.activate("implement the approved plan")
+    pending = manager.approve()
+    manager.begin_build(pending.approval_id)
     calls = 0
 
     def run_plan(**kwargs):
@@ -387,10 +330,6 @@ async def test_acp_cancelled_approved_build_keeps_grant_for_next_continuation(
         calls += 1
         fake.runs.append(kwargs["user_message"])
         if calls == 1:
-            final = "<proposed_plan>\n# Approved plan\n</proposed_plan>"
-        elif calls == 2:
-            pending = manager.state
-            manager.begin_build(pending.approval_id)
             state.cancel_event.set()
             final = "interrupted while adding owner guidance"
         else:
@@ -405,21 +344,9 @@ async def test_acp_cancelled_approved_build_keeps_grant_for_next_continuation(
 
     fake.run_conversation = run_plan
 
-    async def approve_review(_conn, _session_id, _plan_text):
-        return True
-
-    monkeypatch.setattr(
-        "acp_adapter.plan_review.native_plan_is_active",
-        lambda _session_id: calls == 0,
-    )
-    monkeypatch.setattr(
-        "acp_adapter.plan_review.request_plan_review",
-        approve_review,
-    )
-
     interrupted = await acp_agent.prompt(
         session_id=state.session_id,
-        prompt=[TextContentBlock(type="text", text="continue the plan")],
+        prompt=[TextContentBlock(type="text", text="continue the approved plan")],
     )
 
     assert interrupted.stop_reason == "cancelled"

@@ -837,6 +837,26 @@ def test_later_plan_turn_reinjects_full_contract(isolated_plan_mode):
     assert persisted == "Prefer option B"
 
 
+def test_acp_stable_task_id_wins_over_rotated_internal_session(isolated_plan_mode):
+    from agent.conversation_loop import _prepare_native_plan_turn
+
+    class Agent:
+        session_id = "rotated-internal-session"
+
+    plan_mode.PlanModeManager("stable-acp-session").activate("design safely")
+    prepared, persisted = _prepare_native_plan_turn(
+        Agent(),
+        "Prefer option B",
+        None,
+        task_id="stable-acp-session",
+    )
+
+    assert "Explore first, ask second" in prepared
+    assert "Prefer option B" in prepared
+    assert persisted == "Prefer option B"
+    assert not plan_mode.PlanModeManager(Agent.session_id).active
+
+
 def test_inactive_plan_preserves_multimodal_user_message(isolated_plan_mode):
     """Normal image turns must not be flattened by the Plan Mode prologue."""
     from agent.conversation_loop import _prepare_native_plan_turn

@@ -542,6 +542,8 @@ def _prepare_native_plan_turn(
     agent,
     user_message: Any,
     persist_user_message: Optional[Any],
+    *,
+    task_id: str = "",
 ) -> tuple[Any, Optional[Any]]:
     """Apply the nonce-bound approval or reinject the full PLAN contract."""
     from hermes_cli.plan_mode import (
@@ -556,7 +558,13 @@ def _prepare_native_plan_turn(
         render_native_plan_turn_reminder,
     )
 
-    manager = PlanModeManager(getattr(agent, "session_id", "") or "")
+    # ACP exposes a stable client session id as ``task_id`` while the internal
+    # Hermes session id can rotate during compression. Native Plan Mode state,
+    # tool guards, artifacts, and slash commands are all keyed by that stable
+    # id. Falling back to ``agent.session_id`` keeps CLI/direct callers
+    # compatible without splitting the state across two identities.
+    logical_session_id = str(task_id or getattr(agent, "session_id", "") or "")
+    manager = PlanModeManager(logical_session_id)
     state = manager.state
     raw_user_message = flatten_message_text(user_message)
     envelope_approval_id = native_plan_execution_approval_id(raw_user_message)
@@ -639,11 +647,15 @@ def run_conversation(
     # Bind approval to one exact, nonce-bearing runtime prompt and release the
     # guard before the approved turn begins. All other active PLAN turns get
     # the complete contract reinjected, including after resume/compression.
+    native_plan_session_id = str(
+        task_id or getattr(agent, "session_id", "") or ""
+    )
     try:
         user_message, persist_user_message = _prepare_native_plan_turn(
             agent,
             user_message,
             persist_user_message,
+            task_id=native_plan_session_id,
         )
     except Exception:
         # State/transition errors must never synthesize an unlocked turn. The
@@ -5894,7 +5906,7 @@ def run_conversation(
                     from hermes_cli.plan_mode import build_plan_completion_nudge
 
                     _plan_completion_nudge = build_plan_completion_nudge(
-                        getattr(agent, "session_id", "") or "",
+                        native_plan_session_id,
                         final_response,
                     )
                 except Exception:

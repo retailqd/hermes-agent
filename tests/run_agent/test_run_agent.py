@@ -3961,22 +3961,38 @@ class TestRunConversation:
             acknowledgement,
             completed_plan,
         ]
+        completion_checks = []
+
+        def completion_guard(session_id, response_text):
+            completion_checks.append((session_id, response_text))
+            return (
+                "Continue and finish the plan now."
+                if len(completion_checks) == 1
+                else None
+            )
 
         with (
             patch(
                 "hermes_cli.plan_mode.build_plan_completion_nudge",
-                side_effect=["Continue and finish the plan now.", None],
+                side_effect=completion_guard,
             ),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("continue planning")
+            result = agent.run_conversation(
+                "continue planning",
+                task_id="stable-acp-session",
+            )
 
         assert result["final_response"].startswith("<proposed_plan>")
         assert result["completed"] is True
         assert result["api_calls"] == 2
         assert agent.client.chat.completions.create.call_count == 2
+        assert [session_id for session_id, _response in completion_checks] == [
+            "stable-acp-session",
+            "stable-acp-session",
+        ]
         assert not any(
             message.get("_native_plan_completion_synthetic")
             for message in result["messages"]
