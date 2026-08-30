@@ -39,3 +39,4 @@ Other Hermes status messages remain out of the ACP transcript.
 | Compression lifecycle start, completion, failure, and callback restoration | pass |
 | ACP server regression suite | 88 passed |
 | Ruff on changed runtime and tests | pass |
+| Live high-context Armenians session | pass: start and completion markers became native AoE compaction events; context fell from about 212k to 96k tokens and the turn ended `prompt_complete` |
