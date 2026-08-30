@@ -176,6 +176,25 @@ class TestProjectFacts:
         assert "scripts/run_tests.sh" in block
         assert "pytest" in block.split("Verify:")[1]
 
+    def test_plain_python_project_detects_conventional_unittest_suite(self, tmp_path):
+        _git_init(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        tests = tmp_path / "tests"
+        tests.mkdir()
+        (tests / "test_cli.py").write_text("import unittest\n")
+
+        facts = cc.detect_project_facts(tmp_path)
+
+        assert "python -m unittest discover" in facts.verify_commands
+
+    def test_plain_python_project_does_not_invent_suite_without_tests(self, tmp_path):
+        _git_init(tmp_path)
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+
+        facts = cc.detect_project_facts(tmp_path)
+
+        assert "python -m unittest discover" not in facts.verify_commands
+
     def test_makefile_verify_targets_only(self, tmp_path):
         _git_init(tmp_path)
         (tmp_path / "Makefile").write_text("test:\n\tgo test ./...\n\ndeploy:\n\t./deploy.sh\n")

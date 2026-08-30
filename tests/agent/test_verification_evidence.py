@@ -26,6 +26,13 @@ def _python_project(root: Path) -> None:
     (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
 
 
+def _unittest_project(root: Path) -> None:
+    (root / "pyproject.toml").write_text("[project]\nname='x'\n")
+    tests = root / "tests"
+    tests.mkdir()
+    (tests / "test_cli.py").write_text("import unittest\n")
+
+
 def test_classifies_targeted_project_verify_command(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)
@@ -62,6 +69,38 @@ def test_classifies_python_module_pytest_as_detected_pytest(tmp_path, monkeypatc
     assert evidence.kind == "test"
     assert evidence.scope == "targeted"
     assert evidence.status == "failed"
+
+
+def test_classifies_venv_python_unittest_discovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _unittest_project(tmp_path)
+
+    evidence = classify_verification_command(
+        ".venv/bin/python -m unittest discover -s tests -v",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="22 tests OK",
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "python -m unittest discover"
+    assert evidence.kind == "test"
+    assert evidence.status == "passed"
+
+
+def test_echoed_venv_python_unittest_is_not_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _unittest_project(tmp_path)
+
+    evidence = classify_verification_command(
+        "echo .venv/bin/python -m unittest discover -s tests -v",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is None
 
 
 def test_records_passed_then_marks_stale_after_edit(tmp_path, monkeypatch):

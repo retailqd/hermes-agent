@@ -192,7 +192,31 @@ def _equivalent_needles(needle: list[str]) -> list[list[str]]:
             ["poetry", "run", "pytest"],
             ["pipenv", "run", "pytest"],
         ])
+    if needle[:3] == ["python", "-m", "unittest"]:
+        candidates.append(["python3", *needle[1:]])
     return candidates
+
+
+def _python_interpreter_matches(actual: str, expected: str) -> bool:
+    if expected not in {"python", "python3"}:
+        return False
+    cleaned = _clean_token(actual)
+    name = Path(cleaned).name.lower()
+    if expected == "python":
+        return bool(re.fullmatch(r"python(?:3(?:\.\d+)?)?", name))
+    return bool(re.fullmatch(r"python3(?:\.\d+)?", name))
+
+
+def _prefix_matches(tokens: list[str], candidate: list[str]) -> bool:
+    if len(tokens) < len(candidate):
+        return False
+    for index, expected in enumerate(candidate):
+        actual = _clean_token(tokens[index])
+        if index == 0 and _python_interpreter_matches(actual, expected):
+            continue
+        if actual != expected:
+            return False
+    return True
 
 
 def _find_canonical_match(
@@ -208,7 +232,7 @@ def _find_canonical_match(
         for tokens in segments:
             candidate_tokens = _strip_command_prefix(tokens)
             for candidate in _equivalent_needles(needle):
-                if candidate_tokens[: len(candidate)] == candidate:
+                if _prefix_matches(candidate_tokens, candidate):
                     return canonical, candidate_tokens[len(candidate) :]
     return None
 

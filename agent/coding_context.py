@@ -729,6 +729,40 @@ def _read_small(path: Path) -> str:
         return ""
 
 
+def _has_unittest_tests(root: Path) -> bool:
+    """Return whether a bounded conventional Python unittest suite exists."""
+    tests_root = root / "tests"
+    if not tests_root.is_dir():
+        return False
+    seen = 0
+    stack = [tests_root]
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > _CODE_SCAN_MAX_ENTRIES:
+                        return False
+                    try:
+                        if entry.is_file() and (
+                            (entry.name.startswith("test") and entry.name.endswith(".py"))
+                            or entry.name.endswith("_test.py")
+                        ):
+                            return True
+                        if (
+                            entry.is_dir()
+                            and entry.name not in _CODE_SCAN_SKIP_DIRS
+                            and not entry.name.startswith(".")
+                        ):
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return False
+
+
 @dataclass(frozen=True)
 class ProjectFacts:
     """Structured project facts — the model's verify loop, detected once.
@@ -766,8 +800,16 @@ def detect_project_facts(root: Path) -> ProjectFacts:
             scripts = {}
         js_pm = next((pm for lock, pm in _JS_LOCKFILES if (root / lock).is_file()), "npm")
         verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
-    if (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(root / "pyproject.toml"):
+    has_pytest = (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(
+        root / "pyproject.toml"
+    )
+    if has_pytest:
         verify.append("pytest")
+    elif any(
+        (root / marker).is_file()
+        for marker in ("pyproject.toml", "setup.py", "setup.cfg")
+    ) and _has_unittest_tests(root):
+        verify.append("python -m unittest discover")
     makefile = _read_small(root / "Makefile")
     if makefile:
         verify.extend(

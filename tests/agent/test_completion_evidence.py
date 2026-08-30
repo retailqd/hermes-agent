@@ -68,6 +68,48 @@ def test_completion_manifest_is_bounded_hashed_and_verifiable(tmp_path: Path) ->
     assert 'approval"' not in serialized
 
 
+def test_completion_manifest_accepts_fresh_venv_unittest_evidence(
+    tmp_path: Path,
+) -> None:
+    _repo(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='unittest-fixture'\n",
+        encoding="utf-8",
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_cli.py").write_text("import unittest\n", encoding="utf-8")
+    plan, plan_sha = _plan(tmp_path / "plan.md")
+    changed = tmp_path / "src.py"
+    changed.write_text("print('ok')\n", encoding="utf-8")
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[str(changed)])
+    evidence = record_terminal_result(
+        command=".venv/bin/python -m unittest discover -s tests -v",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="Ran 22 tests\nOK",
+    )
+
+    assert evidence is not None
+    path, _ = create_plan_completion_manifest(
+        session_id="s1",
+        cwd=tmp_path,
+        objective="implement safely",
+        approval_id="approval",
+        plan_artifact_path=str(plan),
+        plan_artifact_sha256=plan_sha,
+        final_response="done",
+    )
+
+    manifest = verify_completion_manifest(path)
+    assert manifest["verification"]["status"] == "passed"
+    assert (
+        manifest["verification"]["check"]["canonical_command"]
+        == "python -m unittest discover"
+    )
+
+
 def test_completion_manifest_rejects_stale_workspace_evidence(tmp_path: Path) -> None:
     _repo(tmp_path)
     plan, plan_sha = _plan(tmp_path / "plan.md")
