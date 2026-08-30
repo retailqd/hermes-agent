@@ -84,6 +84,81 @@ async def test_set_config_option_persists_edit_approval_policy_without_advertisi
     assert getattr(state, "mode", None) == "accept_edits"
 
 
+@pytest.mark.asyncio
+async def test_dont_ask_mode_enables_session_yolo_for_command_approvals(agent):
+    """ACP Don't Ask must bypass recoverable command prompts, not only edits."""
+    from tools.approval import (
+        check_dangerous_command,
+        disable_session_yolo,
+        is_session_yolo_enabled,
+        reset_current_session_key,
+        set_current_session_key,
+    )
+
+    resp = await agent.new_session(cwd="/tmp")
+    session_id = resp.session_id
+    disable_session_yolo(session_id)
+
+    await agent.set_session_mode(mode_id="dont_ask", session_id=session_id)
+    assert is_session_yolo_enabled(session_id) is True
+
+    token = set_current_session_key(session_id)
+    try:
+        result = check_dangerous_command(
+            "rm -rf /tmp/hermes-acp-yolo-smoke",
+            "local",
+            approval_callback=lambda *_args: "deny",
+        )
+        hardline = check_dangerous_command(
+            "rm -rf /",
+            "local",
+            approval_callback=lambda *_args: "allow",
+        )
+    finally:
+        reset_current_session_key(token)
+        disable_session_yolo(session_id)
+
+    assert result["approved"] is True
+    assert hardline["approved"] is False
+    assert hardline.get("hardline") is True
+
+
+@pytest.mark.asyncio
+async def test_leaving_dont_ask_disables_session_yolo(agent):
+    from tools.approval import is_session_yolo_enabled
+
+    resp = await agent.new_session(cwd="/tmp")
+    session_id = resp.session_id
+
+    await agent.set_session_mode(mode_id="dont_ask", session_id=session_id)
+    assert is_session_yolo_enabled(session_id) is True
+
+    await agent.set_session_mode(mode_id="default", session_id=session_id)
+    assert is_session_yolo_enabled(session_id) is False
+
+
+@pytest.mark.asyncio
+async def test_config_option_dont_ask_keeps_command_and_edit_policy_in_sync(agent):
+    from tools.approval import is_session_yolo_enabled
+
+    resp = await agent.new_session(cwd="/tmp")
+    session_id = resp.session_id
+
+    await agent.set_config_option(
+        "edit_approval_policy",
+        session_id,
+        "session",
+    )
+    assert is_session_yolo_enabled(session_id) is True
+
+    await agent.set_config_option(
+        "edit_approval_policy",
+        session_id,
+        "ask",
+    )
+    assert is_session_yolo_enabled(session_id) is False
+
+
 def test_plan_workflow_auto_approves_only_planning_and_approved_build_edits(agent):
     state = SimpleNamespace(
         session_id="hermes-plan-session",
@@ -421,9 +496,10 @@ class TestSessionOps:
         observed = []
 
         def mock_run(*args, **kwargs):
-            observed.append(
-                (state.cancel_event.is_set(), state.agent._interrupt_requested)
-            )
+            observed.append((
+                state.cancel_event.is_set(),
+                state.agent._interrupt_requested,
+            ))
             return {"final_response": "recovered", "messages": []}
 
         state.agent.run_conversation = mock_run

@@ -83,6 +83,8 @@ from acp_adapter.session import (
 )
 from acp_adapter.tools import build_tool_complete, build_tool_start
 from tools.approval import (
+    disable_session_yolo,
+    enable_session_yolo,
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
 )
@@ -650,6 +652,25 @@ class HermesACPAgent(acp.Agent):
             mode, self._EDIT_APPROVAL_POLICY_DEFAULT
         )
         return policy, state.cwd
+
+    def _apply_session_mode(self, state: SessionState, mode_id: str) -> str:
+        """Apply one ACP approval mode to both edit and command gates.
+
+        ``dont_ask`` is Hermes' session-scoped YOLO contract.  Keeping its
+        command bypass in ``tools.approval`` means the existing hardline and
+        user-deny floors still run before the bypass, while recoverable command
+        prompts and ordinary edit prompts share the same visible ACP mode.
+        """
+
+        normalized_mode = str(mode_id or "").strip()
+        if normalized_mode not in self._MODE_TO_EDIT_APPROVAL_POLICY:
+            normalized_mode = self._MODE_DEFAULT
+        setattr(state, "mode", normalized_mode)
+        if normalized_mode == self._MODE_DONT_ASK:
+            enable_session_yolo(state.session_id)
+        else:
+            disable_session_yolo(state.session_id)
+        return normalized_mode
 
     @staticmethod
     def _encode_model_choice(provider: str | None, model: str | None) -> str:
@@ -1666,6 +1687,7 @@ class HermesACPAgent(acp.Agent):
                 # handoff can be auto-continued instead of shown as completion.
                 stream_delta_cb = None
             else:
+
                 def stream_delta_cb(text: str) -> None:
                     nonlocal streamed_message
                     if text:
@@ -2483,10 +2505,7 @@ class HermesACPAgent(acp.Agent):
                 "Session %s: mode switch requested for missing session", session_id
             )
             return None
-        normalized_mode = str(mode_id or "").strip()
-        if normalized_mode not in self._MODE_TO_EDIT_APPROVAL_POLICY:
-            normalized_mode = self._MODE_DEFAULT
-        setattr(state, "mode", normalized_mode)
+        normalized_mode = self._apply_session_mode(state, mode_id)
         self.session_manager.save_session(session_id)
         logger.info("Session %s: mode switched to %s", session_id, normalized_mode)
         return SetSessionModeResponse()
@@ -2506,7 +2525,7 @@ class HermesACPAgent(acp.Agent):
             mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(
                 str(value), self._MODE_DEFAULT
             )
-            setattr(state, "mode", mode)
+            self._apply_session_mode(state, mode)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
